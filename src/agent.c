@@ -2,12 +2,16 @@
 #include "agent.h"
 
 #include <curl/curl.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_OUTPUT (100 * 1024) /* cap on one tool result, in bytes */
@@ -32,9 +36,14 @@ static const char *TOOLS_JSON =
     "\"additionalProperties\":false}}},"
     "{\"type\":\"function\",\"function\":{\"name\":\"shell\","
     "\"description\":\"Run a command with /bin/sh in the working directory. "
-    "Returns combined stdout and stderr and the exit status. stdin is /dev/null.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},"
+    "Returns combined stdout and stderr and the exit status. stdin is /dev/null. "
+    "The command and its children are killed after timeout seconds (default 120, max 600). "
+    "Background jobs must redirect their output, or the call waits for them.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},"
+    "\"timeout\":{\"type\":\"integer\"}},"
     "\"required\":[\"command\"],\"additionalProperties\":false}}}]";
+
+volatile sig_atomic_t agent_interrupted;
 
 const agent_provider AGENT_PROVIDERS[] = {
     {"openrouter", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1",
@@ -68,13 +77,56 @@ static char *fmt(const char *f, const char *a) {
     return s;
 }
 
-/* Truncate to MAX_OUTPUT and say so, rather than drop bytes silently. */
+/* Length of the valid UTF-8 sequence at p (at most n bytes), or 0 if invalid.
+   NUL counts as invalid: results become C strings, where it would end them. */
+static size_t utf8_len(const unsigned char *p, size_t n) {
+    unsigned char c = p[0];
+    if (c >= 0x01 && c <= 0x7F) return 1;
+    size_t len;
+    unsigned char lo = 0x80, hi = 0xBF; /* allowed range of the second byte */
+    if (c >= 0xC2 && c <= 0xDF) len = 2;
+    else if (c >= 0xE0 && c <= 0xEF) {
+        len = 3;
+        if (c == 0xE0) lo = 0xA0;      /* no overlong forms */
+        else if (c == 0xED) hi = 0x9F; /* no UTF-16 surrogates */
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        len = 4;
+        if (c == 0xF0) lo = 0x90;
+        else if (c == 0xF4) hi = 0x8F; /* nothing above U+10FFFF */
+    } else return 0;
+    if (n < len || p[1] < lo || p[1] > hi) return 0;
+    for (size_t i = 2; i < len; i++)
+        if ((p[i] & 0xC0) != 0x80) return 0;
+    return len;
+}
+
+/* Replace each invalid byte with U+FFFD, so the JSON request stays valid. */
+static void sanitize_utf8(buf *b) {
+    const unsigned char *p = (const unsigned char *)b->p;
+    size_t i = 0, k;
+    while (i < b->n && (k = utf8_len(p + i, b->n - i))) i += k;
+    if (i == b->n) return; /* the common case: already valid */
+    buf out = {0};
+    buf_add(&out, b->p, i);
+    while (i < b->n) {
+        if ((k = utf8_len(p + i, b->n - i))) buf_add(&out, b->p + i, k), i += k;
+        else buf_add(&out, "\xEF\xBF\xBD", 3), i++;
+    }
+    free(b->p);
+    *b = out;
+}
+
+/* Sanitize, then truncate to MAX_OUTPUT on a character boundary and say so. */
 static char *capped(buf *b) {
     if (!b->p) return xstrdup("");
+    size_t raw = b->n;
+    sanitize_utf8(b);
     if (b->n > MAX_OUTPUT) {
+        size_t cut = MAX_OUTPUT;
+        while (cut && ((unsigned char)b->p[cut] & 0xC0) == 0x80) cut--; /* don't split a char */
         char note[96];
-        snprintf(note, sizeof note, "\n[truncated: %zu bytes total, first %d shown]", b->n, MAX_OUTPUT);
-        b->n = MAX_OUTPUT;
+        snprintf(note, sizeof note, "\n[truncated: %zu bytes total, first %zu shown]", raw, cut);
+        b->n = cut;
         buf_add(b, note, strlen(note));
     }
     return b->p;
@@ -134,26 +186,87 @@ static char *tool_edit(const char *path, const char *old, const char *new, int *
     return fmt("edited %s", path);
 }
 
-static char *tool_shell(const char *cmd, int *err) {
-    /* Braces and newline keep a trailing comment in cmd from eating the redirects. */
-    char *wrapped = fmt("{ %s\n} </dev/null 2>&1", cmd);
-    FILE *p = popen(wrapped, "r");
-    free(wrapped);
-    if (!p) { *err = 1; return xstrdup("popen failed"); }
+static double now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+static void reap(pid_t pid, int *st) {
+    while (waitpid(pid, st, 0) < 0 && errno == EINTR) {}
+}
+
+/* SIGTERM the process group, SIGKILL whatever is left after 2 s. */
+static void kill_group(pid_t pid, int *st) {
+    kill(-pid, SIGTERM);
+    for (int i = 0; i < 20 && waitpid(pid, st, WNOHANG) == 0; i++) usleep(100000);
+    kill(-pid, SIGKILL); /* also children that outlived sh */
+    if (waitpid(pid, st, WNOHANG) == 0) reap(pid, st);
+}
+
+/* sh runs in its own process group, so the terminal's Ctrl-C reaches only the agent,
+   which then decides to kill the group. */
+static char *tool_shell(const char *cmd, int timeout, int *err) {
+    int fds[2];
+    if (pipe(fds) < 0) { *err = 1; return fmt("pipe failed: %s", strerror(errno)); }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        *err = 1;
+        return fmt("fork failed: %s", strerror(errno));
+    }
+    if (pid == 0) {
+        setpgid(0, 0);
+        int nul = open("/dev/null", O_RDONLY);
+        dup2(nul, 0);
+        dup2(fds[1], 1);
+        dup2(fds[1], 2);
+        close(fds[0]);
+        close(fds[1]);
+        close(nul);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    setpgid(pid, pid); /* also here, so the group exists before any kill */
+    close(fds[1]);
+
     buf b = {0};
     char chunk[65536];
-    size_t n;
-    while ((n = fread(chunk, 1, sizeof chunk, p)) > 0) buf_add(&b, chunk, n);
-    int st = pclose(p);
-    char tail[32];
+    const char *stopped = NULL;
+    double deadline = now() + timeout;
+    for (;;) {
+        if (agent_interrupted) { stopped = "interrupted by user"; break; }
+        double left = deadline - now();
+        if (left <= 0) { stopped = "timed out"; break; }
+        struct pollfd pfd = {fds[0], POLLIN, 0};
+        int r = poll(&pfd, 1, left < 0.2 ? (int)(left * 1000) + 1 : 200);
+        if (r <= 0) continue; /* timeout tick or EINTR: recheck both conditions */
+        ssize_t n = read(fds[0], chunk, sizeof chunk);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break; /* EOF: every writer has exited */
+        buf_add(&b, chunk, (size_t)n);
+    }
+    close(fds[0]);
+    int st = 0;
+    if (stopped) kill_group(pid, &st);
+    else reap(pid, &st);
+
+    char tail[64];
+    const char *nl = b.n && b.p[b.n - 1] != '\n' ? "\n" : "";
     int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
-    snprintf(tail, sizeof tail, "%s[exit %d]", b.n && b.p[b.n - 1] != '\n' ? "\n" : "", code);
+    if (stopped && !strcmp(stopped, "timed out"))
+        snprintf(tail, sizeof tail, "%s[timed out after %ds; killed]", nl, timeout);
+    else if (stopped)
+        snprintf(tail, sizeof tail, "%s[interrupted by user; killed]", nl);
+    else
+        snprintf(tail, sizeof tail, "%s[exit %d]", nl, code);
     char *out = capped(&b);
     buf r = {0};
     buf_add(&r, out, strlen(out));
     buf_add(&r, tail, strlen(tail));
     free(out);
-    *err = code != 0;
+    *err = stopped || code != 0;
     return r.p;
 }
 
@@ -201,7 +314,11 @@ char *agent_run_tool(agent *a, const char *name, cJSON *input, int *err) {
     if (!strcmp(name, "shell") && cmd) {
         fprintf(stderr, "[tool] shell %s\n", cmd);
         if ((why = denied(a->auto_yes, "shell", cmd))) return xstrdup(why);
-        return tool_shell(cmd, err);
+        cJSON *t = cJSON_GetObjectItemCaseSensitive(input, "timeout");
+        int secs = cJSON_IsNumber(t) ? (int)t->valuedouble : AGENT_SHELL_TIMEOUT;
+        if (secs < 1) secs = 1;
+        if (secs > AGENT_SHELL_TIMEOUT_MAX) secs = AGENT_SHELL_TIMEOUT_MAX;
+        return tool_shell(cmd, secs, err);
     }
     return fmt("unknown tool or missing arguments: %s", name);
 }
@@ -269,6 +386,12 @@ const agent_provider *agent_provider_default(void) {
 
 /* ---- API ---- */
 
+/* curl calls this about once a second, and sooner on activity; nonzero aborts. */
+static int on_progress(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut, curl_off_t un) {
+    (void)ud, (void)dt, (void)dn, (void)ut, (void)un;
+    return agent_interrupted;
+}
+
 static size_t on_body(char *p, size_t sz, size_t n, void *ud) {
     buf_add(ud, p, sz * n);
     return sz * n;
@@ -288,7 +411,8 @@ static cJSON *request(agent *a, const char *path, const char *body) {
 
     cJSON *resp = NULL;
     for (int attempt = 0; attempt <= RETRIES; attempt++) {
-        if (attempt) sleep(1u << (attempt - 1));
+        if (attempt) sleep(1u << (attempt - 1)); /* a signal ends it early */
+        if (agent_interrupted) break;
         buf out = {0};
         CURL *c = curl_easy_init();
         curl_easy_setopt(c, CURLOPT_URL, url.p);
@@ -297,6 +421,8 @@ static cJSON *request(agent *a, const char *path, const char *body) {
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, on_body);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
         curl_easy_setopt(c, CURLOPT_TIMEOUT, 600L);
+        curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, on_progress);
         CURLcode rc = curl_easy_perform(c);
         long status = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
@@ -304,6 +430,11 @@ static cJSON *request(agent *a, const char *path, const char *body) {
         if (rc == CURLE_OK && status == 200) {
             resp = cJSON_Parse(out.p ? out.p : "");
             if (!resp) fprintf(stderr, "error: response is not JSON\n");
+            free(out.p);
+            break;
+        }
+        if (rc == CURLE_ABORTED_BY_CALLBACK) {
+            fprintf(stderr, "interrupted\n");
             free(out.p);
             break;
         }
@@ -420,8 +551,10 @@ int agent_step(agent *a, cJSON *resp) {
         const char *name = get_str(fn, "name"), *args = get_str(fn, "arguments");
         cJSON *input = cJSON_Parse(args ? args : "");
         int err = 1;
-        char *out = cJSON_IsObject(input) ? agent_run_tool(a, name ? name : "", input, &err)
-                                          : fmt("invalid JSON arguments for %s", name ? name : "?");
+        /* Every call still gets a result, so the history stays valid. */
+        char *out = agent_interrupted       ? xstrdup("skipped: interrupted by user")
+                    : cJSON_IsObject(input) ? agent_run_tool(a, name ? name : "", input, &err)
+                                            : fmt("invalid JSON arguments for %s", name ? name : "?");
         cJSON_Delete(input);
         /* Chat completions has no is_error field, so mark failures in the text. */
         char *content = err ? fmt("error: %s", out) : fmt("%s", out);
@@ -433,10 +566,15 @@ int agent_step(agent *a, cJSON *resp) {
         free(content);
         free(out);
     }
+    if (agent_interrupted) {
+        fprintf(stderr, "interrupted\n");
+        return 0; /* end the turn without asking the model again */
+    }
     return ncalls > 0;
 }
 
 int agent_ask(agent *a, const char *text) {
+    agent_interrupted = 0;
     int before = cJSON_GetArraySize(a->messages);
     cJSON *m = cJSON_CreateObject();
     cJSON_AddStringToObject(m, "role", "user");
@@ -495,6 +633,11 @@ void agent_free(agent *a) {
     cJSON_Delete(a->tools);
     free(a->model);
     memset(a, 0, sizeof *a);
+}
+
+void agent_clear(agent *a) {
+    while (cJSON_GetArraySize(a->messages) > 1)
+        cJSON_DeleteItemFromArray(a->messages, cJSON_GetArraySize(a->messages) - 1);
 }
 
 void agent_set_model(agent *a, const char *model) {

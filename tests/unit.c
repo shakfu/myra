@@ -1,10 +1,12 @@
 /* unit.c - agentlib unit tests. Usage: unit NAME. Each case runs in a fresh temp dir. */
 #include "agent.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define CHECK(c)                                                                  \
@@ -141,6 +143,154 @@ TEST(tool_unknown) {
     int err = 0;
     char *out = tool("bogus", "{}", &err);
     CHECK(err && strstr(out, "unknown tool"));
+    free(out);
+    return 0;
+}
+
+static double secs(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+/* Wait up to 2 s for the pid written to path to disappear. */
+static int gone(const char *path) {
+    const char *s = get(path);
+    pid_t pid = s ? (pid_t)atoi(s) : 0;
+    if (pid <= 0) return 0;
+    for (int i = 0; i < 20; i++) {
+        if (kill(pid, 0) < 0) return 1;
+        usleep(100000);
+    }
+    return 0;
+}
+
+static void on_alarm(int sig) {
+    (void)sig;
+    agent_interrupted = 1;
+}
+
+/* Simulate Ctrl-C after one second, the way main.c installs its handler. */
+static void interrupt_in_1s(void) {
+    struct sigaction sa = {0};
+    sa.sa_handler = on_alarm;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGALRM, &sa, NULL);
+    alarm(1);
+}
+
+TEST(shell_timeout_kills_process_group) {
+    int err;
+    double t = secs();
+    char *out = tool("shell", "{\"command\":\"sleep 30 & echo $! > pid; echo start; wait\","
+                              "\"timeout\":1}", &err);
+    CHECK(secs() - t < 4);
+    CHECK(err && !strcmp(out, "start\n[timed out after 1s; killed]"));
+    CHECK(gone("pid")); /* the background child died with sh */
+    free(out);
+    return 0;
+}
+
+TEST(shell_timeout_is_clamped) {
+    int err;
+    double t = secs();
+    char *out = tool("shell", "{\"command\":\"sleep 30\",\"timeout\":0}", &err);
+    CHECK(secs() - t < 4 && err && !strcmp(out, "[timed out after 1s; killed]"));
+    free(out);
+    out = tool("shell", "{\"command\":\"echo ok\",\"timeout\":\"soon\"}", &err); /* default */
+    CHECK(!err && !strcmp(out, "ok\n[exit 0]"));
+    free(out);
+    return 0;
+}
+
+TEST(shell_background_job_with_redirect_returns) {
+    int err;
+    double t = secs();
+    char *out = tool("shell", "{\"command\":\"sleep 30 >/dev/null 2>&1 & echo $! > pid; echo ok\"}",
+                     &err);
+    CHECK(secs() - t < 2 && !err && !strcmp(out, "ok\n[exit 0]"));
+    free(out);
+    pid_t pid = (pid_t)atoi(get("pid"));
+    CHECK(pid > 0 && kill(pid, 0) == 0); /* still running: not ours to kill */
+    kill(pid, SIGKILL);
+    return 0;
+}
+
+TEST(shell_interrupt_kills_process_group) {
+    int err;
+    interrupt_in_1s();
+    double t = secs();
+    char *out = tool("shell", "{\"command\":\"sleep 30 & echo $! > pid; echo a; wait\"}", &err);
+    CHECK(secs() - t < 4);
+    CHECK(err && !strcmp(out, "a\n[interrupted by user; killed]"));
+    CHECK(gone("pid"));
+    free(out);
+    return 0;
+}
+
+TEST(step_interrupt_skips_remaining_calls) {
+    interrupt_in_1s();
+    CHECK(step("{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":["
+               "{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"shell\","
+               "\"arguments\":\"{\\\"command\\\":\\\"sleep 30\\\"}\"}},"
+               "{\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"shell\","
+               "\"arguments\":\"{\\\"command\\\":\\\"touch y\\\"}\"}}]},"
+               "\"finish_reason\":\"tool_calls\"}]}") == 0); /* turn ends: no next request */
+    CHECK(cJSON_GetArraySize(A.messages) == 4);
+    CHECK(!strcmp(field(msg(2), "content"), "error: [interrupted by user; killed]"));
+    CHECK(!strcmp(field(msg(3), "tool_call_id"), "c2"));
+    CHECK(!strcmp(field(msg(3), "content"), "error: skipped: interrupted by user"));
+    CHECK(access("y", F_OK) != 0);
+    return 0;
+}
+
+#define FFFD "\xEF\xBF\xBD"
+
+/* Run printf with fmt in the shell tool and compare the result. */
+static int printf_gives(const char *fmt_, const char *want) {
+    char cmd[256];
+    snprintf(cmd, sizeof cmd, "{\"command\":\"printf '%s'\"}", fmt_);
+    int err;
+    char *out = tool("shell", cmd, &err);
+    int ok = !err && !strcmp(out, want);
+    if (!ok) fprintf(stderr, "printf '%s' gave [%s]\n", fmt_, out);
+    free(out);
+    return ok;
+}
+
+TEST(utf8_invalid_bytes_are_replaced) {
+    CHECK(printf_gives("\\\\377\\\\376ok", FFFD FFFD "ok\n[exit 0]"));    /* stray bytes */
+    CHECK(printf_gives("a\\\\000b", "a" FFFD "b\n[exit 0]"));               /* NUL no longer truncates */
+    CHECK(printf_gives("\\\\300\\\\257", FFFD FFFD "\n[exit 0]"));         /* overlong '/' */
+    CHECK(printf_gives("\\\\355\\\\240\\\\200", FFFD FFFD FFFD "\n[exit 0]")); /* surrogate */
+    CHECK(printf_gives("x\\\\342\\\\202", "x" FFFD FFFD "\n[exit 0]"));    /* cut-off sequence */
+    CHECK(printf_gives("\\\\364\\\\220\\\\200\\\\200", FFFD FFFD FFFD FFFD "\n[exit 0]")); /* > U+10FFFF */
+    return 0;
+}
+
+TEST(utf8_valid_text_is_unchanged) {
+    CHECK(printf_gives("h\xc3\xa9llo \xe2\x82\xac \xf0\x9d\x84\x9e", /* é, €, U+1D11E */
+                       "h\xc3\xa9llo \xe2\x82\xac \xf0\x9d\x84\x9e\n[exit 0]"));
+    return 0;
+}
+
+TEST(utf8_read_replaces_latin1) {
+    put("l1.txt", "caf\xe9\n");
+    int err;
+    char *out = tool("read", "{\"path\":\"l1.txt\"}", &err);
+    CHECK(!err && !strcmp(out, "caf" FFFD "\n"));
+    free(out);
+    return 0;
+}
+
+TEST(utf8_truncation_does_not_split_a_character) {
+    /* 102399 ASCII bytes, then a 3-byte euro sign straddling the 102400-byte cap */
+    int err;
+    char *out = tool("shell", "{\"command\":\"head -c 102399 /dev/zero | tr '\\\\0' a; "
+                              "printf '\\\\342\\\\202\\\\254tail'\"}", &err);
+    CHECK(!err);
+    CHECK(strspn(out, "a") == 102399);
+    CHECK(!strncmp(out + 102399, "\n[truncated: 102406 bytes total, first 102399 shown]", 52));
     free(out);
     return 0;
 }
@@ -283,6 +433,19 @@ TEST(step_failures_leave_history_alone) {
     return 0;
 }
 
+TEST(clear_keeps_only_system_prompt) {
+    put("f", "data");
+    CHECK(step("{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":["
+               "{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read\","
+               "\"arguments\":\"{\\\"path\\\":\\\"f\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}") == 1);
+    CHECK(cJSON_GetArraySize(A.messages) == 3);
+    agent_clear(&A);
+    CHECK(cJSON_GetArraySize(A.messages) == 1 && !strcmp(field(msg(0), "role"), "system"));
+    agent_clear(&A); /* idempotent */
+    CHECK(cJSON_GetArraySize(A.messages) == 1);
+    return 0;
+}
+
 /* ---- REPL command parsing ---- */
 
 TEST(command_parsing) {
@@ -305,6 +468,17 @@ static const struct { const char *name; int (*fn)(void); int needs_agent; } TEST
     {"tool_shell_status_and_redirects", test_tool_shell_status_and_redirects, 1},
     {"tool_output_is_capped", test_tool_output_is_capped, 1},
     {"tool_unknown", test_tool_unknown, 1},
+    {"utf8_invalid_bytes_are_replaced", test_utf8_invalid_bytes_are_replaced, 1},
+    {"utf8_valid_text_is_unchanged", test_utf8_valid_text_is_unchanged, 1},
+    {"utf8_read_replaces_latin1", test_utf8_read_replaces_latin1, 1},
+    {"utf8_truncation_does_not_split_a_character", test_utf8_truncation_does_not_split_a_character,
+     1},
+    {"shell_timeout_kills_process_group", test_shell_timeout_kills_process_group, 1},
+    {"shell_timeout_is_clamped", test_shell_timeout_is_clamped, 1},
+    {"shell_background_job_with_redirect_returns", test_shell_background_job_with_redirect_returns,
+     1},
+    {"shell_interrupt_kills_process_group", test_shell_interrupt_kills_process_group, 1},
+    {"step_interrupt_skips_remaining_calls", test_step_interrupt_skips_remaining_calls, 1},
     {"state_roundtrip", test_state_roundtrip, 0},
     {"state_falls_back_to_home", test_state_falls_back_to_home, 0},
     {"provider_selection", test_provider_selection, 0},
@@ -319,6 +493,7 @@ static const struct { const char *name; int (*fn)(void); int needs_agent; } TEST
     {"step_null_content_without_calls_becomes_empty",
      test_step_null_content_without_calls_becomes_empty, 1},
     {"step_failures_leave_history_alone", test_step_failures_leave_history_alone, 1},
+    {"clear_keeps_only_system_prompt", test_clear_keeps_only_system_prompt, 1},
     {"command_parsing", test_command_parsing, 0},
 };
 

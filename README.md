@@ -7,7 +7,9 @@ Minimal code agent in C with four tools:
 | `read`  | return a file's contents                          | no         |
 | `write` | create or overwrite a file                        | yes        |
 | `edit`  | replace a unique `old_string` with `new_string`   | yes        |
-| `shell` | run `/bin/sh` and return output plus exit status  | yes        |
+| `shell` | run `/bin/sh` and return output plus exit status; killed after `timeout` seconds (default 120, max 600) | yes        |
+
+Tool output is capped at 100 KB and cleaned to valid UTF-8: invalid bytes and NUL become U+FFFD.
 
 ## Build
 
@@ -72,6 +74,14 @@ REPL commands:
 |--------------------|---------------------------------------------------------|
 | `/model [id]`      | show the current model, or switch to `id` (remembered)  |
 | `/models [filter]` | list the provider's models whose id contains `filter`; `*` marks the current one |
+| `/clear`           | start a new conversation; provider and model are kept   |
 | `/exit`            | quit                                                    |
+
+Ctrl-C:
+
+- During a `shell` command: kills the command and its children, skips the turn's remaining tool calls, and ends the turn.
+- While waiting for the model: stops the request within about a second; the turn is rolled back.
+- At the REPL prompt: drops the line. Ctrl-D or `/exit` quits.
+- Headless: the same, then exit with status 130.
 
 Model text goes to stdout. Tool calls, prompts and errors go to stderr. Confirmation reads from `/dev/tty`. With no terminal and no `-y`, mutating tools are denied.

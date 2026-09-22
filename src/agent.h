@@ -3,7 +3,16 @@
 #define AGENT_H
 
 #include <cJSON.h>
+#include <signal.h>
 #include <stddef.h>
+
+#define AGENT_SHELL_TIMEOUT 120 /* seconds, when the model gives none */
+#define AGENT_SHELL_TIMEOUT_MAX 600
+
+/* Set it from a SIGINT handler installed without SA_RESTART. It stops the running
+   shell command (killing its process group) or model request, and ends the turn.
+   agent_ask clears it on entry. */
+extern volatile sig_atomic_t agent_interrupted;
 
 typedef struct {
     const char *name, *key_env, *base_env, *base, *model;
@@ -35,6 +44,8 @@ void agent_free(agent *a);
 
 /* Run one user turn. -1 on failure, with history rolled back to before the turn. */
 int agent_ask(agent *a, const char *text);
+/* Drop the conversation, keeping the system prompt. */
+void agent_clear(agent *a);
 /* Switch model; it is remembered after the next successful response. */
 void agent_set_model(agent *a, const char *model);
 /* Print the provider's model ids that contain filter, ignoring case; the current one is starred. */

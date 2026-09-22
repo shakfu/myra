@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import threading
@@ -39,13 +40,17 @@ class Mock:
                 mock.requests.append({"method": method, "path": self.path,
                                       "headers": {k.lower(): v for k, v in self.headers.items()},
                                       "body": body})
-                status, reply = mock.replies.pop(0)
+                status, reply, *delay = mock.replies.pop(0)  # optional third item: seconds
+                time.sleep(delay[0] if delay else 0)
                 data = json.dumps(reply).encode()
-                self.send_response(status)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                try:
+                    self.send_response(status)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # the agent gave up, e.g. after Ctrl-C
 
             def log_message(self, *a):
                 pass
@@ -295,6 +300,16 @@ def test_no_key_and_no_provider_is_an_error(mock, tmp_path, key):
     assert p.returncode == 1
     assert "set OPENROUTER_API_KEY or pass -P local" in p.stderr
     assert not mock.requests  # never falls back to local
+
+
+@pytest.mark.parametrize("name", ["local", "openrouter"])
+@pytest.mark.parametrize("flags", [[], ["-P", "local"]])
+def test_provider_name_as_prompt_hints_at_P(mock, tmp_path, name, flags):
+    remember(tmp_path, "local")  # would otherwise run: the prompt must still be refused
+    p = Api(mock, "local").run(tmp_path, *flags, "-p", name, provider_flag=False)
+    assert p.returncode == 2
+    assert p.stderr == f"error: -p takes a prompt; did you mean -P {name}?\n"
+    assert not mock.requests
 
 
 @pytest.mark.parametrize("name", ["nope", "anthropic", "openai", "compat"])
@@ -592,3 +607,112 @@ def test_refused_connection_fails_fast(tmp_path, stdin):
         assert p.returncode == 0
         assert msg % "models" in p.stderr and msg % "chat/completions" in p.stderr
     assert not (tmp_path / ".state/ant/provider").exists()
+
+
+# ---- Ctrl-C (SIGINT) ----
+
+def start(api, cwd, *args):
+    """Start the agent without waiting; stderr's first line is read by the caller if needed."""
+    return subprocess.Popen([str(AGENT), "-P", api.provider, *args], cwd=cwd, env=api.env(cwd),
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+
+
+def wait_for(cond, timeout=10):
+    end = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < end, "timed out waiting"
+        time.sleep(0.05)
+
+
+def pid_gone(path):
+    pid = int(path.read_text())
+    for _ in range(40):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_sigint_during_shell_kills_it_and_exits_130(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[("s", "shell", {"command": "sleep 30 & echo $! > pid; wait"}),
+                     ("t", "shell", {"command": "touch never"})])
+    p = start(api, tmp_path, "-y", "-p", "go")
+    wait_for(lambda: (tmp_path / "pid").exists() and (tmp_path / "pid").read_text().strip())
+    t = time.monotonic()
+    p.send_signal(signal.SIGINT)
+    out, err = p.communicate(timeout=10)
+    assert time.monotonic() - t < 4
+    assert p.returncode == 130, err
+    assert "interrupted" in err
+    assert pid_gone(tmp_path / "pid")  # the command's child was killed too
+    assert not (tmp_path / "never").exists()  # the second call was skipped
+    assert len(mock.requests) == 1  # no follow-up request after the interrupt
+
+
+def test_sigint_during_request_exits_130(mock, tmp_path):
+    api = Api(mock, "local")
+    mock.replies.append((200, {"choices": []}, 20))  # the server stalls
+    p = start(api, tmp_path, "-p", "go")
+    wait_for(lambda: mock.requests)
+    t = time.monotonic()
+    p.send_signal(signal.SIGINT)
+    out, err = p.communicate(timeout=10)
+    assert time.monotonic() - t < 3  # curl checks roughly once a second
+    assert p.returncode == 130 and "interrupted" in err
+    assert "retrying" not in err
+
+
+def test_repl_survives_sigint_at_prompt_and_mid_turn(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[("s", "shell", {"command": "echo $$ > pid; sleep 30"})])
+    api.reply("after")
+    p = start(api, tmp_path, "-y")
+    assert p.stderr.readline() == "local local\n"  # handler is installed by now
+    p.send_signal(signal.SIGINT)  # at the prompt: the line is dropped, the REPL stays
+    time.sleep(0.3)
+    p.stdin.write("first\n")
+    p.stdin.flush()
+    wait_for(lambda: (tmp_path / "pid").exists() and (tmp_path / "pid").read_text().strip())
+    p.send_signal(signal.SIGINT)  # mid-turn: the command is killed, the turn ends
+    wait_for(lambda: pid_gone(tmp_path / "pid"))
+    out, err = p.communicate("second\n", timeout=10)
+    assert p.returncode == 0, err
+    assert out == "after\n"
+    msgs = mock.requests[1]["body"]["messages"]
+    assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool", "user"]
+    assert msgs[3]["content"] == "error: [interrupted by user; killed]"
+    assert msgs[4]["content"] == "second"
+
+
+# ---- /clear ----
+
+def test_clear_starts_a_new_conversation(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("a")
+    api.reply("b")
+    p = api.run(tmp_path, "-m", "qwen", stdin="one\n/clear\ntwo\n/model\n")
+    assert p.returncode == 0, p.stderr
+    assert "history cleared\n" in p.stderr
+    assert "local qwen\n" in p.stderr  # model and provider are kept
+    msgs = mock.requests[1]["body"]["messages"]
+    assert [m["role"] for m in msgs] == ["system", "user"]
+    assert msgs[0] == mock.requests[0]["body"]["messages"][0]  # same system prompt
+    assert msgs[1]["content"] == "two" and mock.requests[1]["body"]["model"] == "qwen"
+
+
+# ---- UTF-8 ----
+
+def test_invalid_utf8_tool_output_reaches_server_as_valid_json(api, tmp_path):
+    (tmp_path / "l1.txt").write_bytes(b"caf\xe9\n")
+    api.reply(calls=[("s", "shell", {"command": "printf '\\377ok\\000!'"}),
+                     ("r", "read", {"path": "l1.txt"})])
+    api.reply("ok")
+    p = api.run(tmp_path, "-y", "-p", "go")
+    assert p.returncode == 0, p.stderr
+    r = api.results(api.mock.requests[1])  # the mock json-decoded this body
+    assert r["s"] == ("\ufffdok\ufffd!\n[exit 0]", False)
+    assert r["r"] == ("caf\ufffd\n", False)

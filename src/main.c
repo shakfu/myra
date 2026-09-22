@@ -1,6 +1,8 @@
 /* main.c - the agent CLI: options, provider choice, headless mode and the REPL. */
 #include "agent.h"
 
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,8 +19,14 @@ static int usage(const char *argv0, int rc) {
             "REPL commands:\n"
             "  /model [id]        show or switch the model\n"
             "  /models [filter]   list the provider's models whose id contains filter\n"
+            "  /clear             start a new conversation\n"
             "  /exit              quit\n", argv0);
     return rc;
+}
+
+static void on_sigint(int sig) {
+    (void)sig;
+    agent_interrupted = 1;
 }
 
 static void repl(agent *a) {
@@ -29,11 +37,22 @@ static void repl(agent *a) {
     int tty = isatty(STDIN_FILENO); /* no prompt when input is piped */
     for (;;) {
         if (tty) fputs("> ", stderr);
-        if ((n = getline(&line, &cap, stdin)) < 0) break;
+        if ((n = getline(&line, &cap, stdin)) < 0) {
+            if (errno != EINTR || !agent_interrupted) break; /* EOF or read error */
+            agent_interrupted = 0; /* Ctrl-C at the prompt: drop the line */
+            clearerr(stdin);
+            fputc('\n', stderr);
+            continue;
+        }
         while (n && strchr(" \t\r\n", line[n - 1])) line[--n] = 0;
         if (!n) continue;
         const char *arg;
         if (!strcmp(line, "/exit")) break;
+        if (!strcmp(line, "/clear")) {
+            agent_clear(a);
+            fprintf(stderr, "history cleared\n");
+            continue;
+        }
         if ((arg = agent_command(line, "/models"))) {
             agent_list_models(a, arg);
             continue;
@@ -59,6 +78,10 @@ int main(int argc, char **argv) {
         else return usage(argv[0], opt == 'h' ? 0 : 2);
     }
     if (optind < argc) return usage(argv[0], 2);
+    if (prompt && agent_provider_named(prompt)) { /* -p and -P differ only by case */
+        fprintf(stderr, "error: -p takes a prompt; did you mean -P %s?\n", prompt);
+        return 2;
+    }
 
     const agent_provider *p;
     if (pname) {
@@ -77,9 +100,19 @@ int main(int argc, char **argv) {
     agent a;
     if (agent_init(&a, p, model, auto_yes) < 0) return 1;
     a.save_provider = pname != NULL;
+    /* No SA_RESTART: blocking reads return EINTR, so Ctrl-C takes effect at once. */
+    struct sigaction sa = {0};
+    sa.sa_handler = on_sigint;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+
     int rc = 0;
-    if (prompt) rc = agent_ask(&a, prompt) < 0;
-    else repl(&a);
+    if (prompt) {
+        rc = agent_ask(&a, prompt) < 0;
+        if (agent_interrupted) rc = 130; /* 128 + SIGINT, as a shell would report */
+    } else {
+        repl(&a);
+    }
     agent_free(&a);
     return rc;
 }

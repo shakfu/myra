@@ -19,7 +19,22 @@ myra builds to one binary of about 110 KB (macOS, Release). It links only libc, 
 
 ## Build
 
-Requires CMake 3.16+ and libcurl; libedit, if found, adds line editing to the REPL. macOS ships both libraries. On Debian or Ubuntu: `apt install libcurl4-openssl-dev libedit-dev`. cJSON 1.7.19 (MIT) is vendored in `vendor/cjson/`. The Makefile wraps CMake and uses Ninja when installed.
+Requires CMake 3.16+, a C11 compiler and libcurl. Everything else is optional. cJSON 1.7.19 (MIT) is vendored in `vendor/cjson/`. The Makefile wraps CMake and uses Ninja when installed.
+
+| Dependency   | Needed for            | Debian or Ubuntu       | macOS                    |
+|--------------|-----------------------|------------------------|--------------------------|
+| CMake 3.16+  | building              | `cmake`                | `brew install cmake`     |
+| C11 compiler | building              | `build-essential`      | `xcode-select --install` |
+| libcurl      | building              | `libcurl4-openssl-dev` | Command Line Tools       |
+| libedit      | REPL line editing     | `libedit-dev`          | Command Line Tools       |
+| Ninja        | faster builds         | `ninja-build`          | `brew install ninja`     |
+| uv           | the `e2e` test        | [docs.astral.sh/uv](https://docs.astral.sh/uv/getting-started/installation/) | same |
+
+On Debian and Ubuntu, `apt install libcurl4-openssl-dev libedit-dev` covers the build. Two libcurl dev packages exist, `libcurl4-openssl-dev` and `libcurl4-gnutls-dev`; they conflict, and CI uses the OpenSSL one. myra never names a TLS backend, so either compiles. Fedora calls the package `libcurl-devel`, Arch `curl`.
+
+macOS needs only CMake from Homebrew. libcurl and libedit ship with the Command Line Tools.
+
+Missing libcurl stops configure with `Could NOT find CURL`. A missing optional dependency prints a message and the build continues.
 
     make              # configure and build into build/; ./myra links to build/myra
     make test         # ctest: unit tests plus the end-to-end suite

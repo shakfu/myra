@@ -1036,6 +1036,7 @@ def test_terminal_history_persists_across_runs(mock, tmp_path):
     tty.expect(b"> ")
     tty.type(b"\x1b[A\r")
     tty.expect(b"second")
+    tty.expect(b"> ", 2)
     tty.type(b"\x04")
     assert tty.wait() == 0
     assert mock.requests[1]["body"]["messages"][-1]["content"] == "remember me"

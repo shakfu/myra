@@ -28,3 +28,7 @@ clean:
 	rm -f myra
 
 .PHONY: all test asan install clean
+
+# cmake writes CMakeCache.txt before it fails; without this a failed configure
+# leaves a cache behind and the next make skips configure and reports a missing Makefile.
+.DELETE_ON_ERROR:

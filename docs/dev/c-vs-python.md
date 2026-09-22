@@ -41,8 +41,11 @@ Task, run with `-P local --permissions all -p`: "Use the write tool to create no
 Controls:
 
 - `--temp 0`: greedy decoding, so both agents receive the same tokens.
+
 - One fixed working directory, emptied between runs. The system prompt contains the path, so a different path changes the model's input.
+
 - `XDG_STATE_HOME` in a scratch directory, so no user state is read or written.
+
 - One warmup run per agent, then 5 runs, alternating C, 3.11, 3.14.
 
 Every run made 2 requests, used 1270 tokens in and 73 out, ran 2 tools, and gave the same answer.
@@ -60,7 +63,9 @@ The agent CPU under a live model is 3 to 4 times what the no-model results predi
 ## When the difference matters
 
 - Replies streamed at thousands of tokens per second, where 5 to 10 µs per event becomes visible.
+
 - Scripts that start the agent many times: Python adds 60 to 100 ms per start.
+
 - Machines where CPU time is limited or billed.
 
 For interactive use with a 4B model on an M1, it does not matter. A fast cloud model shortens the wait, but Python's added cost stays in milliseconds per request.
@@ -68,7 +73,9 @@ For interactive use with a 4B model on an M1, it does not matter. A fast cloud m
 ## Other observations
 
 - Llama 3.2 1B (`Llama-3.2-1B-Instruct-Q4_K_M.gguf`) failed every run. `llama-server` rejected its tool calls with HTTP 500 "The model produced output that does not match the expected peg-native format".
+
 - Both agents retried that 500 four times. With greedy decoding every retry gets the same reply, so the retries only add latency.
+
 - Python 3.14 is slower than 3.11 in every measurement here, by 45 to 75% in startup and CPU time.
 
 ## Reproducing

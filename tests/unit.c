@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -22,7 +24,7 @@
 
 static agent A;
 
-static int local_agent(void) { return agent_init(&A, agent_provider_named("local"), NULL, 1); }
+static int local_agent(void) { return agent_init(&A, agent_provider_named("local"), NULL, AGENT_AUTO); }
 
 static void put(const char *path, const char *s) {
     FILE *f = fopen(path, "wb");
@@ -59,6 +61,12 @@ static const char *field(cJSON *o, const char *k) {
     return cJSON_GetStringValue(cJSON_GetObjectItem(o, k));
 }
 
+static double secs(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
 /* ---- tools ---- */
 
 TEST(tool_write_then_read) {
@@ -68,6 +76,81 @@ TEST(tool_write_then_read) {
     free(out);
     out = tool("read", "{\"path\":\"a.txt\"}", &err);
     CHECK(!err && !strcmp(out, "one\ntwo\n"));
+    free(out);
+    return 0;
+}
+
+/* No temporary file left behind in the current directory. */
+static int no_temp_files(void) {
+    DIR *d = opendir(".");
+    struct dirent *e;
+    int found = 0;
+    while (d && (e = readdir(d)))
+        if (!strncmp(e->d_name, ".ant-tmp-", 9)) found = 1;
+    if (d) closedir(d);
+    return !found;
+}
+
+TEST(write_keeps_mode_and_follows_symlinks) {
+    int err;
+    put("m.txt", "old");
+    chmod("m.txt", 0754);
+    char *out = tool("write", "{\"path\":\"m.txt\",\"content\":\"new\"}", &err);
+    struct stat st;
+    CHECK(!err && stat("m.txt", &st) == 0 && (st.st_mode & 07777) == 0754);
+    CHECK(!strcmp(get("m.txt"), "new"));
+    free(out);
+    put("real.txt", "old");
+    CHECK(symlink("real.txt", "link") == 0);
+    out = tool("edit", "{\"path\":\"link\",\"old_string\":\"old\",\"new_string\":\"via link\"}", &err);
+    CHECK(!err && lstat("link", &st) == 0 && S_ISLNK(st.st_mode)); /* still a link */
+    CHECK(!strcmp(get("real.txt"), "via link"));
+    free(out);
+    umask(027);
+    out = tool("write", "{\"path\":\"fresh.txt\",\"content\":\"x\"}", &err);
+    CHECK(!err && stat("fresh.txt", &st) == 0 && (st.st_mode & 07777) == 0640); /* umask applies */
+    free(out);
+    CHECK(no_temp_files());
+    return 0;
+}
+
+TEST(failed_write_keeps_the_original) {
+    signal(SIGXFSZ, SIG_IGN); /* a write past the limit then fails with EFBIG */
+    struct rlimit rl = {4096, 4096};
+    CHECK(setrlimit(RLIMIT_FSIZE, &rl) == 0);
+    put("keep.txt", "original\n");
+    char big[16384];
+    memset(big, 'x', sizeof big - 1);
+    big[sizeof big - 1] = 0;
+    cJSON *in = cJSON_CreateObject();
+    cJSON_AddStringToObject(in, "path", "keep.txt");
+    cJSON_AddStringToObject(in, "content", big);
+    int err;
+    char *out = agent_run_tool(&A, "write", in, &err);
+    cJSON_Delete(in);
+    CHECK(err && strstr(out, "cannot write"));
+    CHECK(!strcmp(get("keep.txt"), "original\n")); /* not truncated */
+    free(out);
+    in = cJSON_CreateObject();
+    cJSON_AddStringToObject(in, "path", "keep.txt");
+    cJSON_AddStringToObject(in, "old_string", "original");
+    cJSON_AddStringToObject(in, "new_string", big);
+    out = agent_run_tool(&A, "edit", in, &err);
+    cJSON_Delete(in);
+    CHECK(err && !strcmp(get("keep.txt"), "original\n"));
+    free(out);
+    CHECK(no_temp_files());
+    return 0;
+}
+
+TEST(write_in_place_when_directory_is_read_only) {
+    CHECK(mkdir("ro", 0755) == 0);
+    put("ro/f.txt", "old");
+    chmod("ro", 0555);
+    int err;
+    char *out = tool("write", "{\"path\":\"ro/f.txt\",\"content\":\"new\"}", &err);
+    chmod("ro", 0755); /* so the runner can clean up */
+    CHECK(!err && !strcmp(get("ro/f.txt"), "new"));
     free(out);
     return 0;
 }
@@ -151,7 +234,76 @@ TEST(max_output_env_override) {
     CHECK(local_agent() == 0 && A.max_output == 16384);
     agent_free(&A);
     unsetenv("AGENT_MAX_OUTPUT");
-    CHECK(agent_init(&A, agent_provider_named("local"), NULL, 1) == 0 && A.max_output == 16384);
+    CHECK(agent_init(&A, agent_provider_named("local"), NULL, AGENT_AUTO) == 0 && A.max_output == 16384);
+    return 0;
+}
+
+/* Peak resident memory in bytes: macOS reports bytes, Linux kilobytes. */
+static size_t peak_rss(void) {
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+#ifdef __APPLE__
+    return (size_t)ru.ru_maxrss;
+#else
+    return (size_t)ru.ru_maxrss * 1024;
+#endif
+}
+
+TEST(shell_output_does_not_grow_memory) {
+    int err;
+    double t = secs();
+    /* 50 MB through the pipe, with a 16 KB cap: the middle is never held. */
+    char *out = tool("shell", "{\"command\":\"head -c 50000000 /dev/zero | tr '\\\\0' a\"}", &err);
+    CHECK(!err && secs() - t < 30);
+    CHECK(peak_rss() < 80u * 1024 * 1024); /* the whole output would be 50 MB */
+    CHECK(strspn(out, "a") == 3276 && strstr(out, "\n[... 49983616 bytes omitted ...]\n"));
+    CHECK(!strcmp(out + strlen(out) - 9, "\n[exit 0]"));
+    free(out);
+    return 0;
+}
+
+TEST(shell_stops_after_the_raw_output_limit) {
+    int err;
+    double t = secs();
+    char *out = tool("shell", "{\"command\":\"yes hello\"}", &err); /* endless output */
+    CHECK(err && secs() - t < 60);
+    CHECK(strstr(out, "[stopped after 64 MB of output; killed]"));
+    CHECK(peak_rss() < 80u * 1024 * 1024);
+    free(out);
+    return 0;
+}
+
+TEST(read_of_a_huge_file_skips_the_middle) {
+    int err;
+    FILE *f = fopen("big", "wb"); /* 40 MB: head of a's, tail of z's */
+    char *block = malloc(1 << 20);
+    memset(block, 'a', 1 << 20);
+    for (int i = 0; i < 40; i++) {
+        if (i == 39) memset(block, 'z', 1 << 20);
+        fwrite(block, 1, 1 << 20, f);
+    }
+    free(block);
+    fclose(f);
+    double t = secs();
+    char *out = tool("read", "{\"path\":\"big\"}", &err);
+    CHECK(!err && secs() - t < 5); /* seeks, rather than reading 40 MB */
+    CHECK(peak_rss() < 80u * 1024 * 1024);
+    CHECK(strspn(out, "a") == 3276);
+    CHECK(strstr(out, "\n[... 41926656 bytes omitted ...]\n"));
+    CHECK(out[strlen(out) - 1] == 'z');
+    free(out);
+    return 0;
+}
+
+TEST(edit_refuses_a_huge_file) {
+    int err;
+    CHECK(truncate("big", 0) == 0 || 1);
+    FILE *f = fopen("big2", "wb");
+    CHECK(fseeko(f, 65 * 1024 * 1024, SEEK_SET) == 0 && fputc('x', f) == 'x');
+    fclose(f);
+    char *out = tool("edit", "{\"path\":\"big2\",\"old_string\":\"x\",\"new_string\":\"y\"}", &err);
+    CHECK(err && strstr(out, "too large to edit"));
+    free(out);
     return 0;
 }
 
@@ -161,12 +313,6 @@ TEST(tool_unknown) {
     CHECK(err && strstr(out, "unknown tool"));
     free(out);
     return 0;
-}
-
-static double secs(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec / 1e9;
 }
 
 /* Wait up to 2 s for the pid written to path to disappear. */
@@ -215,6 +361,22 @@ TEST(shell_timeout_is_clamped) {
     free(out);
     out = tool("shell", "{\"command\":\"echo ok\",\"timeout\":\"soon\"}", &err); /* default */
     CHECK(!err && !strcmp(out, "ok\n[exit 0]"));
+    free(out);
+    t = secs(); /* out of int range: clamped, not undefined (make asan fails on UB) */
+    out = tool("shell", "{\"command\":\"sleep 30\",\"timeout\":-1e20}", &err);
+    CHECK(secs() - t < 4 && !strcmp(out, "[timed out after 1s; killed]"));
+    free(out);
+    const char *huge[] = {"1e20", "1e999"}; /* 1e999 parses as infinity */
+    for (int i = 0; i < 2; i++) {
+        char cmd[64];
+        snprintf(cmd, sizeof cmd, "{\"command\":\"true\",\"timeout\":%s}", huge[i]);
+        out = tool("shell", cmd, &err);
+        CHECK(!err && !strcmp(out, "[exit 0]"));
+        free(out);
+    }
+    t = secs(); /* fractions are truncated */
+    out = tool("shell", "{\"command\":\"sleep 30\",\"timeout\":2.9}", &err);
+    CHECK(secs() - t < 5 && !strcmp(out, "[timed out after 2s; killed]"));
     free(out);
     return 0;
 }
@@ -372,9 +534,9 @@ TEST(provider_default_prefers_usable_remembered) {
 }
 
 TEST(init_requires_cloud_key) {
-    CHECK(agent_init(&A, agent_provider_named("openrouter"), NULL, 0) == -1);
+    CHECK(agent_init(&A, agent_provider_named("openrouter"), NULL, AGENT_AUTO) == -1);
     setenv("OPENROUTER_API_KEY", "k", 1);
-    CHECK(agent_init(&A, agent_provider_named("openrouter"), NULL, 0) == 0);
+    CHECK(agent_init(&A, agent_provider_named("openrouter"), NULL, AGENT_AUTO) == 0);
     CHECK(!strcmp(A.api_key, "k") && !strcmp(A.model, "anthropic/claude-opus-5"));
     agent_free(&A);
     return 0;
@@ -382,14 +544,14 @@ TEST(init_requires_cloud_key) {
 
 TEST(init_model_precedence) {
     const agent_provider *p = agent_provider_named("local");
-    CHECK(agent_init(&A, p, NULL, 0) == 0 && !strcmp(A.model, "local") && !A.save_model);
+    CHECK(agent_init(&A, p, NULL, AGENT_AUTO) == 0 && !strcmp(A.model, "local") && !A.save_model);
     agent_free(&A);
     agent_store_state("local.model", "qwen");
-    CHECK(agent_init(&A, p, NULL, 0) == 0 && !strcmp(A.model, "qwen") && !A.save_model);
+    CHECK(agent_init(&A, p, NULL, AGENT_AUTO) == 0 && !strcmp(A.model, "qwen") && !A.save_model);
     agent_free(&A);
-    CHECK(agent_init(&A, p, "qwen", 0) == 0 && !A.save_model); /* same: no rewrite */
+    CHECK(agent_init(&A, p, "qwen", AGENT_AUTO) == 0 && !A.save_model); /* same: no rewrite */
     agent_free(&A);
-    CHECK(agent_init(&A, p, "llama", 0) == 0 && !strcmp(A.model, "llama") && A.save_model);
+    CHECK(agent_init(&A, p, "llama", AGENT_AUTO) == 0 && !strcmp(A.model, "llama") && A.save_model);
     agent_set_model(&A, "gemma");
     CHECK(!strcmp(A.model, "gemma") && A.save_model);
     return 0;
@@ -425,6 +587,23 @@ TEST(step_runs_tool_calls) {
     CHECK(!strcmp(field(msg(2), "role"), "tool") && !strcmp(field(msg(2), "tool_call_id"), "c1"));
     CHECK(!strcmp(field(msg(2), "content"), "data"));
     CHECK(!strcmp(field(msg(3), "content"), "error: invalid JSON arguments for shell"));
+    return 0;
+}
+
+TEST(step_generates_missing_call_ids) {
+    put("f", "data");
+    CHECK(step("{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":["
+               "{\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"f\\\"}\"}},"
+               "{\"id\":null,\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"f\\\"}\"}},"
+               "{\"id\":\"srv\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"f\\\"}\"}}"
+               "]},\"finish_reason\":\"tool_calls\"}]}") == 1);
+    cJSON *calls = cJSON_GetObjectItem(msg(1), "tool_calls");
+    const char *want[] = {"ant_call_0", "ant_call_1", "srv"};
+    for (int i = 0; i < 3; i++) { /* each call and its result carry the same id */
+        CHECK(!strcmp(field(cJSON_GetArrayItem(calls, i), "id"), want[i]));
+        CHECK(!strcmp(field(msg(2 + i), "tool_call_id"), want[i]));
+        CHECK(!strcmp(field(msg(2 + i), "content"), "data"));
+    }
     return 0;
 }
 
@@ -483,6 +662,10 @@ TEST(command_parsing) {
 
 static const struct { const char *name; int (*fn)(void); int needs_agent; } TESTS[] = {
     {"tool_write_then_read", test_tool_write_then_read, 1},
+    {"write_keeps_mode_and_follows_symlinks", test_write_keeps_mode_and_follows_symlinks, 1},
+    {"failed_write_keeps_the_original", test_failed_write_keeps_the_original, 1},
+    {"write_in_place_when_directory_is_read_only", test_write_in_place_when_directory_is_read_only,
+     1},
     {"tool_edit_replaces_unique_match", test_tool_edit_replaces_unique_match, 1},
     {"tool_edit_errors_leave_file_unchanged", test_tool_edit_errors_leave_file_unchanged, 1},
     {"tool_read_errors", test_tool_read_errors, 1},
@@ -490,6 +673,10 @@ static const struct { const char *name; int (*fn)(void); int needs_agent; } TEST
     {"tool_output_keeps_start_and_end", test_tool_output_keeps_start_and_end, 1},
     {"max_output_env_override", test_max_output_env_override, 1},
     {"tool_unknown", test_tool_unknown, 1},
+    {"shell_output_does_not_grow_memory", test_shell_output_does_not_grow_memory, 1},
+    {"shell_stops_after_the_raw_output_limit", test_shell_stops_after_the_raw_output_limit, 1},
+    {"read_of_a_huge_file_skips_the_middle", test_read_of_a_huge_file_skips_the_middle, 1},
+    {"edit_refuses_a_huge_file", test_edit_refuses_a_huge_file, 1},
     {"utf8_invalid_bytes_are_replaced", test_utf8_invalid_bytes_are_replaced, 1},
     {"utf8_valid_text_is_unchanged", test_utf8_valid_text_is_unchanged, 1},
     {"utf8_read_replaces_latin1", test_utf8_read_replaces_latin1, 1},
@@ -511,6 +698,7 @@ static const struct { const char *name; int (*fn)(void); int needs_agent; } TEST
     {"init_builds_system_message_and_tools", test_init_builds_system_message_and_tools, 1},
     {"step_text_reply_finishes", test_step_text_reply_finishes, 1},
     {"step_runs_tool_calls", test_step_runs_tool_calls, 1},
+    {"step_generates_missing_call_ids", test_step_generates_missing_call_ids, 1},
     {"step_length_drops_tool_calls", test_step_length_drops_tool_calls, 1},
     {"step_null_content_without_calls_becomes_empty",
      test_step_null_content_without_calls_becomes_empty, 1},

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ant VERSION 0.1.0 LANGUAGES C)
+project(ant VERSION 0.1.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -10,8 +10,10 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(AGENT_SANITIZE "Build with AddressSanitizer and UBSan" OFF)
+option(AGENT_WERROR "Treat our own warnings as errors (CI)" OFF)
 if(AGENT_SANITIZE)
-  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+  # no-recover: undefined behaviour fails the test instead of printing a warning.
+  add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
   add_link_options(-fsanitize=address,undefined)
 endif()
 
@@ -24,6 +26,9 @@ target_link_libraries(cjson PRIVATE m)
 target_compile_options(cjson PRIVATE -Wno-deprecated-declarations) # sprintf, in upstream code
 
 set(WARNINGS -Wall -Wextra)
+if(AGENT_WERROR)
+  list(APPEND WARNINGS -Werror) # our targets only: vendored cJSON keeps its warnings
+endif()
 
 add_library(agentlib STATIC src/agent.c)
 target_include_directories(agentlib PUBLIC src)
@@ -46,6 +51,8 @@ if(EDITLINE_INCLUDE AND EDIT_LIB)
 else()
   message(STATUS "libedit not found: the REPL has no line editing")
 endif()
+
+install(TARGETS agent RUNTIME DESTINATION bin)
 
 enable_testing()
 

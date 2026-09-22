@@ -2,14 +2,16 @@
 
 Minimal code agent in C with four tools:
 
-| Tool    | Does                                              | Asks first |
-|---------|---------------------------------------------------|------------|
-| `read`  | return a file's contents                          | no         |
-| `write` | create or overwrite a file                        | yes        |
-| `edit`  | replace a unique `old_string` with `new_string`   | yes        |
-| `shell` | run `/bin/sh` and return output plus exit status; killed after `timeout` seconds (default 120, max 600) | yes        |
+| Tool    | Does                                              |
+|---------|---------------------------------------------------|
+| `read`  | return a file's contents                          |
+| `write` | create or overwrite a file                        |
+| `edit`  | replace a unique `old_string` with `new_string`   |
+| `shell` | run `/bin/sh` and return output plus exit status; killed after `timeout` seconds (default 120, max 600) |
 
 Tool output is capped per provider (see the table below). Over the cap, the first fifth and the last four fifths are kept, since errors and summaries come last. Output is cleaned to valid UTF-8: invalid bytes and NUL become U+FFFD.
+
+Only what is kept is held in memory, so a huge file or a flood of output costs nothing extra. `read` skips the middle of a large file; `shell` is killed after 64 MB of output; `edit` refuses a file above 64 MB, since it rewrites the whole file. A turn stops after 100 tool calls.
 
 ## Build
 
@@ -18,6 +20,7 @@ Requires CMake 3.16+ and libcurl; libedit, if found, adds line editing to the RE
     make              # configure and build into build/; ./agent links to build/agent
     make test         # ctest: unit tests plus the end-to-end suite
     make asan         # the same, in build-asan/ with AddressSanitizer and UBSan
+    make install      # PREFIX=/usr/local by default
     make clean
     make BUILD=out TYPE=Debug CMAKE_ARGS=-DAGENT_SANITIZE=ON   # overrides
 
@@ -66,10 +69,18 @@ Requests to `openrouter` carry a top-level `"cache_control": {"type": "ephemeral
     ./agent -p "fix the build"           # headless: one task, then exit
     ./agent -m openai/gpt-5.5 -p "..."   # any OpenRouter model id; remembered
     ./agent -P local                     # llama-server on :8080; remembered
-    ./agent -y -p "..."                  # no approval prompts (see below)
+    ./agent --permissions ask            # approve each write, edit and shell
+    ./agent --verbose                    # full tool arguments and results
+    ./agent --no-color                   # plain stderr
     ./agent -V                           # version
 
-Replies stream to stdout as they arrive. Tool calls, prompts, errors and a per-turn `[usage]` line (tokens in, cached, out; when the server reports them) go to stderr.
+Replies stream to stdout as they arrive. Everything else goes to stderr:
+
+- The REPL starts with `ant agent <version>`, then the provider and model.
+- Each tool call gets one line, cut to the terminal width. `--verbose` shows the full arguments and the result instead.
+- Each turn ends with `[usage]`: requests, tokens in (cached) and out, and the cost where the server reports it. OpenRouter does, in credits, which are dollars; llama-server does not. Leaving the REPL prints the `[session]` totals.
+
+stderr is colored on a terminal. `--no-color`, or a non-empty `NO_COLOR` ([no-color.org](https://no-color.org)), turns it off.
 
 REPL commands:
 
@@ -83,7 +94,20 @@ REPL commands:
 
 On a terminal, the REPL has line editing and history (libedit). Piped input is read line by line, without a prompt.
 
-Approval: `write`, `edit` and `shell` ask on `/dev/tty`. With no terminal they are refused. `-y` approves `shell`, and `write` and `edit` inside the working directory, with symlinks resolved. Paths outside it still ask, or are refused.
+`--permissions` sets when `write`, `edit` and `shell` run without asking:
+
+| Mode             | Runs without asking                                         |
+|------------------|-------------------------------------------------------------|
+| `auto` (default) | all three, except `write`/`edit` outside the working directory (symlinks resolved) |
+| `ask`            | none: each call asks on `/dev/tty`                          |
+| `all`            | all three, anywhere                                         |
+| `read-only`      | none: they are refused; `read` still runs                   |
+
+A call that would ask is refused when there is no terminal.
+
+The working-directory check guards against mistakes, not an adversary. `shell` can write anywhere, and a symlink swapped between the check and the write can redirect it.
+
+`write` and `edit` replace a file atomically: a failed write leaves the old contents. The new file keeps the mode and follows symlinks, but a hard-linked file gets its own copy.
 
 Ctrl-C:
 
@@ -118,7 +142,10 @@ Besides the provider variables above:
 
 ## Limitations
 
-- `-y` cannot confine `shell`: a command can still write anywhere.
+- `auto` cannot confine `shell`: a command can still write anywhere. Use `ask` or `read-only` where that matters.
+- `read` is not confined either: the model can read any file you can, including keys and history outside the project.
+- The REPL history file holds your prompts verbatim. Delete it, or point `XDG_STATE_HOME` elsewhere, if they are sensitive.
+- The atomic replacement falls back to writing in place where no temporary file can be created, such as a read-only directory holding a writable file. That path can still truncate on failure.
 - Commands cannot read the terminal. A `sudo` or `ssh` password prompt waits until the timeout.
 - A background job must redirect its output (`cmd >log 2>&1 &`), or the call waits for it until the timeout.
 - `edit` cannot match text that `read` showed as U+FFFD in a file that is not UTF-8. Use `shell`, e.g. `sed` or `iconv`.

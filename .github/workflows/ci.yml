@@ -18,6 +18,6 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libedit-dev ninja-build
       - name: Build and test
-        run: make test
+        run: make test CMAKE_ARGS=-DAGENT_WERROR=ON
       - name: Test with AddressSanitizer and UBSan
         run: make asan

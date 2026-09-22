@@ -1,6 +1,44 @@
 # Changelog
 
-## 0.1.0 - 2026-09-22
+## 0.1.1
+
+### Added
+
+- The REPL starts with `ant agent <version>`; `-V` prints the same.
+
+- One stderr line per tool call, cut to the terminal width, since long `shell` commands buried the conversation. `--verbose` shows the full arguments and each result.
+
+- The cost of each turn and, on leaving the REPL, the session's totals, where the server reports cost. OpenRouter does; llama-server does not.
+
+- `make install` (`PREFIX=/usr/local`), and `-Werror` for our own targets in CI via `-DAGENT_WERROR=ON`.
+
+- Color on stderr when it is a terminal. `--no-color` or `NO_COLOR` turns it off. The prompt stays plain: libedit miscounts its width when it holds escape codes.
+
+### Changed
+
+- Tools no longer ask for approval by default. `--permissions` selects the mode: `auto` (the default), `ask`, `all` or `read-only`. `auto` is what `-y` did: no prompts, except `write` and `edit` outside the working directory. Per-call prompts on a 5-20 call task made `-y` the only practical choice, so it became the default.
+
+### Fixed
+
+- `read` and `shell` held all their output in memory before the cap was applied, so one large file or a fast-producing command could exhaust it. Only the kept head and tail are stored now; `read` seeks past the middle of a large file, `shell` is killed after 64 MB, and `edit`, which must hold the whole file, refuses one above 64 MB.
+
+- Nothing bounded the tool loop: a model that kept asking for tools ran until interrupted. A turn now stops after 100 calls.
+
+- `AGENT_RETRY_DELAY_MS` was parsed with `atol` and shifted per retry, which overflowed on a huge value. It is parsed with `strtol` and clamped to a minute.
+
+- A final stream event without its blank line was dropped, and a stream cut off mid-reply was treated as complete. The remainder is now parsed, and a stream with no `finish_reason` and no `[DONE]` counts as failed: retried when nothing had been printed.
+
+- A failed `write` or `edit`, e.g. on a full disk, could leave the file empty or truncated: it was opened for writing before the new contents existed. Files are now replaced atomically, via a temporary file and a rename. A hard-linked file therefore gets its own copy.
+
+- A tool call without an `id`, which some OpenAI-compatible servers send, produced a result the next request could not match, so the server rejected it and the turn was lost. Such calls now get a generated id.
+
+- A `shell` `timeout` outside the range of `int` was undefined behaviour; it is now clamped first.
+
+### Removed
+
+- `-y`. What it did is now the default, `--permissions auto`; scripts that pass `-y` must drop it.
+
+## 0.1.0
 
 ### Added
 

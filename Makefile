@@ -1,6 +1,7 @@
 # Frontend to CMake. Build dir and type can be overridden: make BUILD=out TYPE=Debug
 BUILD ?= build
 TYPE ?= Release
+PREFIX ?= /usr/local
 CMAKE_ARGS ?=
 LINK ?= agent # symlink to the built binary; empty to skip
 GENERATOR := $(if $(shell command -v ninja),-G Ninja,)
@@ -15,6 +16,9 @@ $(BUILD)/CMakeCache.txt:
 test: all
 	ctest --test-dir $(BUILD) --output-on-failure -j 8
 
+install: all
+	cmake --install $(BUILD) --prefix $(PREFIX)
+
 # Same, in a separate tree with AddressSanitizer and UBSan.
 asan:
 	$(MAKE) test BUILD=build-asan TYPE=Debug CMAKE_ARGS=-DAGENT_SANITIZE=ON LINK=
@@ -23,4 +27,4 @@ clean:
 	rm -rf build build-asan
 	rm -f agent
 
-.PHONY: all test asan clean
+.PHONY: all test asan install clean

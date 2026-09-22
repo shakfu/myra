@@ -2,6 +2,7 @@
 #include "agent.h"
 
 #include <errno.h>
+#include <getopt.h>
 #include <locale.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -33,14 +34,19 @@ static const char *REPL_HELP =
 static int usage(const char *argv0, int rc) {
     FILE *f = rc ? stderr : stdout;
     fprintf(f,
-            "usage: %s [-y] [-P provider] [-m model] [-p prompt] [-V]\n"
+            "usage: %s [options] [-P provider] [-m model] [-p prompt]\n"
             "  -P  openrouter or local; remembered. Default: the remembered one if usable,\n"
             "      else the first cloud provider whose key is set\n"
             "  -m  model id; remembered per provider\n"
             "  -p  run one prompt headless and exit (default: REPL)\n"
-            "  -y  run write/edit/shell without asking; write/edit only inside the working\n"
-            "      directory\n"
-            "  -V  print the version\n", argv0);
+            "  -V  print the version\n"
+            "  --verbose   show each tool call's full arguments and result, not one line\n"
+            "  --no-color  plain stderr; also when NO_COLOR is set or stderr is not a terminal\n"
+            "  --permissions  when write, edit and shell run without asking:\n"
+            "      auto       always, except write/edit outside the working directory (default)\n"
+            "      ask        never: ask on the terminal each time\n"
+            "      all        always\n"
+            "      read-only  refuse them; read still runs\n", argv0);
     fputs(REPL_HELP, f);
     return rc;
 }
@@ -86,7 +92,8 @@ static char *next_line(int edit, char **line, size_t *cap) {
 }
 
 static void repl(agent *a) {
-    fprintf(stderr, "%s %s\n", a->prov->name, a->model);
+    agent_note(AGENT_BOLD, "ant agent %s\n", AGENT_VERSION);
+    agent_note(AGENT_DIM, "%s %s\n", a->prov->name, a->model);
     char *line = NULL;
     size_t cap = 0;
     int tty = isatty(STDIN_FILENO); /* no prompt or editing when input is piped */
@@ -102,7 +109,10 @@ static void repl(agent *a) {
 #endif
     for (;;) {
         if (!next_line(tty, &line, &cap)) {
-            if (!agent_interrupted) break; /* EOF or read error */
+            if (!agent_interrupted) { /* EOF or read error */
+                if (tty) fputc('\n', stderr); /* leave the prompt's line */
+                break;
+            }
             agent_interrupted = 0; /* Ctrl-C at the prompt: drop the line */
             clearerr(stdin);
 #ifndef HAVE_LIBEDIT
@@ -121,7 +131,7 @@ static void repl(agent *a) {
         }
         if (!strcmp(line, "/clear")) {
             agent_clear(a);
-            fprintf(stderr, "history cleared\n");
+            agent_note(AGENT_DIM, "history cleared\n");
             continue;
         }
         if ((arg = agent_command(line, "/models"))) {
@@ -130,7 +140,7 @@ static void repl(agent *a) {
         }
         if ((arg = agent_command(line, "/model"))) {
             if (*arg) agent_set_model(a, arg); /* history is kept */
-            fprintf(stderr, "%s %s\n", a->prov->name, a->model);
+            agent_note(AGENT_DIM, "%s %s\n", a->prov->name, a->model);
             continue;
         }
         agent_ask(a, line);
@@ -144,40 +154,63 @@ static void repl(agent *a) {
 
 int main(int argc, char **argv) {
     const char *prompt = NULL, *pname = NULL, *model = NULL;
-    int opt, auto_yes = 0;
-    while ((opt = getopt(argc, argv, "yp:P:m:hV")) != -1) {
+    static const char *const modes[] = {[AGENT_AUTO] = "auto", [AGENT_ASK] = "ask",
+                                        [AGENT_ALL] = "all", [AGENT_READ_ONLY] = "read-only"};
+    static const struct option longopts[] = {{"permissions", required_argument, NULL, 'W'},
+                                             {"verbose", no_argument, NULL, 'v'},
+                                             {"no-color", no_argument, NULL, 'C'},
+                                             {NULL, 0, NULL, 0}};
+    agent_permissions perms = AGENT_AUTO;
+    int opt, verbose = 0, color = 1;
+    const char *no_color = getenv("NO_COLOR"); /* https://no-color.org */
+    if (no_color && *no_color) color = 0;
+    while ((opt = getopt_long(argc, argv, "p:P:m:hV", longopts, NULL)) != -1) {
         if (opt == 'V') {
-            printf("agent %s\n", AGENT_VERSION);
+            printf("ant agent %s\n", AGENT_VERSION);
             return 0;
         }
-        if (opt == 'y') auto_yes = 1;
+        if (opt == 'v') verbose = 1;
+        else if (opt == 'C') color = 0;
+        else if (opt == 'W') {
+            size_t i = 0;
+            while (i < sizeof modes / sizeof *modes && strcmp(optarg, modes[i])) i++;
+            if (i == sizeof modes / sizeof *modes) {
+                agent_note(AGENT_ERROR, "error: unknown permissions mode %s\n", optarg);
+                return usage(argv[0], 2);
+            }
+            perms = (agent_permissions)i;
+        }
         else if (opt == 'p') prompt = optarg;
         else if (opt == 'P') pname = optarg;
         else if (opt == 'm') model = optarg;
         else return usage(argv[0], opt == 'h' ? 0 : 2);
     }
     if (optind < argc) return usage(argv[0], 2);
+    agent_color = color && isatty(STDERR_FILENO);
     if (prompt && agent_provider_named(prompt)) { /* -p and -P differ only by case */
-        fprintf(stderr, "error: -p takes a prompt; did you mean -P %s?\n", prompt);
+        agent_note(AGENT_ERROR, "error: -p takes a prompt; did you mean -P %s?\n", prompt);
         return 2;
     }
 
     const agent_provider *p;
     if (pname) {
         if (!(p = agent_provider_named(pname))) {
-            fprintf(stderr, "error: unknown provider %s\n", pname);
+            agent_note(AGENT_ERROR, "error: unknown provider %s\n", pname);
             return usage(argv[0], 2);
         }
     } else if (!(p = agent_provider_default())) {
-        fprintf(stderr, "error: no provider: set");
+        char keys[256] = "";
         for (size_t i = 0; i < AGENT_NPROVIDERS; i++)
-            if (!AGENT_PROVIDERS[i].key_optional) fprintf(stderr, " %s", AGENT_PROVIDERS[i].key_env);
-        fprintf(stderr, " or pass -P local\n");
+            if (!AGENT_PROVIDERS[i].key_optional)
+                snprintf(keys + strlen(keys), sizeof keys - strlen(keys), " %s",
+                         AGENT_PROVIDERS[i].key_env);
+        agent_note(AGENT_ERROR, "error: no provider: set%s or pass -P local\n", keys);
         return 1;
     }
 
     agent a;
-    if (agent_init(&a, p, model, auto_yes) < 0) return 1;
+    if (agent_init(&a, p, model, perms) < 0) return 1;
+    a.verbose = verbose;
     a.save_provider = pname != NULL;
     /* No SA_RESTART: blocking reads return EINTR, so Ctrl-C takes effect at once. */
     struct sigaction sa = {0};
@@ -191,6 +224,7 @@ int main(int argc, char **argv) {
         if (agent_interrupted) rc = 130; /* 128 + SIGINT, as a shell would report */
     } else {
         repl(&a);
+        agent_report_session(&a);
     }
     agent_free(&a);
     return rc;

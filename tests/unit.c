@@ -129,13 +129,29 @@ TEST(tool_shell_status_and_redirects) {
     return 0;
 }
 
-TEST(tool_output_is_capped) {
-    int err;
-    char *out = tool("shell", "{\"command\":\"head -c 300000 /dev/zero | tr '\\\\0' a\"}", &err);
-    CHECK(!err);
-    CHECK(strspn(out, "a") == 102400);
-    CHECK(!strncmp(out + 102400, "\n[truncated: 300000 bytes total", 31));
+TEST(tool_output_keeps_start_and_end) {
+    int err; /* local caps at 16384: the first 3276 bytes, the last 13108 */
+    char *out = tool("shell", "{\"command\":\"seq 1 100000\"}", &err);
+    CHECK(!err && !strncmp(out, "1\n2\n3\n", 6));
+    const char *mark = strstr(out, "\n[... ");
+    CHECK(mark && mark - out == 3276);
+    CHECK(strstr(mark, " bytes omitted ...]\n"));
+    size_t n = strlen(out);
+    CHECK(n > 13108 && !strcmp(out + n - 22, "\n99999\n100000\n[exit 0]"));
     free(out);
+    return 0;
+}
+
+TEST(max_output_env_override) {
+    agent_free(&A);
+    setenv("AGENT_MAX_OUTPUT", "2048", 1);
+    CHECK(local_agent() == 0 && A.max_output == 2048);
+    agent_free(&A);
+    setenv("AGENT_MAX_OUTPUT", "10", 1); /* too small: ignored */
+    CHECK(local_agent() == 0 && A.max_output == 16384);
+    agent_free(&A);
+    unsetenv("AGENT_MAX_OUTPUT");
+    CHECK(agent_init(&A, agent_provider_named("local"), NULL, 1) == 0 && A.max_output == 16384);
     return 0;
 }
 
@@ -284,13 +300,18 @@ TEST(utf8_read_replaces_latin1) {
 }
 
 TEST(utf8_truncation_does_not_split_a_character) {
-    /* 102399 ASCII bytes, then a 3-byte euro sign straddling the 102400-byte cap */
+    /* Both cut points (byte 3276, and 13108 from the end) fall inside a euro sign. */
     int err;
-    char *out = tool("shell", "{\"command\":\"head -c 102399 /dev/zero | tr '\\\\0' a; "
-                              "printf '\\\\342\\\\202\\\\254tail'\"}", &err);
+    char *out = tool("shell", "{\"command\":\""
+                              "head -c 3275 /dev/zero | tr '\\\\0' a; printf '\\\\342\\\\202\\\\254'; "
+                              "head -c 20000 /dev/zero | tr '\\\\0' b; printf '\\\\342\\\\202\\\\254'; "
+                              "head -c 13107 /dev/zero | tr '\\\\0' z\"}", &err);
     CHECK(!err);
-    CHECK(strspn(out, "a") == 102399);
-    CHECK(!strncmp(out + 102399, "\n[truncated: 102406 bytes total, first 102399 shown]", 52));
+    CHECK(strspn(out, "a") == 3275);
+    const char *note = "\n[... 20006 bytes omitted ...]\n";
+    CHECK(!strncmp(out + 3275, note, strlen(note)));
+    const char *rest = out + 3275 + strlen(note);
+    CHECK(strspn(rest, "z") == 13107 && !strcmp(rest + 13107, "\n[exit 0]"));
     free(out);
     return 0;
 }
@@ -466,7 +487,8 @@ static const struct { const char *name; int (*fn)(void); int needs_agent; } TEST
     {"tool_edit_errors_leave_file_unchanged", test_tool_edit_errors_leave_file_unchanged, 1},
     {"tool_read_errors", test_tool_read_errors, 1},
     {"tool_shell_status_and_redirects", test_tool_shell_status_and_redirects, 1},
-    {"tool_output_is_capped", test_tool_output_is_capped, 1},
+    {"tool_output_keeps_start_and_end", test_tool_output_keeps_start_and_end, 1},
+    {"max_output_env_override", test_max_output_env_override, 1},
     {"tool_unknown", test_tool_unknown, 1},
     {"utf8_invalid_bytes_are_replaced", test_utf8_invalid_bytes_are_replaced, 1},
     {"utf8_valid_text_is_unchanged", test_utf8_valid_text_is_unchanged, 1},

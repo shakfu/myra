@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ant LANGUAGES C)
+project(ant VERSION 0.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -33,7 +33,19 @@ target_link_libraries(agentlib PUBLIC cjson CURL::libcurl)
 
 add_executable(agent src/main.c)
 target_compile_options(agent PRIVATE ${WARNINGS})
+target_compile_definitions(agent PRIVATE AGENT_VERSION="${PROJECT_VERSION}")
 target_link_libraries(agent PRIVATE agentlib)
+
+# Line editing and history for the REPL; macOS ships libedit, Linux has libedit-dev.
+find_path(EDITLINE_INCLUDE editline/readline.h)
+find_library(EDIT_LIB edit)
+if(EDITLINE_INCLUDE AND EDIT_LIB)
+  target_compile_definitions(agent PRIVATE HAVE_LIBEDIT)
+  target_include_directories(agent PRIVATE ${EDITLINE_INCLUDE})
+  target_link_libraries(agent PRIVATE ${EDIT_LIB})
+else()
+  message(STATUS "libedit not found: the REPL has no line editing")
+endif()
 
 enable_testing()
 

@@ -4,6 +4,7 @@
 #include <curl/curl.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +15,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_OUTPUT (100 * 1024) /* cap on one tool result, in bytes */
 #define RETRIES 4
 
 /* OpenAI chat-completions tool definitions. */
@@ -47,9 +47,11 @@ volatile sig_atomic_t agent_interrupted;
 
 const agent_provider AGENT_PROVIDERS[] = {
     {"openrouter", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1",
-     "anthropic/claude-opus-5", 0, 1},
+     "anthropic/claude-opus-5", 0, 1, 100 * 1024},
     /* Any OpenAI-compatible server; the default URL is llama-server's. */
-    {"local", "LOCAL_API_KEY", "LOCAL_BASE_URL", "http://localhost:8080/v1", "local", 1, 0},
+    /* 16 KB is ~4-5K tokens: a quarter of llama-server's usual 16K context. */
+    {"local", "LOCAL_API_KEY", "LOCAL_BASE_URL", "http://localhost:8080/v1", "local", 1, 0,
+     16 * 1024},
 };
 const size_t AGENT_NPROVIDERS = sizeof AGENT_PROVIDERS / sizeof *AGENT_PROVIDERS;
 
@@ -77,6 +79,15 @@ static char *fmt(const char *f, const char *a) {
     return s;
 }
 
+static const char *get_str(cJSON *o, const char *key) {
+    return cJSON_GetStringValue(cJSON_GetObjectItem(o, key));
+}
+
+static double get_num(cJSON *o, const char *key) { /* 0 when absent */
+    cJSON *v = cJSON_GetObjectItem(o, key);
+    return cJSON_IsNumber(v) ? v->valuedouble : 0;
+}
+
 /* Length of the valid UTF-8 sequence at p (at most n bytes), or 0 if invalid.
    NUL counts as invalid: results become C strings, where it would end them. */
 static size_t utf8_len(const unsigned char *p, size_t n) {
@@ -100,6 +111,12 @@ static size_t utf8_len(const unsigned char *p, size_t n) {
     return len;
 }
 
+static int valid_utf8(const buf *b) {
+    size_t i = 0, k;
+    while (i < b->n && (k = utf8_len((const unsigned char *)b->p + i, b->n - i))) i += k;
+    return i == b->n;
+}
+
 /* Replace each invalid byte with U+FFFD, so the JSON request stays valid. */
 static void sanitize_utf8(buf *b) {
     const unsigned char *p = (const unsigned char *)b->p;
@@ -116,19 +133,25 @@ static void sanitize_utf8(buf *b) {
     *b = out;
 }
 
-/* Sanitize, then truncate to MAX_OUTPUT on a character boundary and say so. */
-static char *capped(buf *b) {
+static int is_cont(char c) { return ((unsigned char)c & 0xC0) == 0x80; }
+
+/* Sanitize, then keep the first fifth and the last four fifths of cap bytes, cut on
+   character boundaries. The end is favoured: errors and summaries come last. */
+static char *capped(buf *b, size_t cap) {
     if (!b->p) return xstrdup("");
-    size_t raw = b->n;
     sanitize_utf8(b);
-    if (b->n > MAX_OUTPUT) {
-        size_t cut = MAX_OUTPUT;
-        while (cut && ((unsigned char)b->p[cut] & 0xC0) == 0x80) cut--; /* don't split a char */
-        char note[96];
-        snprintf(note, sizeof note, "\n[truncated: %zu bytes total, first %zu shown]", raw, cut);
-        b->n = cut;
-        buf_add(b, note, strlen(note));
-    }
+    if (b->n <= cap) return b->p;
+    size_t head = cap / 5, tail = b->n - (cap - head);
+    while (head && is_cont(b->p[head])) head--;
+    while (tail < b->n && is_cont(b->p[tail])) tail++;
+    char note[80];
+    snprintf(note, sizeof note, "\n[... %zu bytes omitted ...]\n", tail - head);
+    buf out = {0};
+    buf_add(&out, b->p, head);
+    buf_add(&out, note, strlen(note));
+    buf_add(&out, b->p + tail, b->n - tail);
+    free(b->p);
+    *b = out;
     return b->p;
 }
 
@@ -153,11 +176,11 @@ static int spit(const char *path, const char *s, size_t n) {
 
 /* ---- tools: each returns a malloc'd result and sets *err on failure ---- */
 
-static char *tool_read(const char *path, int *err) {
+static char *tool_read(const char *path, size_t cap, int *err) {
     buf b = {0};
     if (slurp(path, &b) < 0) { free(b.p); *err = 1; return fmt("cannot read %s", path); }
     if (memchr(b.p, 0, b.n)) { free(b.p); *err = 1; return fmt("%s is binary", path); }
-    return capped(&b);
+    return capped(&b, cap);
 }
 
 static char *tool_write(const char *path, const char *content, int *err) {
@@ -171,6 +194,12 @@ static char *tool_edit(const char *path, const char *old, const char *new, int *
     buf b = {0};
     if (slurp(path, &b) < 0) { free(b.p); return fmt("cannot read %s", path); }
     char *hit = strstr(b.p, old);
+    if (!hit && strstr(old, "\xEF\xBF\xBD") && !valid_utf8(&b)) { /* U+FFFD from read */
+        free(b.p);
+        return fmt("old_string not found in %s: the file is not valid UTF-8, and read showed "
+                   "its invalid bytes as U+FFFD, which edit cannot match. Use shell (sed, iconv).",
+                   path);
+    }
     if (!hit) { free(b.p); return fmt("old_string not found in %s", path); }
     if (strstr(hit + 1, old)) { free(b.p); return fmt("old_string occurs more than once in %s", path); }
     buf out = {0};
@@ -206,7 +235,7 @@ static void kill_group(pid_t pid, int *st) {
 
 /* sh runs in its own process group, so the terminal's Ctrl-C reaches only the agent,
    which then decides to kill the group. */
-static char *tool_shell(const char *cmd, int timeout, int *err) {
+static char *tool_shell(const char *cmd, int timeout, size_t cap, int *err) {
     int fds[2];
     if (pipe(fds) < 0) { *err = 1; return fmt("pipe failed: %s", strerror(errno)); }
     pid_t pid = fork();
@@ -261,7 +290,7 @@ static char *tool_shell(const char *cmd, int timeout, int *err) {
         snprintf(tail, sizeof tail, "%s[interrupted by user; killed]", nl);
     else
         snprintf(tail, sizeof tail, "%s[exit %d]", nl, code);
-    char *out = capped(&b);
+    char *out = capped(&b, cap);
     buf r = {0};
     buf_add(&r, out, strlen(out));
     buf_add(&r, tail, strlen(tail));
@@ -270,13 +299,33 @@ static char *tool_shell(const char *cmd, int timeout, int *err) {
     return r.p;
 }
 
+/* Whether path, with symlinks resolved, lies outside the working directory. A path
+   whose directory does not exist counts as inside: writing there fails anyway. */
+static int outside_cwd(const char *path) {
+    char cwd[PATH_MAX], real[PATH_MAX];
+    if (!realpath(".", cwd)) return 1;
+    if (!realpath(path, real)) { /* a new file: resolve its directory */
+        char *dir = xstrdup(path), *slash = strrchr(dir, '/');
+        const char *d = slash ? (slash == dir ? "/" : (*slash = 0, dir)) : ".";
+        int ok = realpath(d, real) != NULL;
+        free(dir);
+        if (!ok) return 0;
+    }
+    size_t n = strlen(cwd);
+    if (n == 1) return 0; /* cwd is / */
+    return strncmp(real, cwd, n) || (real[n] && real[n] != '/');
+}
+
 /* Ask on the controlling terminal so it works in headless mode and the REPL alike.
    Returns NULL if allowed, else why not, for the model to relay. */
-static const char *denied(int auto_yes, const char *name, const char *detail) {
-    if (auto_yes) return NULL;
+static const char *denied(int auto_yes, int outside, const char *name, const char *detail) {
+    if (auto_yes && !outside) return NULL;
     FILE *tty = fopen("/dev/tty", "r+");
-    if (!tty) return "denied: no terminal to confirm; run with -y";
-    fprintf(tty, "allow %s: %s ? [y/N] ", name, detail);
+    if (!tty)
+        return outside && auto_yes ? "denied: outside the working directory, which -y does not cover"
+                                   : "denied: no terminal to confirm; run with -y";
+    fprintf(tty, "allow %s%s: %s ? [y/N] ", name, outside ? " outside the working directory" : "",
+            detail);
     fflush(tty);
     char line[16] = {0};
     int ok = fgets(line, sizeof line, tty) && (line[0] == 'y' || line[0] == 'Y');
@@ -298,34 +347,34 @@ char *agent_run_tool(agent *a, const char *name, cJSON *input, int *err) {
     if (!strcmp(name, "read") && path) {
         fprintf(stderr, "[tool] read %s\n", path);
         *err = 0;
-        return tool_read(path, err);
+        return tool_read(path, a->max_output, err);
     }
     if (!strcmp(name, "write") && path && content) {
         fprintf(stderr, "[tool] write %s\n", path);
-        if ((why = denied(a->auto_yes, "write", path))) return xstrdup(why);
+        if ((why = denied(a->auto_yes, outside_cwd(path), "write", path))) return xstrdup(why);
         *err = 0;
         return tool_write(path, content, err);
     }
     if (!strcmp(name, "edit") && path && old && new) {
         fprintf(stderr, "[tool] edit %s\n", path);
-        if ((why = denied(a->auto_yes, "edit", path))) return xstrdup(why);
+        if ((why = denied(a->auto_yes, outside_cwd(path), "edit", path))) return xstrdup(why);
         return tool_edit(path, old, new, err);
     }
     if (!strcmp(name, "shell") && cmd) {
         fprintf(stderr, "[tool] shell %s\n", cmd);
-        if ((why = denied(a->auto_yes, "shell", cmd))) return xstrdup(why);
+        if ((why = denied(a->auto_yes, 0, "shell", cmd))) return xstrdup(why); /* unconfinable */
         cJSON *t = cJSON_GetObjectItemCaseSensitive(input, "timeout");
         int secs = cJSON_IsNumber(t) ? (int)t->valuedouble : AGENT_SHELL_TIMEOUT;
         if (secs < 1) secs = 1;
         if (secs > AGENT_SHELL_TIMEOUT_MAX) secs = AGENT_SHELL_TIMEOUT_MAX;
-        return tool_shell(cmd, secs, err);
+        return tool_shell(cmd, secs, a->max_output, err);
     }
     return fmt("unknown tool or missing arguments: %s", name);
 }
 
 /* ---- remembered state ---- */
 
-static char *state_path(const char *name) {
+char *agent_state_path(const char *name, int make_dir) {
     const char *xdg = getenv("XDG_STATE_HOME"), *home = getenv("HOME");
     buf b = {0};
     if (xdg && *xdg) buf_add(&b, xdg, strlen(xdg));
@@ -333,11 +382,13 @@ static char *state_path(const char *name) {
     else return NULL;
     buf_add(&b, "/ant/", 5);
     buf_add(&b, name, strlen(name));
+    for (char *p = b.p + 1; make_dir && *p; p++) /* mkdir -p the parent */
+        if (*p == '/') { *p = 0; mkdir(b.p, 0755); *p = '/'; }
     return b.p;
 }
 
 char *agent_load_state(const char *name) {
-    char *path = state_path(name);
+    char *path = agent_state_path(name, 0);
     buf b = {0};
     int rc = path ? slurp(path, &b) : -1;
     free(path);
@@ -348,12 +399,8 @@ char *agent_load_state(const char *name) {
 }
 
 void agent_store_state(const char *name, const char *value) {
-    char *path = state_path(name);
+    char *path = agent_state_path(name, 1);
     if (!path) return;
-    char *dir = xstrdup(path);
-    for (char *p = dir + 1; *p; p++) /* mkdir -p the parent */
-        if (*p == '/') { *p = 0; mkdir(dir, 0755); *p = '/'; }
-    free(dir);
     char *line = fmt("%s\n", value);
     if (spit(path, line, strlen(line)) < 0) fprintf(stderr, "warning: cannot save %s\n", path);
     free(line);
@@ -397,8 +444,214 @@ static size_t on_body(char *p, size_t sz, size_t n, void *ud) {
     return sz * n;
 }
 
-/* POST body to path, or GET it when body is NULL; retries 429, 5xx and network errors. */
-static cJSON *request(agent *a, const char *path, const char *body) {
+/* Case-insensitive strstr; strcasestr needs _GNU_SOURCE on glibc. */
+static int contains_ci(const char *s, const char *sub) {
+    size_t n = strlen(sub);
+    for (; *s; s++)
+        if (!strncasecmp(s, sub, n)) return 1;
+    return !n;
+}
+
+/* Wording varies by server: llama-server, OpenAI-style APIs, Anthropic. */
+static int is_context_error(const char *body) {
+    static const char *const hints[] = {"context size", "context length", "context window",
+                                        "maximum context", "prompt is too long", "too many tokens"};
+    for (size_t i = 0; i < sizeof hints / sizeof *hints; i++)
+        if (contains_ci(body, hints[i])) return 1;
+    return 0;
+}
+
+/* ---- streaming (server-sent events) ---- */
+
+typedef struct {
+    char key[24];
+    buf val;
+} text_field;
+
+/* One streamed reply, rebuilt into the shape of a non-streamed one. */
+typedef struct {
+    CURL *c;
+    buf line, raw; /* raw: every byte, for error bodies and servers that ignore "stream" */
+    buf content;
+    text_field extra[4]; /* other text deltas: reasoning, reasoning_content, refusal */
+    cJSON *calls;        /* tool calls; arguments are kept in args */
+    buf *args;
+    int ncalls;
+    cJSON *details; /* reasoning_details, merged by index */
+    cJSON *usage, *error;
+    char finish[32];
+    int events, printed;
+} stream;
+
+static void stream_free(stream *st) {
+    free(st->line.p);
+    free(st->raw.p);
+    free(st->content.p);
+    for (size_t i = 0; i < sizeof st->extra / sizeof *st->extra; i++) free(st->extra[i].val.p);
+    for (int i = 0; i < st->ncalls; i++) free(st->args[i].p);
+    free(st->args);
+    cJSON_Delete(st->calls);
+    cJSON_Delete(st->details);
+    cJSON_Delete(st->usage);
+    cJSON_Delete(st->error);
+}
+
+static void add_text(stream *st, const char *key, const char *s) {
+    size_t i, n = sizeof st->extra / sizeof *st->extra;
+    for (i = 0; i < n && st->extra[i].key[0] && strcmp(st->extra[i].key, key); i++) {}
+    if (i == n || strlen(key) >= sizeof st->extra[i].key) return; /* unknown extras: dropped */
+    snprintf(st->extra[i].key, sizeof st->extra[i].key, "%s", key);
+    buf_add(&st->extra[i].val, s, strlen(s));
+}
+
+/* Tool calls arrive in pieces keyed by index: arguments are appended, the rest is set. */
+static void merge_calls(stream *st, cJSON *deltas) {
+    cJSON *d;
+    if (!st->calls) st->calls = cJSON_CreateArray();
+    cJSON_ArrayForEach(d, deltas) {
+        int idx = (int)get_num(d, "index");
+        if (idx < 0 || idx > 255) continue;
+        while (st->ncalls <= idx) {
+            cJSON *c = cJSON_CreateObject();
+            cJSON_AddStringToObject(c, "id", "");
+            cJSON_AddStringToObject(c, "type", "function");
+            cJSON_AddItemToObject(c, "function", cJSON_CreateObject());
+            cJSON_AddStringToObject(cJSON_GetObjectItem(c, "function"), "name", "");
+            cJSON_AddItemToArray(st->calls, c);
+            st->args = realloc(st->args, (st->ncalls + 1) * sizeof *st->args);
+            st->args[st->ncalls++] = (buf){0};
+        }
+        cJSON *c = cJSON_GetArrayItem(st->calls, idx), *fn = cJSON_GetObjectItem(d, "function");
+        const char *id = get_str(d, "id"), *name = get_str(fn, "name"), *args = get_str(fn, "arguments");
+        if (id && *id) cJSON_ReplaceItemInObject(c, "id", cJSON_CreateString(id));
+        if (name && *name)
+            cJSON_ReplaceItemInObject(cJSON_GetObjectItem(c, "function"), "name", cJSON_CreateString(name));
+        if (args) buf_add(&st->args[idx], args, strlen(args));
+    }
+}
+
+/* reasoning_details pieces: text fields are appended, others set, merged by index. */
+static void merge_details(stream *st, cJSON *deltas) {
+    cJSON *d;
+    if (!st->details) st->details = cJSON_CreateArray();
+    cJSON_ArrayForEach(d, deltas) {
+        cJSON *idx = cJSON_GetObjectItem(d, "index"), *into = NULL, *e;
+        cJSON_ArrayForEach(e, st->details)
+            if (cJSON_IsNumber(idx) && cJSON_Compare(cJSON_GetObjectItem(e, "index"), idx, 1)) into = e;
+        if (!into) {
+            cJSON_AddItemToArray(st->details, cJSON_Duplicate(d, 1));
+            continue;
+        }
+        cJSON *f;
+        cJSON_ArrayForEach(f, d) {
+            cJSON *old = cJSON_GetObjectItem(into, f->string);
+            if (cJSON_IsString(f) && cJSON_IsString(old) && strcmp(f->string, "type")) {
+                buf j = {0};
+                buf_add(&j, old->valuestring, strlen(old->valuestring));
+                buf_add(&j, f->valuestring, strlen(f->valuestring));
+                cJSON_ReplaceItemInObject(into, f->string, cJSON_CreateString(j.p));
+                free(j.p);
+            } else if (old) {
+                cJSON_ReplaceItemInObject(into, f->string, cJSON_Duplicate(f, 1));
+            } else {
+                cJSON_AddItemToObject(into, f->string, cJSON_Duplicate(f, 1));
+            }
+        }
+    }
+}
+
+static void stream_event(stream *st, const char *data) {
+    if (!strcmp(data, "[DONE]")) return;
+    cJSON *chunk = cJSON_Parse(data), *f;
+    if (!chunk) return;
+    cJSON *err = cJSON_DetachItemFromObject(chunk, "error");
+    if (err) { /* mid-stream failure */
+        cJSON_Delete(st->error);
+        st->error = err;
+    }
+    st->events++;
+    cJSON *usage = cJSON_GetObjectItem(chunk, "usage");
+    if (cJSON_IsObject(usage)) {
+        cJSON_Delete(st->usage);
+        st->usage = cJSON_Duplicate(usage, 1);
+    }
+    cJSON *choice = cJSON_GetArrayItem(cJSON_GetObjectItem(chunk, "choices"), 0);
+    const char *finish = get_str(choice, "finish_reason");
+    if (finish) snprintf(st->finish, sizeof st->finish, "%s", finish);
+    cJSON_ArrayForEach(f, cJSON_GetObjectItem(choice, "delta")) {
+        if (!strcmp(f->string, "content") && cJSON_IsString(f) && *f->valuestring) {
+            fputs(f->valuestring, stdout);
+            fflush(stdout);
+            st->printed = 1;
+            buf_add(&st->content, f->valuestring, strlen(f->valuestring));
+        } else if (!strcmp(f->string, "tool_calls") && cJSON_IsArray(f)) {
+            merge_calls(st, f);
+        } else if (!strcmp(f->string, "reasoning_details") && cJSON_IsArray(f)) {
+            merge_details(st, f);
+        } else if (strcmp(f->string, "role") && cJSON_IsString(f) && *f->valuestring) {
+            add_text(st, f->string, f->valuestring);
+        }
+    }
+    cJSON_Delete(chunk);
+}
+
+static size_t on_stream(char *p, size_t sz, size_t n, void *ud) {
+    stream *st = ud;
+    size_t len = sz * n;
+    buf_add(&st->raw, p, len);
+    long status = 0;
+    curl_easy_getinfo(st->c, CURLINFO_RESPONSE_CODE, &status);
+    if (status != 200) return len; /* an error body: plain JSON, kept in raw */
+    buf_add(&st->line, p, len);
+    char *start = st->line.p, *nl;
+    while ((nl = memchr(start, '\n', st->line.n - (size_t)(start - st->line.p)))) {
+        *nl = 0;
+        if (nl > start && nl[-1] == '\r') nl[-1] = 0;
+        if (!strncmp(start, "data:", 5)) stream_event(st, start + 5 + (start[5] == ' '));
+        start = nl + 1; /* comments (":") and other fields are ignored */
+    }
+    st->line.n -= (size_t)(start - st->line.p);
+    memmove(st->line.p, start, st->line.n);
+    st->line.p[st->line.n] = 0;
+    return len;
+}
+
+/* The streamed reply as a non-streamed response object. */
+static cJSON *stream_result(stream *st) {
+    cJSON *msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(msg, "role", "assistant");
+    if (st->content.n) cJSON_AddStringToObject(msg, "content", st->content.p);
+    else if (st->ncalls) cJSON_AddNullToObject(msg, "content");
+    else cJSON_AddStringToObject(msg, "content", "");
+    for (size_t i = 0; i < sizeof st->extra / sizeof *st->extra && st->extra[i].key[0]; i++)
+        cJSON_AddStringToObject(msg, st->extra[i].key, st->extra[i].val.p);
+    if (cJSON_GetArraySize(st->details)) {
+        cJSON_AddItemToObject(msg, "reasoning_details", st->details);
+        st->details = NULL;
+    }
+    for (int i = 0; i < st->ncalls; i++)
+        cJSON_AddStringToObject(cJSON_GetObjectItem(cJSON_GetArrayItem(st->calls, i), "function"),
+                                "arguments", st->args[i].p ? st->args[i].p : "");
+    if (st->ncalls) {
+        cJSON_AddItemToObject(msg, "tool_calls", st->calls);
+        st->calls = NULL;
+    }
+    cJSON *choice = cJSON_CreateObject();
+    cJSON_AddItemToObject(choice, "message", msg);
+    if (st->finish[0]) cJSON_AddStringToObject(choice, "finish_reason", st->finish);
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddItemToObject(resp, "choices", cJSON_CreateArray());
+    cJSON_AddItemToArray(cJSON_GetObjectItem(resp, "choices"), choice);
+    if (st->usage) {
+        cJSON_AddItemToObject(resp, "usage", st->usage);
+        st->usage = NULL;
+    }
+    return resp;
+}
+
+/* POST body to path (streamed when streaming is set), or GET path when body is NULL.
+   Retries 429, 5xx and network errors, unless streamed text was already printed. */
+static cJSON *request(agent *a, const char *path, const char *body, int streaming) {
     const char *base = getenv(a->prov->base_env);
     buf url = {0};
     base = base && *base ? base : a->prov->base;
@@ -409,17 +662,24 @@ static cJSON *request(agent *a, const char *path, const char *body) {
     char *auth = a->api_key && *a->api_key ? fmt("authorization: Bearer %s", a->api_key) : NULL;
     if (auth) h = curl_slist_append(h, auth);
 
+    const char *d = getenv("AGENT_RETRY_DELAY_MS"); /* first back-off; doubles each retry */
+    long delay_ms = d && atol(d) > 0 ? atol(d) : 1000;
     cJSON *resp = NULL;
+    a->streamed = 0;
     for (int attempt = 0; attempt <= RETRIES; attempt++) {
-        if (attempt) sleep(1u << (attempt - 1)); /* a signal ends it early */
+        if (attempt) { /* a signal ends the wait early */
+            long ms = delay_ms << (attempt - 1);
+            struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+            nanosleep(&ts, NULL);
+        }
         if (agent_interrupted) break;
-        buf out = {0};
-        CURL *c = curl_easy_init();
+        stream st = {0};
+        CURL *c = st.c = curl_easy_init();
         curl_easy_setopt(c, CURLOPT_URL, url.p);
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
         if (body) curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
-        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, on_body);
-        curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
+        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, streaming ? on_stream : on_body);
+        curl_easy_setopt(c, CURLOPT_WRITEDATA, streaming ? (void *)&st : (void *)&st.raw);
         curl_easy_setopt(c, CURLOPT_TIMEOUT, 600L);
         curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, on_progress);
@@ -427,26 +687,36 @@ static cJSON *request(agent *a, const char *path, const char *body) {
         long status = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
         curl_easy_cleanup(c);
-        if (rc == CURLE_OK && status == 200) {
-            resp = cJSON_Parse(out.p ? out.p : "");
+        if (st.printed) putchar('\n'), fflush(stdout); /* end the streamed line */
+        a->streamed = st.printed;
+        const char *out = st.raw.p ? st.raw.p : "";
+        if (rc == CURLE_OK && status == 200 && !st.error) {
+            resp = st.events ? stream_result(&st) : cJSON_Parse(out); /* "stream" ignored */
             if (!resp) fprintf(stderr, "error: response is not JSON\n");
-            free(out.p);
+            stream_free(&st);
             break;
         }
         if (rc == CURLE_ABORTED_BY_CALLBACK) {
             fprintf(stderr, "interrupted\n");
-            free(out.p);
+            stream_free(&st);
             break;
         }
         if (rc == CURLE_COULDNT_CONNECT) { /* nothing listening: retrying cannot help */
             fprintf(stderr, "error: cannot connect to %s; is the server running?\n", url.p);
-            free(out.p);
+            stream_free(&st);
             break;
         }
-        int retryable = rc != CURLE_OK || status == 429 || status >= 500;
-        fprintf(stderr, "api error (%s, http %ld)%s: %s\n", curl_easy_strerror(rc), status,
-                retryable && attempt < RETRIES ? ", retrying" : "", out.p ? out.p : "");
-        free(out.p);
+        char *err = st.error ? cJSON_PrintUnformatted(st.error) : NULL;
+        if (err) out = err;
+        a->context_full = (status == 400 || st.error) && is_context_error(out);
+        int retryable = (rc != CURLE_OK || status == 429 || status >= 500 || st.error) &&
+                        !st.printed && !a->context_full; /* retrying cannot shrink the context */
+        const char *again = retryable && attempt < RETRIES ? ", retrying" : "";
+        if (st.error) fprintf(stderr, "stream error%s: %s\n", again, out);
+        else fprintf(stderr, "api error (%s, http %ld)%s: %s\n", curl_easy_strerror(rc), status,
+                     again, out);
+        free(err);
+        stream_free(&st);
         if (!retryable) break;
     }
     curl_slist_free_all(h);
@@ -460,13 +730,15 @@ static cJSON *call_api(agent *a) {
     cJSON_AddStringToObject(req, "model", a->model);
     cJSON_AddItemReferenceToObject(req, "tools", a->tools);
     cJSON_AddItemReferenceToObject(req, "messages", a->messages);
+    cJSON_AddTrueToObject(req, "stream");
+    cJSON_AddItemToObject(req, "stream_options", cJSON_Parse("{\"include_usage\":true}"));
     /* Turns on prompt caching for Anthropic models, where it is opt-in. Providers
        that cache automatically or lack support ignore unknown fields. */
     if (a->prov->cache_control)
         cJSON_AddItemToObject(req, "cache_control", cJSON_Parse("{\"type\":\"ephemeral\"}"));
     char *body = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
-    cJSON *resp = request(a, "/chat/completions", body);
+    cJSON *resp = request(a, "/chat/completions", body, 1);
     free(body);
     /* Saved only once the server accepts them, so a mistyped choice is not kept. */
     if (resp && a->save_provider) {
@@ -482,16 +754,8 @@ static cJSON *call_api(agent *a) {
     return resp;
 }
 
-/* Case-insensitive strstr; strcasestr needs _GNU_SOURCE on glibc. */
-static int contains_ci(const char *s, const char *sub) {
-    size_t n = strlen(sub);
-    for (; *s; s++)
-        if (!strncasecmp(s, sub, n)) return 1;
-    return !n;
-}
-
 void agent_list_models(agent *a, const char *filter) {
-    cJSON *resp = request(a, "/models", NULL), *m;
+    cJSON *resp = request(a, "/models", NULL, 0), *m;
     cJSON *data = cJSON_GetObjectItem(resp, "data");
     if (resp && !cJSON_IsArray(data)) fprintf(stderr, "error: no model list in response\n");
     cJSON_ArrayForEach(m, data) {
@@ -508,10 +772,6 @@ static void print_text(const char *s) {
     if (!s || !*s) return;
     printf("%s\n", s);
     fflush(stdout);
-}
-
-static const char *get_str(cJSON *o, const char *key) {
-    return cJSON_GetStringValue(cJSON_GetObjectItem(o, key));
 }
 
 int agent_step(agent *a, cJSON *resp) {
@@ -537,7 +797,7 @@ int agent_step(agent *a, cJSON *resp) {
         fprintf(stderr, "warning: reply hit the length limit\n");
         cJSON_DeleteItemFromObject(msg, "tool_calls");
     }
-    print_text(get_str(msg, "content"));
+    if (!a->streamed) print_text(get_str(msg, "content")); /* else already shown */
     cJSON *calls = cJSON_GetObjectItem(msg, "tool_calls");
     int ncalls = cJSON_GetArraySize(calls);
     if (!ncalls && !get_str(msg, "content")) { /* null content is only valid with tool_calls */
@@ -573,6 +833,27 @@ int agent_step(agent *a, cJSON *resp) {
     return ncalls > 0;
 }
 
+static int is_tool(cJSON *m) {
+    const char *role = get_str(m, "role");
+    return role && !strcmp(role, "tool");
+}
+
+/* Blank every tool result except the trailing batch, which the next reply needs.
+   Returns how many were blanked. */
+static int drop_old_tool_output(agent *a) {
+    static const char *const dropped = "[output dropped to fit the context]";
+    int n = cJSON_GetArraySize(a->messages), last = n, count = 0;
+    while (last > 0 && is_tool(cJSON_GetArrayItem(a->messages, last - 1))) last--;
+    for (int i = 0; i < last; i++) {
+        cJSON *m = cJSON_GetArrayItem(a->messages, i);
+        const char *content = get_str(m, "content");
+        if (!is_tool(m) || !content || !strcmp(content, dropped)) continue;
+        cJSON_ReplaceItemInObject(m, "content", cJSON_CreateString(dropped));
+        count++;
+    }
+    return count;
+}
+
 int agent_ask(agent *a, const char *text) {
     agent_interrupted = 0;
     int before = cJSON_GetArraySize(a->messages);
@@ -580,13 +861,35 @@ int agent_ask(agent *a, const char *text) {
     cJSON_AddStringToObject(m, "role", "user");
     cJSON_AddStringToObject(m, "content", text);
     cJSON_AddItemToArray(a->messages, m);
-    int rc;
-    do { /* call the model and run tools until it stops asking for them */
+    int rc, requests = 0;
+    double in = 0, out = 0, cached = 0; /* token counts, when the server reports them */
+    for (;;) { /* call the model and run tools until it stops asking for them */
         cJSON *resp = call_api(a);
+        cJSON *u = cJSON_GetObjectItem(resp, "usage");
+        if (cJSON_IsObject(u)) {
+            requests++;
+            in += get_num(u, "prompt_tokens");
+            out += get_num(u, "completion_tokens");
+            cached += get_num(cJSON_GetObjectItem(u, "prompt_tokens_details"), "cached_tokens");
+        }
+        if (!resp && a->context_full) {
+            int n = drop_old_tool_output(a);
+            if (n) {
+                fprintf(stderr, "context full: dropped %d old tool output%s, retrying\n", n,
+                        n == 1 ? "" : "s");
+                continue;
+            }
+            fprintf(stderr, "hint: the conversation no longer fits the model's context; "
+                            "/clear starts a new one\n");
+        }
         if (!resp) { rc = -1; break; }
         rc = agent_step(a, resp);
         cJSON_Delete(resp);
-    } while (rc == 1);
+        if (rc != 1) break;
+    }
+    if (requests)
+        fprintf(stderr, "[usage] %d request%s: %.0f in (%.0f cached), %.0f out\n", requests,
+                requests == 1 ? "" : "s", in, cached, out);
     if (rc < 0)
         while (cJSON_GetArraySize(a->messages) > before)
             cJSON_DeleteItemFromArray(a->messages, cJSON_GetArraySize(a->messages) - 1);
@@ -599,6 +902,8 @@ int agent_init(agent *a, const agent_provider *p, const char *model, int auto_ye
     memset(a, 0, sizeof *a);
     a->prov = p;
     a->auto_yes = auto_yes;
+    const char *cap = getenv("AGENT_MAX_OUTPUT");
+    a->max_output = cap && atol(cap) >= 1024 ? (size_t)atol(cap) : p->max_output;
     a->api_key = getenv(p->key_env);
     if ((!a->api_key || !*a->api_key) && !p->key_optional) {
         fprintf(stderr, "error: %s is not set\n", p->key_env);

@@ -2,9 +2,12 @@
 
 import json
 import os
+import pty
+import select
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +22,36 @@ PROVIDERS = {
     "openrouter": ("OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "/api/v1"),
     "local": ("LOCAL_API_KEY", "LOCAL_BASE_URL", "/v1"),
 }
+
+
+def to_sse(reply):
+    """A chat-completions reply as a stream: text in halves, arguments in thirds."""
+    if "_sse" in reply:  # raw events, for malformed-stream tests
+        return "".join(reply["_sse"]).encode()
+    choice = reply["choices"][0]
+    msg, deltas = choice["message"], [{"role": "assistant"}]
+    for k, v in msg.items():
+        if isinstance(v, str) and v and k != "role":
+            deltas += [{k: v[:len(v) // 2]}, {k: v[len(v) // 2:]}]
+        elif k == "reasoning_details":
+            deltas.append({k: v})
+    for i, tc in enumerate(msg.get("tool_calls") or []):
+        fn = tc["function"]
+        deltas.append({"tool_calls": [{"index": i, "id": tc["id"], "type": "function",
+                                       "function": {"name": fn["name"], "arguments": ""}}]})
+        a = fn["arguments"]
+        for part in (a[:len(a) // 3], a[len(a) // 3:2 * len(a) // 3], a[2 * len(a) // 3:]):
+            deltas.append({"tool_calls": [{"index": i, "function": {"arguments": part}}]})
+    events = [": keep-alive comment\n\n"]
+    events += ["data: " + json.dumps({"choices": [{"index": 0, "delta": d, "finish_reason": None}]})
+               + "\n\n" for d in deltas]
+    events.append("data: " + json.dumps({"choices": [{"index": 0, "delta": {},
+                                                       "finish_reason": choice.get("finish_reason")}]})
+                  + "\n\n")
+    if "usage" in reply:
+        events.append("data: " + json.dumps({"choices": [], "usage": reply["usage"]}) + "\n\n")
+    events.append("data: [DONE]\n\n")
+    return "".join(events).encode()
 
 
 class Mock:
@@ -42,13 +75,26 @@ class Mock:
                                       "body": body})
                 status, reply, *delay = mock.replies.pop(0)  # optional third item: seconds
                 time.sleep(delay[0] if delay else 0)
-                data = json.dumps(reply).encode()
+                reply = dict(reply)
+                wants_stream = (body or {}).get("stream") and status == 200
+                plain = reply.pop("_plain", False) or (
+                    "_sse" not in reply and not (wants_stream and reply.get("choices")))
                 try:
-                    self.send_response(status)
-                    self.send_header("content-type", "application/json")
-                    self.send_header("content-length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
+                    if plain:
+                        data = json.dumps(reply).encode()
+                        self.send_response(status)
+                        self.send_header("content-type", "application/json")
+                        self.send_header("content-length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                    else:  # server-sent events, in small writes so lines split mid-chunk
+                        data = to_sse(reply)
+                        self.send_response(200)
+                        self.send_header("content-type", "text/event-stream")
+                        self.end_headers()
+                        for i in range(0, len(data), 50):
+                            self.wfile.write(data[i:i + 50])
+                            self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     pass  # the agent gave up, e.g. after Ctrl-C
 
@@ -56,7 +102,8 @@ class Mock:
                 pass
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        # A short poll interval: shutdown() waits up to one interval (default 0.5 s).
+        threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_port}"
 
 
@@ -69,7 +116,7 @@ class Api:
     def env(self, cwd, key="test-key"):
         key_env, base_env, suffix = PROVIDERS[self.provider]
         env = {"PATH": "/usr/bin:/bin", base_env: self.mock.url + suffix,
-               "XDG_STATE_HOME": str(cwd / ".state")}
+               "XDG_STATE_HOME": str(cwd / ".state"), "AGENT_RETRY_DELAY_MS": "1"}
         if key is not None:
             env[key_env] = key
         return env
@@ -129,6 +176,7 @@ def test_request_shape(api, tmp_path):
     body = req["body"]
     if api.provider == "openrouter":
         assert body.pop("cache_control") == {"type": "ephemeral"}
+    assert body.pop("stream") is True and body.pop("stream_options") == {"include_usage": True}
     assert set(body) == {"model", "tools", "messages"}  # nothing OpenRouter-specific to local
     assert body["messages"][0]["role"] == "system"
     assert str(tmp_path.resolve()) in body["messages"][0]["content"]
@@ -192,13 +240,18 @@ def test_read_and_argument_errors(api, tmp_path):
     assert r["r4"] == ("invalid JSON arguments for shell", True)
 
 
-def test_shell_output_is_capped(api, tmp_path):
-    api.reply(calls=[("s", "shell", {"command": "head -c 300000 /dev/zero | tr '\\0' a"})])
+@pytest.mark.parametrize("env,cap", [({}, None), ({"AGENT_MAX_OUTPUT": "4096"}, 4096)])
+def test_shell_output_keeps_start_and_end(api, tmp_path, env, cap):
+    cap = cap or {"openrouter": 102400, "local": 16384}[api.provider]
+    api.reply(calls=[("s", "shell", {"command": "seq 1 100000"})])
     api.reply("ok")
-    api.run(tmp_path, "-y", "-p", "go")
+    api.run(tmp_path, "-y", "-p", "go", env=env)
     out = api.results(api.mock.requests[1])["s"][0]
-    assert out.startswith("a" * 102400 + "\n[truncated: 300000 bytes total")
-    assert out.endswith("[exit 0]")
+    head, sep, rest = out.partition("\n[... ")
+    assert sep and len(head) == cap // 5 and head.startswith("1\n2\n3\n")
+    omitted, _, tail = rest.partition(" bytes omitted ...]\n")
+    assert tail.endswith("99999\n100000\n[exit 0]")
+    assert len(head) + int(omitted) + len(tail) - len("[exit 0]") == 588895  # seq's size
 
 
 def test_mutating_tools_denied_without_tty(api, tmp_path):
@@ -214,6 +267,15 @@ def test_mutating_tools_denied_without_tty(api, tmp_path):
     assert r["s"] == ("denied: no terminal to confirm; run with -y", True)
     assert r["r"] == ("readable", False)  # read needs no confirmation
     assert not (tmp_path / "c.txt").exists() and not (tmp_path / "d.txt").exists()
+
+
+def test_default_retry_delay_is_one_second(mock, tmp_path):
+    api = Api(mock, "local")
+    mock.replies.append((503, {"error": {}}))
+    api.reply("ok")
+    t = time.monotonic()
+    p = api.run(tmp_path, "-p", "go", env={"AGENT_RETRY_DELAY_MS": ""})
+    assert p.returncode == 0 and 0.9 < time.monotonic() - t < 3
 
 
 def test_retries_overloaded_then_succeeds(api, tmp_path):
@@ -716,3 +778,321 @@ def test_invalid_utf8_tool_output_reaches_server_as_valid_json(api, tmp_path):
     r = api.results(api.mock.requests[1])  # the mock json-decoded this body
     assert r["s"] == ("\ufffdok\ufffd!\n[exit 0]", False)
     assert r["r"] == ("caf\ufffd\n", False)
+
+
+# ---- context overflow ----
+
+CONTEXT_ERRORS = [  # llama-server, OpenAI-style, Anthropic via OpenRouter
+    {"error": {"code": 400, "type": "exceed_context_size_error",
+               "message": "the request exceeds the available context size, try increasing it"}},
+    {"error": {"message": "This model's maximum context length is 8192 tokens."}},
+    {"error": {"message": "prompt is too long: 250000 tokens > 200000 maximum"}},
+]
+
+
+@pytest.mark.parametrize("body", CONTEXT_ERRORS)
+def test_context_full_drops_old_tool_output_and_retries(mock, tmp_path, body):
+    (tmp_path / "f").write_text("data")
+    api = Api(mock, "local")
+    api.reply(calls=[("c1", "read", {"path": "f"})])
+    api.reply("ok")
+    mock.replies.append((400, body))
+    api.reply("fine")
+    p = api.run(tmp_path, stdin="one\ntwo\n")
+    assert p.returncode == 0, p.stderr
+    assert p.stdout == "ok\nfine\n"
+    assert "context full: dropped 1 old tool output, retrying" in p.stderr
+    msgs = mock.requests[3]["body"]["messages"]
+    assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool", "assistant", "user"]
+    assert msgs[3]["content"] == "[output dropped to fit the context]"
+    assert msgs[3]["tool_call_id"] == "c1"  # the call/result pairing is kept
+
+
+def test_context_full_keeps_newest_batch_then_hints(mock, tmp_path):
+    (tmp_path / "f").write_text("data")
+    api = Api(mock, "local")
+    api.reply(calls=[("c1", "read", {"path": "f"})])
+    mock.replies.append((400, CONTEXT_ERRORS[0]))
+    p = api.run(tmp_path, "-p", "go")
+    assert p.returncode == 1
+    assert "/clear starts a new one" in p.stderr and "dropped" not in p.stderr
+    assert len(mock.requests) == 2  # no pointless retry
+    assert api.results(mock.requests[1])["c1"] == ("data", False)
+
+
+def test_other_400_is_not_a_context_error(mock, tmp_path):
+    mock.replies.append((400, {"error": {"message": "invalid model"}}))
+    p = Api(mock, "local").run(tmp_path, "-p", "go")
+    assert p.returncode == 1 and "invalid model" in p.stderr
+    assert "/clear" not in p.stderr and len(mock.requests) == 1
+
+
+# ---- usage and /help ----
+
+def test_usage_is_summed_per_turn(mock, tmp_path):
+    api = Api(mock, "openrouter")
+    api.reply(calls=[("c", "read", {"path": "nope"})])
+    mock.replies[-1][1]["usage"] = {"prompt_tokens": 1000, "completion_tokens": 20,
+                                    "prompt_tokens_details": {"cached_tokens": 0}}
+    api.reply("done")
+    mock.replies[-1][1]["usage"] = {"prompt_tokens": 1100, "completion_tokens": 5,
+                                    "prompt_tokens_details": {"cached_tokens": 900}}
+    p = api.run(tmp_path, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert p.stderr.endswith("[usage] 2 requests: 2100 in (900 cached), 25 out\n")
+
+
+def test_partial_usage_counts_missing_fields_as_zero(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("hi")
+    mock.replies[-1][1]["usage"] = {"prompt_tokens": 7}
+    p = api.run(tmp_path, "-p", "go")
+    assert p.stderr == "[usage] 1 request: 7 in (0 cached), 0 out\n"
+
+
+def test_no_usage_no_line(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("hi")
+    assert "[usage]" not in api.run(tmp_path, "-p", "go").stderr
+
+
+def test_help_lists_commands(mock, tmp_path):
+    p = Api(mock, "local").run(tmp_path, stdin="/help\n")
+    for cmd in ["/model [id]", "/models [filter]", "/clear", "/help", "/exit"]:
+        assert cmd in p.stderr
+    assert not mock.requests
+
+
+# ---- streaming ----
+
+def sse(*chunks, done=True, nl="\n"):
+    """Raw events: each chunk is a delta dict, or a full event dict with a "choices" key."""
+    out = []
+    for c in chunks:
+        ev = c if "choices" in c or "error" in c else {"choices": [{"index": 0, "delta": c}]}
+        out.append("data: " + json.dumps(ev) + nl + nl)
+    if done:
+        out.append("data: [DONE]" + nl + nl)
+    return {"_sse": out}
+
+
+def finish(reason):
+    return {"choices": [{"index": 0, "delta": {}, "finish_reason": reason}]}
+
+
+def test_reasoning_content_is_replayed(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[("c", "read", {"path": "nope"})])
+    mock.replies[-1][1]["choices"][0]["message"]["reasoning_content"] = "think step by step"
+    api.reply("done")
+    p = api.run(tmp_path, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    msg = mock.requests[1]["body"]["messages"][2]
+    assert msg["reasoning_content"] == "think step by step" and msg["content"] is None
+    assert p.stdout == "done\n"  # reasoning is not printed
+
+
+def test_reasoning_details_are_merged_by_index(mock, tmp_path):
+    mock.replies.append((200, sse(
+        {"reasoning_details": [{"type": "reasoning.text", "text": "ab", "index": 0}]},
+        {"reasoning_details": [{"type": "reasoning.text", "text": "cd", "index": 0,
+                                "signature": "sig"}]},
+        {"reasoning_details": [{"type": "reasoning.encrypted", "data": "xyz", "index": 1}]},
+        {"content": "hi"}, finish("stop"))))
+    Api(mock, "local").reply("again")
+    p = Api(mock, "local").run(tmp_path, stdin="one\ntwo\n")
+    assert p.stdout == "hi\nagain\n", p.stderr
+    assert mock.requests[1]["body"]["messages"][2]["reasoning_details"] == [
+        {"type": "reasoning.text", "text": "abcd", "index": 0, "signature": "sig"},
+        {"type": "reasoning.encrypted", "data": "xyz", "index": 1}]
+
+
+def test_crlf_events_and_missing_done(mock, tmp_path):
+    mock.replies.append((200, sse({"content": "a"}, {"content": "b"}, finish("stop"),
+                                  done=False, nl="\r\n")))
+    p = Api(mock, "local").run(tmp_path, "-p", "go")
+    assert p.returncode == 0 and p.stdout == "ab\n", p.stderr
+
+
+def test_server_that_ignores_stream_still_works(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("plain reply")
+    mock.replies[-1][1]["_plain"] = True
+    p = api.run(tmp_path, "-p", "go")
+    assert p.returncode == 0 and p.stdout == "plain reply\n"  # printed once
+
+
+def test_midstream_error_before_text_is_retried(mock, tmp_path):
+    mock.replies.append((200, sse({"role": "assistant"},
+                                  {"error": {"message": "upstream overloaded"}})))
+    Api(mock, "local").reply("recovered")
+    p = Api(mock, "local").run(tmp_path, "-p", "go")
+    assert p.returncode == 0 and p.stdout == "recovered\n"
+    assert "upstream overloaded" in p.stderr and "retrying" in p.stderr
+
+
+def test_midstream_error_after_text_is_not_retried(mock, tmp_path):
+    mock.replies.append((200, sse({"content": "partial answ"},
+                                  {"error": {"message": "upstream died"}})))
+    p = Api(mock, "local").run(tmp_path, "-p", "go")
+    assert p.returncode == 1
+    assert p.stdout == "partial answ\n"  # the line is ended, and nothing is printed twice
+    assert "upstream died" in p.stderr and "retrying" not in p.stderr
+    assert len(mock.requests) == 1
+
+
+def test_midstream_context_error_is_recognised(mock, tmp_path):
+    mock.replies.append((200, sse({"error": {"message": "prompt is too long: 300000 tokens"}})))
+    p = Api(mock, "local").run(tmp_path, "-p", "go")
+    assert p.returncode == 1 and "/clear starts a new one" in p.stderr
+
+
+# ---- line editing (libedit), driven through a pseudo-terminal ----
+
+class Tty:
+    """The agent on a pty, as if typed into a terminal. expect() matches in order."""
+
+    def __init__(self, api, cwd, *args):
+        # A terminal's usual locale; Linux CI images ship C.UTF-8 but not en_US.UTF-8.
+        env = {**api.env(cwd), "LANG": "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"}
+        self.pid, self.fd = pty.fork()  # the child gets the pty as its controlling terminal
+        if self.pid == 0:
+            os.chdir(cwd)
+            os.execve(str(AGENT), [str(AGENT), "-P", api.provider, *args], env)
+        self.out, self.pos = b"", 0
+
+    def expect(self, pattern, timeout=10):
+        end = time.monotonic() + timeout
+        while (i := self.out.find(pattern, self.pos)) < 0:
+            assert time.monotonic() < end, f"waiting for {pattern!r} after {self.out[self.pos:]!r}"
+            if select.select([self.fd], [], [], 0.05)[0]:
+                try:
+                    self.out += os.read(self.fd, 4096)
+                except OSError:
+                    pass
+        self.pos = i + len(pattern)
+
+    def type(self, data):
+        os.write(self.fd, data)
+
+    def wait(self, timeout=10):
+        end = time.monotonic() + timeout
+        while not (r := os.waitpid(self.pid, os.WNOHANG))[0]:
+            if time.monotonic() > end:
+                os.kill(self.pid, signal.SIGKILL)
+                os.waitpid(self.pid, 0)
+                raise AssertionError(f"agent did not exit: {self.out!r}")
+            if select.select([self.fd], [], [], 0.05)[0]:
+                try:
+                    self.out += os.read(self.fd, 4096)
+                except OSError:
+                    pass
+        os.close(self.fd)
+        return os.waitstatus_to_exitcode(r[1])
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")  # fork() with the mock's thread
+def test_terminal_line_editing_history_and_ctrl_c(mock, tmp_path):
+    api = Api(mock, "local")
+    for r in ("r1", "r2", "r3"):
+        api.reply(r)
+    tty = Tty(api, tmp_path)
+    tty.expect(b"> ")
+    tty.type(b"ello\x01h\r")  # Ctrl-A jumps to the start: libedit is editing the line
+    tty.expect(b"r1")
+    tty.expect(b"> ")
+    tty.type(b"\x1b[A\r")  # up arrow recalls "hello"
+    tty.expect(b"r2")
+    tty.expect(b"> ")
+    tty.type(b"abc")
+    tty.expect(b"abc")
+    tty.type(b"\x03")  # Ctrl-C drops the line; the first press is enough
+    tty.expect(b"\r\n> ")
+    tty.type("café\r".encode())  # multi-byte input survives the custom getc
+    tty.expect(b"r3")
+    tty.expect(b"> ")
+    tty.type(b"/exit\r")
+    assert tty.wait() == 0
+    assert [r["body"]["messages"][-1]["content"] for r in mock.requests] == ["hello", "hello", "café"]
+    hist = tmp_path / ".state/ant/history"
+    assert hist.stat().st_mode & 0o777 == 0o600 and "hello" in hist.read_text(errors="replace")
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_terminal_history_persists_across_runs(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("first")
+    api.reply("second")
+    tty = Tty(api, tmp_path)
+    tty.expect(b"> ")
+    tty.type(b"remember me\r")
+    tty.expect(b"first")
+    tty.expect(b"> ", 2)
+    tty.type(b"\x04")  # Ctrl-D on an empty line quits
+    assert tty.wait() == 0
+    tty = Tty(api, tmp_path)
+    tty.expect(b"> ")
+    tty.type(b"\x1b[A\r")
+    tty.expect(b"second")
+    tty.type(b"\x04")
+    assert tty.wait() == 0
+    assert mock.requests[1]["body"]["messages"][-1]["content"] == "remember me"
+
+
+# ---- -y covers only the working directory ----
+
+OUTSIDE = "denied: outside the working directory, which -y does not cover"
+
+
+def test_yes_does_not_cover_writes_outside_cwd(mock, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (tmp_path / "out.txt").write_text("keep")
+    (work / "link").symlink_to(tmp_path)  # a symlink out of the working directory
+    api = Api(mock, "local")
+    api.reply(calls=[("w1", "write", {"path": "../escape.txt", "content": "x"}),
+                     ("w2", "write", {"path": str(tmp_path / "abs.txt"), "content": "x"}),
+                     ("e1", "edit", {"path": "link/out.txt", "old_string": "keep", "new_string": "x"}),
+                     ("w3", "write", {"path": "sub/../in.txt", "content": "in"}),
+                     ("s1", "shell", {"command": "echo shell-ok"})])
+    api.reply("ok")
+    p = api.run(work, "-y", "-p", "go")
+    assert p.returncode == 0, p.stderr
+    r = api.results(mock.requests[1])
+    assert r["w1"] == (OUTSIDE, True) and r["w2"] == (OUTSIDE, True) and r["e1"] == (OUTSIDE, True)
+    assert not (tmp_path / "escape.txt").exists() and not (tmp_path / "abs.txt").exists()
+    assert (tmp_path / "out.txt").read_text() == "keep"
+    assert r["w3"][1] is True  # sub/ does not exist: inside, but the write itself fails
+    assert r["s1"] == ("shell-ok\n[exit 0]", False)  # -y still covers shell
+
+
+def test_yes_covers_paths_inside_cwd(mock, tmp_path):
+    (tmp_path / "sub").mkdir()
+    api = Api(mock, "local")
+    api.reply(calls=[("w", "write", {"path": "sub/../in.txt", "content": "in"}),
+                     ("a", "write", {"path": str(tmp_path / "sub/abs.txt"), "content": "abs"})])
+    api.reply("ok")
+    api.run(tmp_path, "-y", "-p", "go")
+    r = api.results(mock.requests[1])
+    assert not r["w"][1] and not r["a"][1]
+    assert (tmp_path / "in.txt").read_text() == "in" and (tmp_path / "sub/abs.txt").read_text() == "abs"
+
+
+# ---- edit on a file that is not UTF-8 ----
+
+def test_edit_explains_non_utf8_mismatch(mock, tmp_path):
+    (tmp_path / "l1.txt").write_bytes(b"caf\xe9 au lait\n")
+    api = Api(mock, "local")
+    api.reply(calls=[("e1", "edit", {"path": "l1.txt", "old_string": "caf\ufffd", "new_string": "x"}),
+                     ("e2", "edit", {"path": "l1.txt", "old_string": "au lait", "new_string": "noir"})])
+    api.reply("ok")
+    api.run(tmp_path, "-y", "-p", "go")
+    r = api.results(mock.requests[1])
+    assert r["e1"][1] and "not valid UTF-8" in r["e1"][0] and "shell" in r["e1"][0]
+    assert r["e2"] == ("edited l1.txt", False)  # text around the bad byte is still editable
+    assert (tmp_path / "l1.txt").read_bytes() == b"caf\xe9 noir\n"  # the raw byte is kept
+
+
+def test_version_flag(tmp_path):
+    p = subprocess.run([str(AGENT), "-V"], capture_output=True, text=True, timeout=10)
+    assert p.returncode == 0 and p.stdout == "agent 0.1.0\n"

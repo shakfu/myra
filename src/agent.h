@@ -41,7 +41,7 @@ typedef struct {
     const char *name, *key_env, *base_env, *base, *model;
     int key_optional;
     int cache_control;  /* send OpenRouter's top-level cache_control */
-    size_t max_output;  /* cap on one tool result, in bytes; AGENT_MAX_OUTPUT overrides */
+    size_t max_output;  /* cap on one tool result, in bytes; MYRA_MAX_OUTPUT overrides */
 } agent_provider;
 
 extern const agent_provider AGENT_PROVIDERS[];
@@ -89,7 +89,7 @@ void agent_list_models(agent *a, const char *filter);
 int agent_step(agent *a, cJSON *resp);
 /* Returns a malloc'd result; *err is set on failure. */
 char *agent_run_tool(agent *a, const char *name, cJSON *input, int *err);
-/* $XDG_STATE_HOME/ant/<name>, default ~/.local/state/ant/<name>; NULL without either
+/* $XDG_STATE_HOME/myra/<name>, default ~/.local/state/myra/<name>; NULL without either
    variable. make_dir creates the parent directory. */
 char *agent_state_path(const char *name, int make_dir);
 /* Read and write that file's first line. */

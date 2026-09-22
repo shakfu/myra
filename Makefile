@@ -3,12 +3,12 @@ BUILD ?= build
 TYPE ?= Release
 PREFIX ?= /usr/local
 CMAKE_ARGS ?=
-LINK ?= agent # symlink to the built binary; empty to skip
+LINK ?= myra # symlink to the built binary; empty to skip
 GENERATOR := $(if $(shell command -v ninja),-G Ninja,)
 
 all: $(BUILD)/CMakeCache.txt
 	cmake --build $(BUILD)
-	$(if $(strip $(LINK)),ln -sfn $(BUILD)/agent $(strip $(LINK)))
+	$(if $(strip $(LINK)),ln -sfn $(BUILD)/myra $(strip $(LINK)))
 
 $(BUILD)/CMakeCache.txt:
 	cmake -S . -B $(BUILD) $(GENERATOR) -DCMAKE_BUILD_TYPE=$(TYPE) $(CMAKE_ARGS)
@@ -25,6 +25,6 @@ asan:
 
 clean:
 	rm -rf build build-asan
-	rm -f agent
+	rm -f myra
 
 .PHONY: all test asan install clean

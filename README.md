@@ -1,4 +1,4 @@
-# ant
+# myra
 
 Minimal code agent in C with four tools:
 
@@ -17,7 +17,7 @@ Only what is kept is held in memory, so a huge file or a flood of output costs n
 
 Requires CMake 3.16+ and libcurl; libedit, if found, adds line editing to the REPL. macOS ships both libraries. On Debian or Ubuntu: `apt install libcurl4-openssl-dev libedit-dev`. cJSON 1.7.19 (MIT) is vendored in `vendor/cjson/`. The Makefile wraps CMake and uses Ninja when installed.
 
-    make              # configure and build into build/; ./agent links to build/agent
+    make              # configure and build into build/; ./myra links to build/myra
     make test         # ctest: unit tests plus the end-to-end suite
     make asan         # the same, in build-asan/ with AddressSanitizer and UBSan
     make install      # PREFIX=/usr/local by default
@@ -60,23 +60,23 @@ Model precedence: `-m`, then the last `-m` used with that provider, then the tab
 
 Requests to `openrouter` carry a top-level `"cache_control": {"type": "ephemeral"}`. It turns on prompt caching for Claude models, which is opt-in; other models ignore it. See [OpenRouter prompt caching](https://openrouter.ai/docs/features/prompt-caching).
 
-`local` covers any OpenAI-compatible server. For llama-server, start it with `--jinja` so tool calls work. Its 16 KB cap is about a quarter of a 16K-token context; raise it with `AGENT_MAX_OUTPUT` for a larger `-c`.
+`local` covers any OpenAI-compatible server. For llama-server, start it with `--jinja` so tool calls work. Its 16 KB cap is about a quarter of a 16K-token context; raise it with `MYRA_MAX_OUTPUT` for a larger `-c`.
 
 ## Use
 
     export OPENROUTER_API_KEY=...
-    ./agent                              # REPL
-    ./agent -p "fix the build"           # headless: one task, then exit
-    ./agent -m openai/gpt-5.5 -p "..."   # any OpenRouter model id; remembered
-    ./agent -P local                     # llama-server on :8080; remembered
-    ./agent --permissions ask            # approve each write, edit and shell
-    ./agent --verbose                    # full tool arguments and results
-    ./agent --no-color                   # plain stderr
-    ./agent -V                           # version
+    ./myra                              # REPL
+    ./myra -p "fix the build"           # headless: one task, then exit
+    ./myra -m openai/gpt-5.5 -p "..."   # any OpenRouter model id; remembered
+    ./myra -P local                     # llama-server on :8080; remembered
+    ./myra --permissions ask            # approve each write, edit and shell
+    ./myra --verbose                    # full tool arguments and results
+    ./myra --no-color                   # plain stderr
+    ./myra -V                           # version
 
 Replies stream to stdout as they arrive. Everything else goes to stderr:
 
-- The REPL starts with `ant agent <version>`, then the provider and model.
+- The REPL starts with `myra <version>`, then the provider and model.
 - Each tool call gets one line, cut to the terminal width. `--verbose` shows the full arguments and the result instead.
 - Each turn ends with `[usage]`: requests, tokens in (cached) and out, and the cost where the server reports it. OpenRouter does, in credits, which are dollars; llama-server does not. Leaving the REPL prints the `[session]` totals.
 
@@ -120,7 +120,7 @@ When a request exceeds the model's context, older tool outputs are replaced by a
 
 ## Saved state
 
-Under `$XDG_STATE_HOME/ant/` (default `~/.local/state/ant/`):
+Under `$XDG_STATE_HOME/myra/` (default `~/.local/state/myra/`):
 
 | File                | Holds                                   |
 |---------------------|-----------------------------------------|
@@ -136,8 +136,8 @@ Besides the provider variables above:
 
 | Variable               | Effect                                                   |
 |------------------------|----------------------------------------------------------|
-| `AGENT_MAX_OUTPUT`     | tool output cap in bytes (at least 1024), for every provider |
-| `AGENT_RETRY_DELAY_MS` | first retry wait; it doubles per retry (default 1000). Tests set it to 1 |
+| `MYRA_MAX_OUTPUT`     | tool output cap in bytes (at least 1024), for every provider |
+| `MYRA_RETRY_DELAY_MS` | first retry wait; it doubles per retry (default 1000). Tests set it to 1 |
 | `XDG_STATE_HOME`       | where state is saved                                     |
 
 ## Limitations

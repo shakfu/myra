@@ -275,7 +275,7 @@ static int spit(const char *path, const char *s, size_t n) {
     const char *slash = strrchr(target, '/');
     buf tmp = {0};
     if (slash) buf_add(&tmp, target, (size_t)(slash - target) + 1);
-    buf_add(&tmp, ".ant-tmp-XXXXXX", 15);
+    buf_add(&tmp, ".myra-tmp-XXXXXX", 18);
     int fd = mkstemp(tmp.p);
     if (fd < 0) { /* in place, as a last resort */
         free(tmp.p);
@@ -569,7 +569,7 @@ char *agent_state_path(const char *name, int make_dir) {
     if (xdg && *xdg) buf_add(&b, xdg, strlen(xdg));
     else if (home && *home) { buf_add(&b, home, strlen(home)); buf_add(&b, "/.local/state", 13); }
     else return NULL;
-    buf_add(&b, "/ant/", 5);
+    buf_add(&b, "/myra/", 8);
     buf_add(&b, name, strlen(name));
     for (char *p = b.p + 1; make_dir && *p; p++) /* mkdir -p the parent */
         if (*p == '/') { *p = 0; mkdir(b.p, 0755); *p = '/'; }
@@ -857,7 +857,7 @@ static cJSON *request(agent *a, const char *path, const char *body, int streamin
     char *auth = a->api_key && *a->api_key ? fmt("authorization: Bearer %s", a->api_key) : NULL;
     if (auth) h = curl_slist_append(h, auth);
 
-    const char *d = getenv("AGENT_RETRY_DELAY_MS"); /* first back-off; doubles each retry */
+    const char *d = getenv("MYRA_RETRY_DELAY_MS"); /* first back-off; doubles each retry */
     long delay_ms = d ? strtol(d, NULL, 10) : 0;
     if (delay_ms < 1) delay_ms = 1000;
     if (delay_ms > 60000) delay_ms = 60000; /* a minute of back-off is plenty */
@@ -1013,7 +1013,7 @@ int agent_step(agent *a, cJSON *resp) {
         const char *id = get_str(call, "id");
         if (!id || !*id) { /* some servers omit it; the result must still name its call */
             char gen[32];
-            snprintf(gen, sizeof gen, "ant_call_%d", i);
+            snprintf(gen, sizeof gen, "myra_call_%d", i);
             if (cJSON_GetObjectItem(call, "id"))
                 cJSON_ReplaceItemInObject(call, "id", cJSON_CreateString(gen));
             else
@@ -1137,7 +1137,7 @@ int agent_init(agent *a, const agent_provider *p, const char *model, agent_permi
     memset(a, 0, sizeof *a);
     a->prov = p;
     a->permissions = perms;
-    const char *cap = getenv("AGENT_MAX_OUTPUT");
+    const char *cap = getenv("MYRA_MAX_OUTPUT");
     a->max_output = cap && atol(cap) >= 1024 ? (size_t)atol(cap) : p->max_output;
     a->api_key = getenv(p->key_env);
     if ((!a->api_key || !*a->api_key) && !p->key_optional) {

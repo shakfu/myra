@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Renamed to `myra`, Swedish for ant. The binary, the state directory (`~/.local/state/myra/`) and the environment variables (`MYRA_MAX_OUTPUT`, `MYRA_RETRY_DELAY_MS`) follow the name. Move the old state directory across to keep a remembered provider and model. The C API keeps its `agent_` prefix, which no shell ever sees.
+
 ## 0.1.1
 
 ### Added

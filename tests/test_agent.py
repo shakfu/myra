@@ -1,4 +1,4 @@
-"""End-to-end tests: run ./agent against a scripted mock of /chat/completions."""
+"""End-to-end tests: run ./myra against a scripted mock of /chat/completions."""
 
 import json
 import os
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-AGENT = Path(os.environ.get("AGENT_BIN") or Path(__file__).resolve().parent.parent / "build/agent")
+AGENT = Path(os.environ.get("MYRA_BIN") or Path(__file__).resolve().parent.parent / "build/myra")
 
 # provider -> (key env, base-url env, base-url suffix)
 PROVIDERS = {
@@ -116,7 +116,7 @@ class Api:
     def env(self, cwd, key="test-key"):
         key_env, base_env, suffix = PROVIDERS[self.provider]
         env = {"PATH": "/usr/bin:/bin", base_env: self.mock.url + suffix,
-               "XDG_STATE_HOME": str(cwd / ".state"), "AGENT_RETRY_DELAY_MS": "1"}
+               "XDG_STATE_HOME": str(cwd / ".state"), "MYRA_RETRY_DELAY_MS": "1"}
         if key is not None:
             env[key_env] = key
         return env
@@ -240,7 +240,7 @@ def test_read_and_argument_errors(api, tmp_path):
     assert r["r4"] == ("invalid JSON arguments for shell", True)
 
 
-@pytest.mark.parametrize("env,cap", [({}, None), ({"AGENT_MAX_OUTPUT": "4096"}, 4096)])
+@pytest.mark.parametrize("env,cap", [({}, None), ({"MYRA_MAX_OUTPUT": "4096"}, 4096)])
 def test_shell_output_keeps_start_and_end(api, tmp_path, env, cap):
     cap = cap or {"openrouter": 102400, "local": 16384}[api.provider]
     api.reply(calls=[("s", "shell", {"command": "seq 1 100000"})])
@@ -274,7 +274,7 @@ def test_default_retry_delay_is_one_second(mock, tmp_path):
     mock.replies.append((503, {"error": {}}))
     api.reply("ok")
     t = time.monotonic()
-    p = api.run(tmp_path, "-p", "go", env={"AGENT_RETRY_DELAY_MS": ""})
+    p = api.run(tmp_path, "-p", "go", env={"MYRA_RETRY_DELAY_MS": ""})
     assert p.returncode == 0 and 0.9 < time.monotonic() - t < 3
 
 
@@ -401,7 +401,7 @@ def test_model_is_remembered_per_provider(mock, tmp_path):
     api = Api(mock, "openrouter")
     api.reply("a")
     assert api.run(tmp_path, "-m", "openai/gpt-5.5", "-p", "x").returncode == 0
-    assert (tmp_path / ".state/ant/openrouter.model").read_text() == "openai/gpt-5.5\n"
+    assert (tmp_path / ".state/myra/openrouter.model").read_text() == "openai/gpt-5.5\n"
     api.reply("b")
     assert api.run(tmp_path, "-p", "x").returncode == 0
     assert mock.requests[1]["body"]["model"] == "openai/gpt-5.5"
@@ -413,22 +413,22 @@ def test_model_is_remembered_per_provider(mock, tmp_path):
 
     api.reply("d")  # a new -m replaces the remembered one
     assert api.run(tmp_path, "-m", "anthropic/claude-opus-4.8", "-p", "x").returncode == 0
-    assert (tmp_path / ".state/ant/openrouter.model").read_text() == "anthropic/claude-opus-4.8\n"
+    assert (tmp_path / ".state/myra/openrouter.model").read_text() == "anthropic/claude-opus-4.8\n"
 
 
 def test_rejected_model_is_not_remembered(mock, tmp_path):
     api = Api(mock, "openrouter")
     mock.replies.append((400, {"error": {"message": "no such model"}}))
     assert api.run(tmp_path, "-m", "typo", "-p", "x").returncode == 1
-    assert not (tmp_path / ".state/ant/openrouter.model").exists()
+    assert not (tmp_path / ".state/myra/openrouter.model").exists()
     api.reply("hi")
     api.run(tmp_path, "-p", "x")
     assert mock.requests[1]["body"]["model"] == "anthropic/claude-opus-5"
 
 
 def test_blank_state_file_uses_default(mock, tmp_path):
-    (tmp_path / ".state/ant").mkdir(parents=True)
-    (tmp_path / ".state/ant/local.model").write_text(" \n")
+    (tmp_path / ".state/myra").mkdir(parents=True)
+    (tmp_path / ".state/myra/local.model").write_text(" \n")
     api = Api(mock, "local")
     api.reply("hi")
     api.run(tmp_path, "-p", "x")
@@ -440,7 +440,7 @@ def test_state_falls_back_to_home(mock, tmp_path):
     api.reply("hi")
     p = api.run(tmp_path, "-m", "qwen", "-p", "x", env={"XDG_STATE_HOME": "", "HOME": str(tmp_path)})
     assert p.returncode == 0, p.stderr
-    assert (tmp_path / ".local/state/ant/local.model").read_text() == "qwen\n"
+    assert (tmp_path / ".local/state/myra/local.model").read_text() == "qwen\n"
 
 
 def test_unwritable_state_warns_but_runs(mock, tmp_path):
@@ -448,7 +448,7 @@ def test_unwritable_state_warns_but_runs(mock, tmp_path):
     api.reply("hi")
     p = api.run(tmp_path, "-m", "qwen", "-p", "x", env={"XDG_STATE_HOME": "/dev/null/x"})
     assert p.returncode == 0 and p.stdout == "hi\n"
-    assert "cannot save /dev/null/x/ant/" in p.stderr
+    assert "cannot save /dev/null/x/myra/" in p.stderr
 
 
 def test_repl_shows_provider_and_model(mock, tmp_path):
@@ -456,7 +456,7 @@ def test_repl_shows_provider_and_model(mock, tmp_path):
     p = api.run(tmp_path, stdin="/model\n")
     assert p.returncode == 0
     # Piped input: banner and /model output only, no "> " prompts, no color.
-    assert p.stderr == "ant agent 0.1.1\n" + "openrouter anthropic/claude-opus-5\n" * 2
+    assert p.stderr == "myra 0.1.1\n" + "openrouter anthropic/claude-opus-5\n" * 2
 
 
 # ---- provider selection: -P, else remembered if usable, else first cloud key, else error ----
@@ -472,15 +472,15 @@ def run_plain(tmp_path, env, *args):
 
 
 def remember(tmp_path, provider):
-    (tmp_path / ".state/ant").mkdir(parents=True, exist_ok=True)
-    (tmp_path / ".state/ant/provider").write_text(provider + "\n")
+    (tmp_path / ".state/myra").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".state/myra/provider").write_text(provider + "\n")
 
 
 def test_provider_is_remembered(mock, tmp_path):
     env = both_keys(tmp_path, mock)
     Api(mock, "local").reply("a")
     assert run_plain(tmp_path, env, "-P", "local", "-p", "x").returncode == 0
-    assert (tmp_path / ".state/ant/provider").read_text() == "local\n"
+    assert (tmp_path / ".state/myra/provider").read_text() == "local\n"
     Api(mock, "local").reply("b")  # key is set, but the remembered provider wins
     assert run_plain(tmp_path, env, "-p", "x").returncode == 0
     Api(mock, "openrouter").reply("c")  # -P switches and is remembered
@@ -504,18 +504,18 @@ def test_provider_and_model_remembered_together(mock, tmp_path):
 def test_default_provider_is_not_saved(mock, tmp_path):
     Api(mock, "openrouter").reply("hi")  # picked by the key rule, not by -P
     assert run_plain(tmp_path, both_keys(tmp_path, mock), "-p", "x").returncode == 0
-    assert not (tmp_path / ".state/ant/provider").exists()
+    assert not (tmp_path / ".state/myra/provider").exists()
 
 
 def test_rejected_provider_is_not_remembered(mock, tmp_path):
     mock.replies.append((401, {"error": {"message": "bad key"}}))
     assert run_plain(tmp_path, both_keys(tmp_path, mock), "-P", "local", "-p", "x").returncode == 1
-    assert not (tmp_path / ".state/ant/provider").exists()
+    assert not (tmp_path / ".state/myra/provider").exists()
 
 
 def test_unknown_provider_is_not_remembered(mock, tmp_path):
     assert run_plain(tmp_path, both_keys(tmp_path, mock), "-P", "nope", "-p", "x").returncode == 2
-    assert not (tmp_path / ".state/ant").exists()
+    assert not (tmp_path / ".state/myra").exists()
 
 
 def test_remembered_local_needs_no_key(mock, tmp_path):
@@ -565,7 +565,7 @@ def test_model_command_switches_and_keeps_history(mock, tmp_path):
     msgs = mock.requests[1]["body"]["messages"]
     assert [m["role"] for m in msgs] == ["system", "user", "assistant", "user"]
     assert "/model" not in json.dumps(msgs)
-    assert (tmp_path / ".state/ant/local.model").read_text() == "qwen\n"
+    assert (tmp_path / ".state/myra/local.model").read_text() == "qwen\n"
 
 
 def test_model_command_not_saved_until_accepted(mock, tmp_path):
@@ -573,7 +573,7 @@ def test_model_command_not_saved_until_accepted(mock, tmp_path):
     mock.replies.append((400, {"error": {"message": "no such model"}}))
     p = api.run(tmp_path, stdin="/model typo\nhi\n")
     assert "no such model" in p.stderr
-    assert not (tmp_path / ".state/ant/local.model").exists()
+    assert not (tmp_path / ".state/myra/local.model").exists()
 
 
 def test_model_prefix_is_not_a_command(mock, tmp_path):
@@ -668,7 +668,7 @@ def test_refused_connection_fails_fast(tmp_path, stdin):
     else:  # REPL survives both /models and a prompt
         assert p.returncode == 0
         assert msg % "models" in p.stderr and msg % "chat/completions" in p.stderr
-    assert not (tmp_path / ".state/ant/provider").exists()
+    assert not (tmp_path / ".state/myra/provider").exists()
 
 
 # ---- Ctrl-C (SIGINT) ----
@@ -733,7 +733,7 @@ def test_repl_survives_sigint_at_prompt_and_mid_turn(mock, tmp_path):
     api.reply(calls=[("s", "shell", {"command": "echo $$ > pid; sleep 30"})])
     api.reply("after")
     p = start(api, tmp_path)
-    assert p.stderr.readline() == "ant agent 0.1.1\n"
+    assert p.stderr.readline() == "myra 0.1.1\n"
     assert p.stderr.readline() == "local local\n"  # handler is installed by now
     p.send_signal(signal.SIGINT)  # at the prompt: the line is dropped, the REPL stays
     time.sleep(0.3)
@@ -1016,7 +1016,7 @@ def test_terminal_line_editing_history_and_ctrl_c(mock, tmp_path):
     tty.type(b"/exit\r")
     assert tty.wait() == 0
     assert [r["body"]["messages"][-1]["content"] for r in mock.requests] == ["hello", "hello", "café"]
-    hist = tmp_path / ".state/ant/history"
+    hist = tmp_path / ".state/myra/history"
     assert hist.stat().st_mode & 0o777 == 0o600 and "hello" in hist.read_text(errors="replace")
 
 
@@ -1097,7 +1097,7 @@ def test_edit_explains_non_utf8_mismatch(mock, tmp_path):
 
 def test_version_flag(tmp_path):
     p = subprocess.run([str(AGENT), "-V"], capture_output=True, text=True, timeout=10)
-    assert p.returncode == 0 and p.stdout == "ant agent 0.1.1\n"
+    assert p.returncode == 0 and p.stdout == "myra 0.1.1\n"
 
 
 MUTATIONS = [("w", "write", {"path": "../out.txt", "content": "x"}),
@@ -1163,7 +1163,7 @@ def test_call_without_id_gets_one_that_matches(mock, tmp_path):
     p = Api(mock, "local").run(tmp_path, "-p", "go")
     assert p.returncode == 0, p.stderr
     msgs = mock.requests[1]["body"]["messages"]
-    assert msgs[2]["tool_calls"][0]["id"] == msgs[3]["tool_call_id"] == "ant_call_0"
+    assert msgs[2]["tool_calls"][0]["id"] == msgs[3]["tool_call_id"] == "myra_call_0"
 
 
 # ---- tool lines, --verbose, cost, color ----
@@ -1226,7 +1226,7 @@ def test_color_on_a_terminal_only(mock, tmp_path, args, env, colored):
     tty.type(b"\x04")
     assert tty.wait() == 0
     assert (b"\x1b[36m[tool] shell true" in tty.out) == colored
-    assert (b"\x1b[1mant agent 0.1.1" in tty.out) == colored
+    assert (b"\x1b[1mmyra 0.1.1" in tty.out) == colored
 
 
 # ---- limits and stream framing ----
@@ -1278,5 +1278,5 @@ def test_bad_retry_delay_falls_back_to_default(mock, tmp_path, value):
     mock.replies.append((503, {"error": {}}))
     api.reply("ok")
     t = time.monotonic()
-    p = api.run(tmp_path, "-p", "go", env={"AGENT_RETRY_DELAY_MS": value})
+    p = api.run(tmp_path, "-p", "go", env={"MYRA_RETRY_DELAY_MS": value})
     assert p.returncode == 0 and 0.9 < time.monotonic() - t < 3  # the 1 s default

@@ -86,7 +86,7 @@ static int no_temp_files(void) {
     struct dirent *e;
     int found = 0;
     while (d && (e = readdir(d)))
-        if (!strncmp(e->d_name, ".ant-tmp-", 9)) found = 1;
+        if (!strncmp(e->d_name, ".myra-tmp-", 12)) found = 1;
     if (d) closedir(d);
     return !found;
 }
@@ -227,13 +227,13 @@ TEST(tool_output_keeps_start_and_end) {
 
 TEST(max_output_env_override) {
     agent_free(&A);
-    setenv("AGENT_MAX_OUTPUT", "2048", 1);
+    setenv("MYRA_MAX_OUTPUT", "2048", 1);
     CHECK(local_agent() == 0 && A.max_output == 2048);
     agent_free(&A);
-    setenv("AGENT_MAX_OUTPUT", "10", 1); /* too small: ignored */
+    setenv("MYRA_MAX_OUTPUT", "10", 1); /* too small: ignored */
     CHECK(local_agent() == 0 && A.max_output == 16384);
     agent_free(&A);
-    unsetenv("AGENT_MAX_OUTPUT");
+    unsetenv("MYRA_MAX_OUTPUT");
     CHECK(agent_init(&A, agent_provider_named("local"), NULL, AGENT_AUTO) == 0 && A.max_output == 16384);
     return 0;
 }
@@ -483,11 +483,11 @@ TEST(utf8_truncation_does_not_split_a_character) {
 TEST(state_roundtrip) {
     CHECK(!agent_load_state("x"));
     agent_store_state("x", "value");
-    CHECK(!strcmp(get("state/ant/x"), "value\n"));
+    CHECK(!strcmp(get("state/myra/x"), "value\n"));
     char *v = agent_load_state("x");
     CHECK(v && !strcmp(v, "value"));
     free(v);
-    put("state/ant/x", " \n");
+    put("state/myra/x", " \n");
     CHECK(!agent_load_state("x"));
     return 0;
 }
@@ -498,7 +498,7 @@ TEST(state_falls_back_to_home) {
     unsetenv("XDG_STATE_HOME");
     setenv("HOME", cwd, 1);
     agent_store_state("y", "v");
-    CHECK(!strcmp(get(".local/state/ant/y"), "v\n"));
+    CHECK(!strcmp(get(".local/state/myra/y"), "v\n"));
     unsetenv("HOME");
     CHECK(!agent_load_state("y"));
     return 0;
@@ -598,7 +598,7 @@ TEST(step_generates_missing_call_ids) {
                "{\"id\":\"srv\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"f\\\"}\"}}"
                "]},\"finish_reason\":\"tool_calls\"}]}") == 1);
     cJSON *calls = cJSON_GetObjectItem(msg(1), "tool_calls");
-    const char *want[] = {"ant_call_0", "ant_call_1", "srv"};
+    const char *want[] = {"myra_call_0", "myra_call_1", "srv"};
     for (int i = 0; i < 3; i++) { /* each call and its result carry the same id */
         CHECK(!strcmp(field(cJSON_GetArrayItem(calls, i), "id"), want[i]));
         CHECK(!strcmp(field(msg(2 + i), "tool_call_id"), want[i]));

@@ -92,7 +92,7 @@ static char *next_line(int edit, char **line, size_t *cap) {
 }
 
 static void repl(agent *a) {
-    agent_note(AGENT_BOLD, "ant agent %s\n", AGENT_VERSION);
+    agent_note(AGENT_BOLD, "myra %s\n", AGENT_VERSION);
     agent_note(AGENT_DIM, "%s %s\n", a->prov->name, a->model);
     char *line = NULL;
     size_t cap = 0;
@@ -166,7 +166,7 @@ int main(int argc, char **argv) {
     if (no_color && *no_color) color = 0;
     while ((opt = getopt_long(argc, argv, "p:P:m:hV", longopts, NULL)) != -1) {
         if (opt == 'V') {
-            printf("ant agent %s\n", AGENT_VERSION);
+            printf("myra %s\n", AGENT_VERSION);
             return 0;
         }
         if (opt == 'v') verbose = 1;

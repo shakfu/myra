@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ant VERSION 0.1.1 LANGUAGES C)
+project(myra VERSION 0.1.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -36,23 +36,23 @@ target_compile_definitions(agentlib PUBLIC _DEFAULT_SOURCE _DARWIN_C_SOURCE)
 target_compile_options(agentlib PRIVATE ${WARNINGS})
 target_link_libraries(agentlib PUBLIC cjson CURL::libcurl)
 
-add_executable(agent src/main.c)
-target_compile_options(agent PRIVATE ${WARNINGS})
-target_compile_definitions(agent PRIVATE AGENT_VERSION="${PROJECT_VERSION}")
-target_link_libraries(agent PRIVATE agentlib)
+add_executable(myra src/main.c)
+target_compile_options(myra PRIVATE ${WARNINGS})
+target_compile_definitions(myra PRIVATE AGENT_VERSION="${PROJECT_VERSION}")
+target_link_libraries(myra PRIVATE agentlib)
 
 # Line editing and history for the REPL; macOS ships libedit, Linux has libedit-dev.
 find_path(EDITLINE_INCLUDE editline/readline.h)
 find_library(EDIT_LIB edit)
 if(EDITLINE_INCLUDE AND EDIT_LIB)
-  target_compile_definitions(agent PRIVATE HAVE_LIBEDIT)
-  target_include_directories(agent PRIVATE ${EDITLINE_INCLUDE})
-  target_link_libraries(agent PRIVATE ${EDIT_LIB})
+  target_compile_definitions(myra PRIVATE HAVE_LIBEDIT)
+  target_include_directories(myra PRIVATE ${EDITLINE_INCLUDE})
+  target_link_libraries(myra PRIVATE ${EDIT_LIB})
 else()
   message(STATUS "libedit not found: the REPL has no line editing")
 endif()
 
-install(TARGETS agent RUNTIME DESTINATION bin)
+install(TARGETS myra RUNTIME DESTINATION bin)
 
 enable_testing()
 
@@ -71,7 +71,7 @@ find_program(UV uv)
 if(UV)
   add_test(NAME e2e COMMAND ${UV} run --no-project --with pytest pytest -q tests
            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-  set_tests_properties(e2e PROPERTIES ENVIRONMENT "AGENT_BIN=$<TARGET_FILE:agent>")
+  set_tests_properties(e2e PROPERTIES ENVIRONMENT "MYRA_BIN=$<TARGET_FILE:myra>")
 else()
   message(WARNING "uv not found: end-to-end tests (tests/test_agent.py) are not registered")
 endif()

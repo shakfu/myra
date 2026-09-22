@@ -1,6 +1,7 @@
-"""End-to-end tests: run ./agent against a scripted mock of each provider's API."""
+"""End-to-end tests: run ./agent against a scripted mock of /chat/completions."""
 
 import json
+import os
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,16 +9,12 @@ from pathlib import Path
 
 import pytest
 
-AGENT = Path(__file__).resolve().parent.parent / "agent"
+AGENT = Path(os.environ.get("AGENT_BIN") or Path(__file__).resolve().parent.parent / "build/agent")
 
-# provider -> (key env, base-url env, base-url suffix, expected path, extra args)
+# provider -> (key env, base-url env, base-url suffix)
 PROVIDERS = {
-    "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "", "/v1/messages", []),
-    "openrouter": ("OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "/api/v1",
-                   "/api/v1/chat/completions", []),
-    "openai": ("OPENAI_API_KEY", "OPENAI_BASE_URL", "/v1", "/v1/chat/completions",
-               ["-m", "gpt-test"]),
-    "compat": ("COMPAT_API_KEY", "COMPAT_BASE_URL", "/v1", "/v1/chat/completions", []),
+    "openrouter": ("OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "/api/v1"),
+    "local": ("LOCAL_API_KEY", "LOCAL_BASE_URL", "/v1"),
 }
 
 
@@ -31,9 +28,15 @@ class Mock:
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = self.rfile.read(int(self.headers["content-length"]))
-                mock.requests.append({"path": self.path,
+                self.answer("POST", json.loads(body))
+
+            def do_GET(self):
+                self.answer("GET", None)
+
+            def answer(self, method, body):
+                mock.requests.append({"method": method, "path": self.path,
                                       "headers": {k.lower(): v for k, v in self.headers.items()},
-                                      "body": json.loads(body)})
+                                      "body": body})
                 status, reply = mock.replies.pop(0)
                 data = json.dumps(reply).encode()
                 self.send_response(status)
@@ -51,55 +54,46 @@ class Mock:
 
 
 class Api:
-    """Builds replies and reads tool results in one provider's wire format."""
+    """Runs the agent against the mock as one provider."""
 
     def __init__(self, mock, provider):
         self.mock, self.provider = mock, provider
-        self.anthropic = provider == "anthropic"
 
-    def env(self, key="test-key"):
-        key_env, base_env, suffix, _, _ = PROVIDERS[self.provider]
-        env = {"PATH": "/usr/bin:/bin", base_env: self.mock.url + suffix}
+    def env(self, cwd, key="test-key"):
+        key_env, base_env, suffix = PROVIDERS[self.provider]
+        env = {"PATH": "/usr/bin:/bin", base_env: self.mock.url + suffix,
+               "XDG_STATE_HOME": str(cwd / ".state")}
         if key is not None:
             env[key_env] = key
         return env
 
-    def run(self, cwd, *args, stdin="", key="test-key"):
+    def run(self, cwd, *args, stdin="", key="test-key", env=None, provider_flag=True):
         # New session: no controlling terminal, so /dev/tty confirmation cannot block.
-        argv = [str(AGENT), "-P", self.provider, *PROVIDERS[self.provider][4], *args]
-        return subprocess.run(argv, cwd=cwd, env=self.env(key), input=stdin, text=True,
+        flag = ["-P", self.provider] if provider_flag else []
+        return subprocess.run([str(AGENT), *flag, *args], cwd=cwd,
+                              env={**self.env(cwd, key), **(env or {})}, input=stdin, text=True,
                               capture_output=True, timeout=60, start_new_session=True)
 
     def reply(self, text=None, calls=(), stop=None):
         """calls: (id, name, input dict or raw argument string)."""
-        if self.anthropic:
-            content = ([{"type": "text", "text": text}] if text else []) + [
-                {"type": "tool_use", "id": i, "name": n, "input": a} for i, n, a in calls]
-            stop = stop or ("tool_use" if calls else "end_turn")
-            body = {"type": "message", "role": "assistant", "content": content, "stop_reason": stop}
-        else:
-            msg = {"role": "assistant", "content": text}
-            if calls:
-                msg["tool_calls"] = [{"id": i, "type": "function", "function": {
-                    "name": n, "arguments": a if isinstance(a, str) else json.dumps(a)}}
-                    for i, n, a in calls]
-            stop = stop or ("tool_calls" if calls else "stop")
-            body = {"choices": [{"index": 0, "message": msg, "finish_reason": stop}]}
-        self.mock.replies.append((200, body))
+        msg = {"role": "assistant", "content": text}
+        if calls:
+            msg["tool_calls"] = [{"id": i, "type": "function", "function": {
+                "name": n, "arguments": a if isinstance(a, str) else json.dumps(a)}}
+                for i, n, a in calls]
+        stop = stop or ("tool_calls" if calls else "stop")
+        self.mock.replies.append(
+            (200, {"choices": [{"index": 0, "message": msg, "finish_reason": stop}]}))
 
-    def results(self, req):
-        """{tool id: (content, is_error)} for the results sent in req."""
-        msgs = req["body"]["messages"]
-        if self.anthropic:
-            assert msgs[-1]["role"] == "user"
-            return {r["tool_use_id"]: (r["content"], r.get("is_error", False))
-                    for r in msgs[-1]["content"]}
+    @staticmethod
+    def results(req):
+        """{tool call id: (content, is_error)} for the trailing tool messages in req."""
         out = {}
-        for m in reversed(msgs):
+        for m in reversed(req["body"]["messages"]):
             if m["role"] != "tool":
                 break
-            err = m["content"].startswith("error: ")
-            out[m["tool_call_id"]] = (m["content"].removeprefix("error: "), err)
+            out[m["tool_call_id"]] = (m["content"].removeprefix("error: "),
+                                      m["content"].startswith("error: "))
         return out
 
 
@@ -115,18 +109,27 @@ def api(request, mock):
     return Api(mock, request.param)
 
 
-# ---- behaviour shared by every provider ----
+# ---- behaviour shared by both providers ----
 
-def test_request_path_and_tools(api, tmp_path):
+def test_request_shape(api, tmp_path):
     api.reply("hello")
     p = api.run(tmp_path, "-p", "say hi")
     assert p.returncode == 0, p.stderr
     assert p.stdout == "hello\n"
     req = api.mock.requests[0]
-    assert req["path"] == PROVIDERS[api.provider][3]
-    tools = req["body"]["tools"]
-    names = [t["name"] if api.anthropic else t["function"]["name"] for t in tools]
-    assert names == ["read", "write", "edit", "shell"]
+    assert req["path"] == PROVIDERS[api.provider][2] + "/chat/completions"
+    assert req["headers"]["authorization"] == "Bearer test-key"
+    body = req["body"]
+    if api.provider == "openrouter":
+        assert body.pop("cache_control") == {"type": "ephemeral"}
+    assert set(body) == {"model", "tools", "messages"}  # nothing OpenRouter-specific to local
+    assert body["messages"][0]["role"] == "system"
+    assert str(tmp_path.resolve()) in body["messages"][0]["content"]
+    assert body["messages"][1] == {"role": "user", "content": "say hi"}
+    assert [t["type"] for t in body["tools"]] == ["function"] * 4
+    fns = [t["function"] for t in body["tools"]]
+    assert [f["name"] for f in fns] == ["read", "write", "edit", "shell"]
+    assert fns[0]["parameters"]["required"] == ["path"]
 
 
 def test_all_four_tools_in_one_turn(api, tmp_path):
@@ -139,6 +142,9 @@ def test_all_four_tools_in_one_turn(api, tmp_path):
     assert p.returncode == 0, p.stderr
     assert p.stdout == "working\ndone\n"
     assert (tmp_path / "a.txt").read_text() == "one\n2\n"
+    msgs = api.mock.requests[1]["body"]["messages"]
+    assert msgs[2]["role"] == "assistant"
+    assert [c["id"] for c in msgs[2]["tool_calls"]] == ["t1", "t2", "t3", "t4"]
     r = api.results(api.mock.requests[1])
     assert set(r) == {"t1", "t2", "t3", "t4"}
     assert not r["t1"][1] and not r["t2"][1]
@@ -164,16 +170,17 @@ def test_edit_errors(api, tmp_path, inp, msg):
     assert (tmp_path / "b.txt").read_text() == "x x\n"
 
 
-def test_read_errors(api, tmp_path):
+def test_read_and_argument_errors(api, tmp_path):
     (tmp_path / "bin").write_bytes(b"a\0b")
     api.reply(calls=[("r1", "read", {"path": "bin"}), ("r2", "read", {"path": "nope"}),
-                     ("r3", "bogus", {})])
+                     ("r3", "bogus", {}), ("r4", "shell", '{"command": ')])
     api.reply("ok")
     api.run(tmp_path, "-p", "go")
     r = api.results(api.mock.requests[1])
     assert r["r1"][1] and "binary" in r["r1"][0]
     assert r["r2"][1] and "cannot read" in r["r2"][0]
     assert r["r3"][1] and "unknown tool" in r["r3"][0]
+    assert r["r4"] == ("invalid JSON arguments for shell", True)
 
 
 def test_shell_output_is_capped(api, tmp_path):
@@ -215,34 +222,47 @@ def test_client_error_not_retried(api, tmp_path):
     assert len(api.mock.requests) == 1
 
 
+def test_missing_choices_fails(api, tmp_path):
+    api.mock.replies.append((200, {"error": {"message": "upstream exploded"}}))
+    p = api.run(tmp_path, "-p", "x")
+    assert p.returncode == 1 and "upstream exploded" in p.stderr
+
+
 def test_repl_keeps_history_and_rolls_back_failures(api, tmp_path):
     api.reply("first")
     api.mock.replies.append((400, {"error": {"message": "nope"}}))
+    api.reply("", stop="content_filter")
     api.reply("second")
-    p = api.run(tmp_path, stdin="one\n\nbad\ntwo\n/exit\nnever\n")
+    p = api.run(tmp_path, stdin="one\n\nbad\nworse\ntwo\n/exit\nnever\n")
     assert p.returncode == 0, p.stderr
     assert p.stdout == "first\nsecond\n"
-    msgs = api.mock.requests[2]["body"]["messages"]
-    roles = [m["role"] for m in msgs]
-    assert roles == (["user", "assistant", "user"] if api.anthropic
-                     else ["system", "user", "assistant", "user"])
+    assert "refused: content_filter" in p.stderr
+    msgs = api.mock.requests[3]["body"]["messages"]
+    assert [m["role"] for m in msgs] == ["system", "user", "assistant", "user"]
     assert msgs[-1]["content"] == "two"
-    assert len(api.mock.requests) == 3
+    assert len(api.mock.requests) == 4
 
 
 def test_truncated_reply_drops_tool_calls(api, tmp_path):
-    api.reply("partial", [("t", "shell", {"command": "touch x"})],
-              stop="max_tokens" if api.anthropic else "length")
+    api.reply("partial", [("t", "shell", {"command": "touch x"})], stop="length")
     api.reply("next")
     p = api.run(tmp_path, "-y", stdin="a\nb\n")
-    assert "max_tokens" in p.stderr and not (tmp_path / "x").exists()
-    assert "tool_" not in json.dumps(api.mock.requests[1]["body"]["messages"])
+    assert "length limit" in p.stderr and not (tmp_path / "x").exists()
+    msgs = api.mock.requests[1]["body"]["messages"]
+    assert msgs[2] == {"role": "assistant", "content": "partial"}
+
+
+def test_null_content_without_calls_becomes_empty(api, tmp_path):
+    api.reply(None)
+    api.reply("ok")
+    api.run(tmp_path, stdin="a\nb\n")
+    assert api.mock.requests[1]["body"]["messages"][2] == {"role": "assistant", "content": ""}
 
 
 # ---- provider selection ----
 
 @pytest.mark.parametrize("provider,model", [
-    ("anthropic", "claude-opus-5"), ("openrouter", "anthropic/claude-opus-5"), ("compat", "local")])
+    ("openrouter", "anthropic/claude-opus-5"), ("local", "local")])
 def test_default_models(mock, tmp_path, provider, model):
     api = Api(mock, provider)
     api.reply("hi")
@@ -250,128 +270,232 @@ def test_default_models(mock, tmp_path, provider, model):
     assert mock.requests[0]["body"]["model"] == model
 
 
-def test_model_flag(mock, tmp_path):
-    api = Api(mock, "openrouter")
+def test_model_flag(api, tmp_path):
     api.reply("hi")
     assert api.run(tmp_path, "-m", "openai/gpt-5.5", "-p", "x").returncode == 0
-    assert mock.requests[0]["body"]["model"] == "openai/gpt-5.5"
+    assert api.mock.requests[0]["body"]["model"] == "openai/gpt-5.5"
 
 
-def test_openrouter_is_default_provider(mock, tmp_path):
+def test_openrouter_is_default_when_key_set(mock, tmp_path):
     api = Api(mock, "openrouter")
     api.reply("hi")
-    p = subprocess.run([str(AGENT), "-p", "x"], cwd=tmp_path, env=api.env(), text=True,
-                       capture_output=True, timeout=30)
+    p = api.run(tmp_path, "-p", "x", provider_flag=False)
     assert p.returncode == 0, p.stderr
     assert mock.requests[0]["path"] == "/api/v1/chat/completions"
 
 
-def test_openai_requires_model(mock, tmp_path):
-    p = subprocess.run([str(AGENT), "-P", "openai", "-p", "x"], cwd=tmp_path,
-                       env=Api(mock, "openai").env(), capture_output=True, text=True, timeout=10)
-    assert p.returncode == 2 and "needs -m" in p.stderr
+@pytest.mark.parametrize("key", [None, ""])
+def test_no_key_and_no_provider_is_an_error(mock, tmp_path, key):
+    env = {} if key is None else {"OPENROUTER_API_KEY": key}
+    p = Api(mock, "local").run(tmp_path, "-p", "x", provider_flag=False, key=None, env=env)
+    assert p.returncode == 1
+    assert "set OPENROUTER_API_KEY or pass -P local" in p.stderr
+    assert not mock.requests  # never falls back to local
 
 
-def test_unknown_provider(tmp_path):
-    p = subprocess.run([str(AGENT), "-P", "nope", "-p", "x"], cwd=tmp_path,
+@pytest.mark.parametrize("name", ["nope", "anthropic", "openai", "compat"])
+def test_unknown_provider(tmp_path, name):
+    p = subprocess.run([str(AGENT), "-P", name, "-p", "x"], cwd=tmp_path,
                        capture_output=True, text=True, timeout=10)
-    assert p.returncode == 2 and "unknown provider nope" in p.stderr
+    assert p.returncode == 2 and f"unknown provider {name}" in p.stderr
 
 
-@pytest.mark.parametrize("provider", ["anthropic", "openrouter", "openai"])
-def test_missing_api_key(mock, tmp_path, provider):
-    p = Api(mock, provider).run(tmp_path, "-p", "x", key=None)
-    assert p.returncode == 1 and PROVIDERS[provider][0] + " is not set" in p.stderr
+def test_openrouter_requires_key(mock, tmp_path):
+    p = Api(mock, "openrouter").run(tmp_path, "-p", "x", key=None)
+    assert p.returncode == 1 and "OPENROUTER_API_KEY is not set" in p.stderr
     assert not mock.requests
 
 
 @pytest.mark.parametrize("key,header", [(None, None), ("sk-local", "Bearer sk-local")])
-def test_compat_key_is_optional(mock, tmp_path, key, header):
-    api = Api(mock, "compat")
+def test_local_key_is_optional(mock, tmp_path, key, header):
+    api = Api(mock, "local")
     api.reply("hi")
     assert api.run(tmp_path, "-p", "x", key=key).returncode == 0
     assert mock.requests[0]["headers"].get("authorization") == header
 
 
-# ---- wire-format specifics ----
+# ---- remembered model ----
 
-def test_anthropic_request_shape(mock, tmp_path):
-    api = Api(mock, "anthropic")
+def test_model_is_remembered_per_provider(mock, tmp_path):
+    api = Api(mock, "openrouter")
+    api.reply("a")
+    assert api.run(tmp_path, "-m", "openai/gpt-5.5", "-p", "x").returncode == 0
+    assert (tmp_path / ".state/ant/openrouter.model").read_text() == "openai/gpt-5.5\n"
+    api.reply("b")
+    assert api.run(tmp_path, "-p", "x").returncode == 0
+    assert mock.requests[1]["body"]["model"] == "openai/gpt-5.5"
+
+    local = Api(mock, "local")  # other provider keeps its own default
+    local.reply("c")
+    assert local.run(tmp_path, "-p", "x").returncode == 0
+    assert mock.requests[2]["body"]["model"] == "local"
+
+    api.reply("d")  # a new -m replaces the remembered one
+    assert api.run(tmp_path, "-m", "anthropic/claude-opus-4.8", "-p", "x").returncode == 0
+    assert (tmp_path / ".state/ant/openrouter.model").read_text() == "anthropic/claude-opus-4.8\n"
+
+
+def test_rejected_model_is_not_remembered(mock, tmp_path):
+    api = Api(mock, "openrouter")
+    mock.replies.append((400, {"error": {"message": "no such model"}}))
+    assert api.run(tmp_path, "-m", "typo", "-p", "x").returncode == 1
+    assert not (tmp_path / ".state/ant/openrouter.model").exists()
     api.reply("hi")
-    api.run(tmp_path, "-p", "say hi")
-    req = mock.requests[0]
-    h, body = req["headers"], req["body"]
-    assert h["x-api-key"] == "test-key" and "authorization" not in h
-    assert h["anthropic-version"] == "2023-06-01"
-    assert h["anthropic-beta"] == "server-side-fallback-2026-07-01"
-    assert body["fallbacks"] == "default" and body["max_tokens"] == 16000
-    assert body["messages"] == [{"role": "user", "content": "say hi"}]
-    assert str(tmp_path.resolve()) in body["system"]
+    api.run(tmp_path, "-p", "x")
+    assert mock.requests[1]["body"]["model"] == "anthropic/claude-opus-5"
 
 
-def test_openai_request_shape(mock, tmp_path):
-    api = Api(mock, "openai")
+def test_blank_state_file_uses_default(mock, tmp_path):
+    (tmp_path / ".state/ant").mkdir(parents=True)
+    (tmp_path / ".state/ant/local.model").write_text(" \n")
+    api = Api(mock, "local")
     api.reply("hi")
-    api.run(tmp_path, "-p", "say hi")
-    req = mock.requests[0]
-    h, body = req["headers"], req["body"]
-    assert h["authorization"] == "Bearer test-key" and "x-api-key" not in h
-    assert "anthropic-beta" not in h
-    assert set(body) == {"model", "tools", "messages"}
-    assert body["messages"][0]["role"] == "system"
-    assert str(tmp_path.resolve()) in body["messages"][0]["content"]
-    assert body["messages"][1] == {"role": "user", "content": "say hi"}
-    t = body["tools"][0]
-    assert t["type"] == "function" and t["function"]["parameters"]["required"] == ["path"]
+    api.run(tmp_path, "-p", "x")
+    assert mock.requests[0]["body"]["model"] == "local"
 
 
-def test_openai_assistant_tool_message_is_replayed(mock, tmp_path):
-    api = Api(mock, "compat")
-    api.reply(None, [("c1", "read", {"path": "f"}), ("c2", "shell", '{"command": ')])
-    api.reply("ok")
-    (tmp_path / "f").write_text("data")
-    api.run(tmp_path, "-y", "-p", "go")
+def test_state_falls_back_to_home(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("hi")
+    p = api.run(tmp_path, "-m", "qwen", "-p", "x", env={"XDG_STATE_HOME": "", "HOME": str(tmp_path)})
+    assert p.returncode == 0, p.stderr
+    assert (tmp_path / ".local/state/ant/local.model").read_text() == "qwen\n"
+
+
+def test_unwritable_state_warns_but_runs(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("hi")
+    p = api.run(tmp_path, "-m", "qwen", "-p", "x", env={"XDG_STATE_HOME": "/dev/null/x"})
+    assert p.returncode == 0 and p.stdout == "hi\n"
+    assert "cannot save /dev/null/x/ant/" in p.stderr
+
+
+def test_repl_shows_provider_and_model(mock, tmp_path):
+    api = Api(mock, "openrouter")
+    p = api.run(tmp_path, stdin="")
+    assert p.returncode == 0
+    assert p.stderr.startswith("openrouter anthropic/claude-opus-5\n")
+
+
+# ---- provider selection: -P, else first cloud key set, else error ----
+
+def both_keys(tmp_path, mock):
+    """Env where either provider could run: OpenRouter key set, both base URLs at the mock."""
+    return {**Api(mock, "local").env(tmp_path), **Api(mock, "openrouter").env(tmp_path)}
+
+
+def run_plain(tmp_path, env, *args):
+    return subprocess.run([str(AGENT), *args], cwd=tmp_path, env=env, text=True,
+                          capture_output=True, timeout=30, start_new_session=True)
+
+
+def test_provider_is_not_remembered(mock, tmp_path):
+    env = both_keys(tmp_path, mock)
+    Api(mock, "local").reply("a")
+    assert run_plain(tmp_path, env, "-P", "local", "-p", "x").returncode == 0
+    Api(mock, "openrouter").reply("b")  # key is set, so openrouter, not the last -P
+    assert run_plain(tmp_path, env, "-p", "x").returncode == 0
+    assert [r["path"] for r in mock.requests] == ["/v1/chat/completions",
+                                                  "/api/v1/chat/completions"]
+    assert not (tmp_path / ".state/ant/provider").exists()
+
+
+def test_stale_provider_file_is_ignored(mock, tmp_path):
+    (tmp_path / ".state/ant").mkdir(parents=True)
+    (tmp_path / ".state/ant/provider").write_text("local\n")
+    p = Api(mock, "local").run(tmp_path, "-p", "x", provider_flag=False, key=None)
+    assert p.returncode == 1 and "set OPENROUTER_API_KEY or pass -P local" in p.stderr
+    assert not mock.requests
+
+
+def test_explicit_local_ignores_cloud_key(mock, tmp_path):
+    Api(mock, "local").reply("hi")
+    env = {**Api(mock, "local").env(tmp_path, key=None), "OPENROUTER_API_KEY": "sk-or"}
+    p = run_plain(tmp_path, env, "-P", "local", "-p", "x")
+    assert p.returncode == 0, p.stderr
+    assert mock.requests[0]["path"] == "/v1/chat/completions"
+    assert "authorization" not in mock.requests[0]["headers"]  # OpenRouter key not sent
+
+
+# ---- /model ----
+
+def test_model_command_switches_and_keeps_history(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("a")
+    api.reply("b")
+    p = api.run(tmp_path, stdin="one\n/model\n/model   qwen \ntwo\n")
+    assert p.returncode == 0, p.stderr
+    assert p.stderr.count("local local\n") == 2  # banner, then bare /model
+    assert "local qwen \n" not in p.stderr and "local qwen\n" in p.stderr
+    assert [r["body"]["model"] for r in mock.requests] == ["local", "qwen"]
     msgs = mock.requests[1]["body"]["messages"]
-    assert msgs[2]["role"] == "assistant" and msgs[2]["content"] is None
-    assert [c["id"] for c in msgs[2]["tool_calls"]] == ["c1", "c2"]
-    r = api.results(mock.requests[1])
-    assert r["c1"] == ("data", False)
-    assert r["c2"] == ("invalid JSON arguments for shell", True)
+    assert [m["role"] for m in msgs] == ["system", "user", "assistant", "user"]
+    assert "/model" not in json.dumps(msgs)
+    assert (tmp_path / ".state/ant/local.model").read_text() == "qwen\n"
 
 
-def test_openai_missing_choices_fails(mock, tmp_path):
-    mock.replies.append((200, {"error": {"message": "upstream exploded"}}))
-    p = Api(mock, "openrouter").run(tmp_path, "-p", "x")
-    assert p.returncode == 1 and "upstream exploded" in p.stderr
+def test_model_command_not_saved_until_accepted(mock, tmp_path):
+    api = Api(mock, "local")
+    mock.replies.append((400, {"error": {"message": "no such model"}}))
+    p = api.run(tmp_path, stdin="/model typo\nhi\n")
+    assert "no such model" in p.stderr
+    assert not (tmp_path / ".state/ant/local.model").exists()
 
 
-def test_anthropic_thinking_replayed_and_refusal_rolled_back(mock, tmp_path):
-    api = Api(mock, "anthropic")
-    mock.replies.append((200, {"content": [
-        {"type": "thinking", "thinking": "", "signature": "sig"},
-        {"type": "text", "text": "first"}], "stop_reason": "end_turn"}))
-    mock.replies.append((200, {"content": [], "stop_reason": "refusal",
-                               "stop_details": {"type": "refusal", "explanation": "policy"}}))
-    api.reply("second")
-    p = api.run(tmp_path, stdin="one\nworse\ntwo\n")
-    assert p.stdout == "first\nsecond\n" and "refused: policy" in p.stderr
-    msgs = mock.requests[2]["body"]["messages"]
-    assert [m["content"] if m["role"] == "user" else None for m in msgs] == ["one", None, "two"]
-    assert msgs[1]["content"][0] == {"type": "thinking", "thinking": "", "signature": "sig"}
+def test_model_prefix_is_not_a_command(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("ok")
+    api.run(tmp_path, stdin="/modelling question\n")
+    assert mock.requests[0]["method"] == "POST"
+    assert mock.requests[0]["body"]["messages"][1]["content"] == "/modelling question"
 
 
-def test_openai_content_filter_rolled_back(mock, tmp_path):
-    api = Api(mock, "openai")
-    api.reply("", stop="content_filter")
-    api.reply("fine")
-    p = api.run(tmp_path, stdin="bad\ngood\n")
-    assert "refused: content_filter" in p.stderr and p.stdout == "fine\n"
+# ---- /models ----
+
+MODELS = {"object": "list", "data": [{"id": "anthropic/claude-opus-5"}, {"id": "openai/gpt-5.5"},
+                                     {"id": "anthropic/claude-sonnet-5"}, {"name": "no id"}]}
+
+
+def test_models_lists_and_stars_current(api, tmp_path):
+    api.mock.replies.append((200, MODELS))
+    api.run(tmp_path, "-m", "openai/gpt-5.5", stdin="/models\n")
+    req = api.mock.requests[0]
+    assert req["method"] == "GET"
+    assert req["path"] == PROVIDERS[api.provider][2] + "/models"
+    assert req["headers"]["authorization"] == "Bearer test-key"
+
+
+def test_models_output_and_filter(mock, tmp_path):
+    api = Api(mock, "openrouter")
+    mock.replies += [(200, MODELS), (200, MODELS)]
+    p = api.run(tmp_path, stdin="/models\n/models   claude \n")
+    assert p.returncode == 0, p.stderr
+    assert p.stdout == ("* anthropic/claude-opus-5\n  openai/gpt-5.5\n  anthropic/claude-sonnet-5\n"
+                        "* anthropic/claude-opus-5\n  anthropic/claude-sonnet-5\n")
+
+
+def test_models_does_not_touch_history(mock, tmp_path):
+    api = Api(mock, "local")
+    mock.replies.append((200, MODELS))
+    api.reply("hi")
+    api.run(tmp_path, stdin="/models\nhello\n")
     assert [m["role"] for m in mock.requests[1]["body"]["messages"]] == ["system", "user"]
 
 
-def test_openai_null_content_without_calls_becomes_empty(mock, tmp_path):
-    api = Api(mock, "compat")
-    api.reply(None)
-    api.reply("ok")
-    api.run(tmp_path, stdin="a\nb\n")
-    assert mock.requests[1]["body"]["messages"][2] == {"role": "assistant", "content": ""}
+@pytest.mark.parametrize("reply,msg", [
+    ((401, {"error": {"message": "bad key"}}), "bad key"),
+    ((200, {"error": {"message": "odd"}}), "no model list"),
+])
+def test_models_errors_keep_repl_running(mock, tmp_path, reply, msg):
+    api = Api(mock, "local")
+    mock.replies.append(reply)
+    api.reply("still here")
+    p = api.run(tmp_path, stdin="/models\nhello\n")
+    assert msg in p.stderr and p.stdout == "still here\n"
+
+
+def test_models_retries_server_errors(mock, tmp_path):
+    api = Api(mock, "local")
+    mock.replies += [(503, {"error": {}}), (200, MODELS)]
+    p = api.run(tmp_path, stdin="/models gpt\n")
+    assert "retrying" in p.stderr and p.stdout == "  openai/gpt-5.5\n"

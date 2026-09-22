@@ -1,14 +1,23 @@
-CFLAGS ?= -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -Wall -Wextra
-CFLAGS += $(shell pkg-config --cflags libcjson libcurl)
-LDLIBS += $(shell pkg-config --libs libcjson libcurl)
+# Frontend to CMake. Build dir and type can be overridden: make BUILD=out TYPE=Debug
+BUILD ?= build
+TYPE ?= Release
+CMAKE_ARGS ?=
+GENERATOR := $(if $(shell command -v ninja),-G Ninja,)
 
-agent: agent.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
+all: $(BUILD)/CMakeCache.txt
+	cmake --build $(BUILD)
 
-test: agent
-	uv run --no-project --with pytest pytest -q tests
+$(BUILD)/CMakeCache.txt:
+	cmake -S . -B $(BUILD) $(GENERATOR) -DCMAKE_BUILD_TYPE=$(TYPE) $(CMAKE_ARGS)
+
+test: all
+	ctest --test-dir $(BUILD) --output-on-failure -j 8
+
+# Same, in a separate tree with AddressSanitizer and UBSan.
+asan:
+	$(MAKE) test BUILD=build-asan TYPE=Debug CMAKE_ARGS=-DAGENT_SANITIZE=ON
 
 clean:
-	rm -f agent
+	rm -rf build build-asan
 
-.PHONY: test clean
+.PHONY: all test asan clean

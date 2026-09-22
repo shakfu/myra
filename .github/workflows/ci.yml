@@ -16,7 +16,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Install build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libedit-dev ninja-build
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev ninja-build
       - name: Build and test
         run: make test CMAKE_ARGS=-DMYRA_WERROR=ON
       - name: Test with AddressSanitizer and UBSan

@@ -1,13 +1,16 @@
 """End-to-end tests: run ./myra against a scripted mock of /chat/completions."""
 
+import fcntl
 import json
 import os
 import pty
 import select
 import signal
 import socket
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -961,6 +964,9 @@ class Tty:
         if self.pid == 0:
             os.chdir(cwd)
             os.execve(str(AGENT), [str(AGENT), "-P", api.provider, *args], env)
+        # A pty starts at 0x0. linenoise reads the size to lay out the line, and with
+        # no size it falls back to asking the terminal with ESC[6n and waits for a reply.
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         self.out, self.pos = b"", 0
 
     def expect(self, pattern, timeout=10):
@@ -1000,7 +1006,7 @@ def test_terminal_line_editing_history_and_ctrl_c(mock, tmp_path):
         api.reply(r)
     tty = Tty(api, tmp_path)
     tty.expect(b"> ")
-    tty.type(b"ello\x01h\r")  # Ctrl-A jumps to the start: libedit is editing the line
+    tty.type(b"ello\x01h\r")  # Ctrl-A jumps to the start: linenoise is editing the line
     tty.expect(b"r1")
     tty.expect(b"> ")
     tty.type(b"\x1b[A\r")  # up arrow recalls "hello"
@@ -1009,7 +1015,8 @@ def test_terminal_line_editing_history_and_ctrl_c(mock, tmp_path):
     tty.type(b"abc")
     tty.expect(b"abc")
     tty.type(b"\x03")  # Ctrl-C drops the line; the first press is enough
-    tty.expect(b"\r\n> ")
+    tty.expect(b"\r\n")  # linenoise brackets each line with \x1b[?2004h/l, so not contiguous
+    tty.expect(b"> ")
     tty.type("café\r".encode())  # multi-byte input survives the custom getc
     tty.expect(b"r3")
     tty.expect(b"> ")
@@ -1040,6 +1047,50 @@ def test_terminal_history_persists_across_runs(mock, tmp_path):
     tty.type(b"\x04")
     assert tty.wait() == 0
     assert mock.requests[1]["body"]["messages"][-1]["content"] == "remember me"
+
+
+# ---- tab completion ----
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_tab_completes_a_repl_command(mock, tmp_path):
+    api = Api(mock, "local")
+    tty = Tty(api, tmp_path)
+    tty.expect(b"> ")
+    tty.type(b"/mod\t\r")  # /model and /models both match; the first is offered
+    tty.expect(b"local local")  # /model with no argument reports the current model
+    tty.expect(b"> ", 2)  # linenoise discards input typed before it re-enters raw mode
+    tty.type(b"\x04")
+    assert tty.wait() == 0
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_tab_completes_a_model_id(mock, tmp_path):
+    api = Api(mock, "local")
+    mock.replies.append((200, MODELS))
+    tty = Tty(api, tmp_path)
+    tty.expect(b"> ")
+    tty.type(b"/model anthropic/claude-o\t\r")
+    # the result line, not the echoed completion: the redraw puts a "> " after that too
+    tty.expect(b"local anthropic/claude-opus-5")
+    tty.expect(b"> ", 2)
+    tty.type(b"\x04")
+    assert tty.wait() == 0
+    assert mock.requests[0]["method"] == "GET"  # the ids come from one /models request
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_tab_completes_a_path(mock, tmp_path):
+    (tmp_path / "notes.txt").write_text("x")
+    api = Api(mock, "local")
+    api.reply("ok")
+    tty = Tty(api, tmp_path)
+    tty.expect(b"> ")
+    tty.type(b"read not\t\r")
+    tty.expect(b"ok")
+    tty.expect(b"> ", 2)
+    tty.type(b"\x04")
+    assert tty.wait() == 0
+    assert mock.requests[0]["body"]["messages"][-1]["content"] == "read notes.txt"
 
 
 # ---- --permissions: auto (the default) covers only the working directory ----

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Line editing comes from linenoise, vendored in `vendor/linenoise/` (BSD-2), instead of system libedit. libedit was optional, so a build that could not find it had no line editing at all, and it forced a `siglongjmp` out of the SIGINT handler: libedit retries `read()` after `EINTR`, which swallowed the first Ctrl-C. linenoise hands over the read loop, so Ctrl-C at the prompt is an ordinary keystroke and the jump is gone. The binary grows about 41 KB and stops linking libedit, libtinfo, libbsd and libmd.
+
+### Added
+
+- Tab completion in the REPL: a command at the start of a line, a model id after `/model `, a path anywhere else. Model ids cost one `/models` request, made once per session and only when a completion asks for them.
+
+- `myra_model_ids` and `myra_free_model_ids` return the provider's model ids; `myra_list_models` now prints that list rather than fetching its own.
+
+### Fixed
+
+- A failed `cmake` configure left `build/CMakeCache.txt` behind, so the next `make` treated the tree as configured and reported a missing `Makefile` instead of the real error. `.DELETE_ON_ERROR` drops the half-written cache.
+
 ## 0.1.2
 
 ### Changed

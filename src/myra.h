@@ -86,6 +86,10 @@ void myra_report_session(myra_agent *a);
 /* Print the provider's model ids that contain filter, ignoring case; the current one is starred. */
 void myra_list_models(myra_agent *a, const char *filter);
 
+/* The provider's model ids, NULL-terminated; NULL if the request failed. Fetches. */
+char **myra_model_ids(myra_agent *a);
+void myra_free_model_ids(char **ids);
+
 /* Lower-level pieces, exposed for tests. */
 
 /* Consume one chat-completions response: -1 failed, 0 done, 1 tools ran. */

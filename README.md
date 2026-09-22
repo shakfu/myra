@@ -15,24 +15,23 @@ Only what is kept is held in memory, so a huge file or a flood of output costs n
 
 ## Why C
 
-myra builds to one binary of about 110 KB (macOS, Release). It links only libc, libcurl and, optionally, libedit, so no interpreter or package manager is needed.
+myra builds to one binary of about 139 KB (Linux, Release). It links only libc and libcurl, so no interpreter or package manager is needed.
 
 ## Build
 
-Requires CMake 3.16+, a C11 compiler and libcurl. Everything else is optional. cJSON 1.7.19 (MIT) is vendored in `vendor/cjson/`. The Makefile wraps CMake and uses Ninja when installed.
+Requires CMake 3.16+, a C11 compiler and libcurl. Everything else is optional. cJSON 1.7.19 (MIT) is vendored in `vendor/cjson/`, linenoise 2.0 (BSD-2) in `vendor/linenoise/`. The Makefile wraps CMake and uses Ninja when installed.
 
 | Dependency   | Needed for            | Debian or Ubuntu       | macOS                    |
 |--------------|-----------------------|------------------------|--------------------------|
 | CMake 3.16+  | building              | `cmake`                | `brew install cmake`     |
 | C11 compiler | building              | `build-essential`      | `xcode-select --install` |
 | libcurl      | building              | `libcurl4-openssl-dev` | Command Line Tools       |
-| libedit      | REPL line editing     | `libedit-dev`          | Command Line Tools       |
 | Ninja        | faster builds         | `ninja-build`          | `brew install ninja`     |
 | uv           | the `e2e` test        | [docs.astral.sh/uv](https://docs.astral.sh/uv/getting-started/installation/) | same |
 
-On Debian and Ubuntu, `apt install libcurl4-openssl-dev libedit-dev` covers the build. Two libcurl dev packages exist, `libcurl4-openssl-dev` and `libcurl4-gnutls-dev`; they conflict, and CI uses the OpenSSL one. myra never names a TLS backend, so either compiles. Fedora calls the package `libcurl-devel`, Arch `curl`.
+On Debian and Ubuntu, `apt install libcurl4-openssl-dev` covers the build. Two libcurl dev packages exist, `libcurl4-openssl-dev` and `libcurl4-gnutls-dev`; they conflict, and CI uses the OpenSSL one. myra never names a TLS backend, so either compiles. Fedora calls the package `libcurl-devel`, Arch `curl`.
 
-macOS needs only CMake from Homebrew. libcurl and libedit ship with the Command Line Tools.
+macOS needs only CMake from Homebrew. libcurl ships with the Command Line Tools.
 
 Missing libcurl stops configure with `Could NOT find CURL`. A missing optional dependency prints a message and the build continues.
 
@@ -50,7 +49,7 @@ Layout:
 | Path                  | Contains                                                         |
 |-----------------------|------------------------------------------------------------------|
 | `src/myra.{h,c}`      | `myralib`: providers, tools, remembered state, streaming, the tool loop |
-| `src/main.c`          | the CLI: options, provider choice, headless mode, REPL           |
+| `src/main.c`          | the CLI: options, provider choice, headless mode, REPL, completion |
 | `tests/unit.c`        | `myralib` unit tests; each `TEST(name)` is a ctest `unit.<name>` |
 | `tests/test_agent.py` | end-to-end tests against a mock server; ctest `e2e`, needs `uv`  |
 
@@ -113,7 +112,10 @@ REPL commands:
 | `/help`            | list these commands                                     |
 | `/exit`            | quit; so does Ctrl-D                                    |
 
-On a terminal, the REPL has line editing and history (libedit). Piped input is read line by line, without a prompt.
+On a terminal, the REPL has line editing, history and UTF-8 input (linenoise, vendored). Tab completes a
+REPL command at the start of the line, a model id after `/model `, and otherwise a path in the working
+directory; repeated tabs cycle the matches. Completing a model id costs one `/models` request, made once
+per session and only if you ask for it. Piped input is read line by line, without a prompt.
 
 `--permissions` sets when `write`, `edit` and `shell` run without asking:
 

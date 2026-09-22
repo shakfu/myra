@@ -1,10 +1,10 @@
 /* main.c - the agent CLI: options, provider choice, headless mode and the REPL. */
 #include "myra.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
-#include <locale.h>
-#include <setjmp.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,24 +12,25 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#ifdef HAVE_LIBEDIT
-#include <editline/readline.h>
+#include "linenoise.h"
 
-/* libedit retries read() after EINTR, so the first Ctrl-C would be lost. Its own
-   SIGINT handler restores the terminal and passes the signal on to on_sigint, which
-   jumps back here while readline() waits. A custom rl_getc_function cannot do this:
-   macOS libedit truncates its result to one byte, which breaks non-ASCII input. */
-static sigjmp_buf at_prompt_jmp;
-static volatile sig_atomic_t at_prompt;
-#endif
+static const struct { const char *name, *args, *help; } COMMANDS[] = {
+    {"/model", " [id]", "show or switch the model"},
+    {"/models", " [filter]", "list the provider's models whose id contains filter"},
+    {"/clear", "", "start a new conversation"},
+    {"/help", "", "show this list"},
+    {"/exit", "", "quit (also Ctrl-D)"},
+};
+#define NCOMMANDS (sizeof COMMANDS / sizeof *COMMANDS)
 
-static const char *REPL_HELP =
-    "REPL commands:\n"
-    "  /model [id]        show or switch the model\n"
-    "  /models [filter]   list the provider's models whose id contains filter\n"
-    "  /clear             start a new conversation\n"
-    "  /help              show this list\n"
-    "  /exit              quit (also Ctrl-D)\n";
+static void repl_help(FILE *f) {
+    fputs("REPL commands:\n", f);
+    for (size_t i = 0; i < NCOMMANDS; i++) {
+        char sig[32];
+        snprintf(sig, sizeof sig, "%s%s", COMMANDS[i].name, COMMANDS[i].args);
+        fprintf(f, "  %-18s %s\n", sig, COMMANDS[i].help);
+    }
+}
 
 static int usage(const char *argv0, int rc) {
     FILE *f = rc ? stderr : stdout;
@@ -47,48 +48,111 @@ static int usage(const char *argv0, int rc) {
             "      ask        never: ask on the terminal each time\n"
             "      all        always\n"
             "      read-only  refuse them; read still runs\n", argv0);
-    fputs(REPL_HELP, f);
+    repl_help(f);
     return rc;
 }
 
 static void on_sigint(int sig) {
     (void)sig;
     myra_interrupted = 1;
-#ifdef HAVE_LIBEDIT
-    if (at_prompt) {
-        at_prompt = 0;
-        siglongjmp(at_prompt_jmp, 1);
-    }
-#endif
 }
 
-/* The next input line in *line, trailing whitespace trimmed; NULL at EOF or Ctrl-C.
-   A terminal gets line editing and history when built with libedit. */
-static char *next_line(int edit, char **line, size_t *cap) {
+/* The next input line in *line, trailing whitespace trimmed; NULL at EOF, or at
+   Ctrl-C with *interrupted set. ctx is NULL when input is piped: no prompt, no editing.
+   linenoise owns the returned string, but its default allocator is malloc, so *line
+   stays free()-able either way. */
+static char *next_line(linenoise_context_t *ctx, char **line, size_t *cap, int *interrupted) {
     ssize_t n;
-#ifdef HAVE_LIBEDIT
-    if (edit) {
-        if (sigsetjmp(at_prompt_jmp, 1)) { /* Ctrl-C at the prompt */
-            fputc('\n', stderr);
+    *interrupted = 0;
+    if (ctx) {
+        /* The editing loop is ours, so Ctrl-C needs no signal: linenoise clears ISIG
+           and reports the keystroke. The prompt goes to stderr, like the other chatter. */
+        linenoise_state_t st;
+        if (linenoise_edit_start_dynamic(ctx, &st, STDIN_FILENO, STDERR_FILENO, 128, "> ") < 0)
+            return NULL;
+        char *l;
+        while ((l = linenoise_edit_feed(&st)) == linenoise_edit_more) continue;
+        linenoise_edit_stop(&st);
+        if (!l) {
+            *interrupted = linenoise_get_error() == LINENOISE_ERR_INTERRUPTED;
             return NULL;
         }
-        at_prompt = 1;
-        char *l = readline("> ");
-        at_prompt = 0;
-        if (!l) return NULL; /* EOF */
-        if (*l) add_history(l);
+        if (*l) linenoise_history_add(ctx, l);
         free(*line);
         *line = l;
         *cap = strlen(l) + 1;
         n = (ssize_t)strlen(l);
-    } else
-#endif
-    {
-        if (edit) fputs("> ", stderr);
-        if ((n = getline(line, cap, stdin)) < 0) return NULL;
+    } else {
+        if ((n = getline(line, cap, stdin)) < 0) {
+            *interrupted = myra_interrupted; /* SIGINT makes getline fail with EINTR */
+            return NULL;
+        }
     }
     while (n && strchr(" \t\r\n", (*line)[n - 1])) (*line)[--n] = 0;
     return *line;
+}
+
+/* ---- tab completion ---- */
+
+/* linenoise replaces the whole line with the chosen candidate, so each candidate
+   repeats the text before the token. Its callback takes no user data, hence the statics. */
+static myra_agent *completing;
+static char **completion_models; /* the provider's ids: one fetch, on first use */
+static int completion_models_tried;
+
+static size_t last_token(const char *buf) {
+    const char *p = buf + strlen(buf);
+    while (p > buf && !strchr(" \t", p[-1])) p--;
+    return (size_t)(p - buf);
+}
+
+/* Offer the line with name + suffix in place of the token at buf + at. */
+static void add_match(linenoise_completions_t *lc, const char *buf, size_t at,
+                      const char *name, const char *suffix) {
+    const char *tok = buf + at;
+    if (strncmp(name, tok, strlen(tok))) return;
+    char out[PATH_MAX + 64];
+    if (snprintf(out, sizeof out, "%.*s%s%s", (int)at, buf, name, suffix) < (int)sizeof out)
+        linenoise_add_completion(lc, out);
+}
+
+static void complete_path(const char *buf, size_t at, linenoise_completions_t *lc) {
+    const char *arg = buf + at, *slash = strrchr(arg, '/');
+    size_t dlen = slash ? (size_t)(slash - arg) + 1 : 0; /* the directory, keeping its slash */
+    char dir[PATH_MAX];
+    if (dlen >= sizeof dir) return;
+    memcpy(dir, arg, dlen);
+    dir[dlen] = 0;
+    DIR *d = opendir(dlen ? dir : ".");
+    if (!d) return;
+    const char *base = arg + dlen;
+    size_t blen = strlen(base);
+    for (struct dirent *e; (e = readdir(d));) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (*base != '.' && *e->d_name == '.') continue; /* hidden ones only when asked for */
+        if (strncmp(e->d_name, base, blen)) continue;
+        char path[PATH_MAX];
+        struct stat st;
+        if (snprintf(path, sizeof path, "%s%s", dir, e->d_name) >= (int)sizeof path) continue;
+        add_match(lc, buf, at, path, !stat(path, &st) && S_ISDIR(st.st_mode) ? "/" : "");
+    }
+    closedir(d);
+}
+
+static void complete(const char *buf, linenoise_completions_t *lc) {
+    const char *arg;
+    if (*buf == '/' && !strpbrk(buf, " \t")) { /* a command name */
+        for (size_t i = 0; i < NCOMMANDS; i++) add_match(lc, buf, 0, COMMANDS[i].name, "");
+    } else if ((arg = myra_command(buf, "/model"))) { /* a model id */
+        if (!completion_models_tried) { /* costs a request, so only once and only if asked */
+            completion_models_tried = 1;
+            completion_models = myra_model_ids(completing);
+        }
+        for (char **m = completion_models; m && *m; m++)
+            add_match(lc, buf, (size_t)(arg - buf), *m, "");
+    } else {
+        complete_path(buf, last_token(buf), lc);
+    }
 }
 
 static void repl(myra_agent *a) {
@@ -97,36 +161,31 @@ static void repl(myra_agent *a) {
     char *line = NULL;
     size_t cap = 0;
     int tty = isatty(STDIN_FILENO); /* no prompt or editing when input is piped */
-#ifdef HAVE_LIBEDIT
     char *hist = tty ? myra_state_path("history", 1) : NULL;
-    if (tty) {
-        setlocale(LC_CTYPE, ""); /* libedit decodes and encodes input with it */
-        rl_outstream = stderr; /* the prompt stays off stdout, like the other chatter */
-        using_history();
-        stifle_history(1000);
-        if (hist) read_history(hist);
+    linenoise_context_t *ctx = tty ? linenoise_context_create() : NULL;
+    if (ctx) {
+        completing = a;
+        linenoise_set_completion_callback(ctx, complete);
+        linenoise_history_set_max_len(ctx, 1000);
+        if (hist) linenoise_history_load(ctx, hist);
     }
-#endif
     for (;;) {
-        if (!next_line(tty, &line, &cap)) {
-            if (!myra_interrupted) { /* EOF or read error */
+        int interrupted;
+        if (!next_line(ctx, &line, &cap, &interrupted)) {
+            if (!interrupted) { /* EOF or read error */
                 if (tty) fputc('\n', stderr); /* leave the prompt's line */
                 break;
             }
             myra_interrupted = 0; /* Ctrl-C at the prompt: drop the line */
             clearerr(stdin);
-#ifndef HAVE_LIBEDIT
-            fputc('\n', stderr);
-#else
-            if (!tty) fputc('\n', stderr); /* next_line already ended libedit's line */
-#endif
+            if (!ctx) fputc('\n', stderr); /* linenoise already ended the line */
             continue;
         }
         if (!*line) continue;
         const char *arg;
         if (!strcmp(line, "/exit")) break;
         if (!strcmp(line, "/help")) {
-            fputs(REPL_HELP, stderr);
+            repl_help(stderr);
             continue;
         }
         if (!strcmp(line, "/clear")) {
@@ -146,10 +205,13 @@ static void repl(myra_agent *a) {
         myra_ask(a, line);
     }
     free(line);
-#ifdef HAVE_LIBEDIT
-    if (hist && write_history(hist) == 0) chmod(hist, 0600); /* prompts may hold secrets */
+    myra_free_model_ids(completion_models);
+    if (ctx) {
+        /* prompts may hold secrets */
+        if (hist && linenoise_history_save(ctx, hist) == 0) chmod(hist, 0600);
+        linenoise_context_destroy(ctx);
+    }
     free(hist);
-#endif
 }
 
 int main(int argc, char **argv) {

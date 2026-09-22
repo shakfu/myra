@@ -960,16 +960,38 @@ static cJSON *call_api(myra_agent *a) {
     return resp;
 }
 
-void myra_list_models(myra_agent *a, const char *filter) {
+char **myra_model_ids(myra_agent *a) {
     cJSON *resp = request(a, "/models", NULL, 0), *m;
     cJSON *data = cJSON_GetObjectItem(resp, "data");
     if (resp && !cJSON_IsArray(data)) myra_note(MYRA_ERROR, "error: no model list in response\n");
+    char **ids = NULL;
+    size_t n = 0, cap = 0;
     cJSON_ArrayForEach(m, data) {
         const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(m, "id"));
-        if (id && contains_ci(id, filter)) printf("%s %s\n", strcmp(id, a->model) ? " " : "*", id);
+        if (!id) continue;
+        if (n + 2 > cap) {
+            cap = cap ? cap * 2 : 32;
+            ids = realloc(ids, cap * sizeof *ids);
+            if (!ids) { perror("realloc"); exit(1); }
+        }
+        ids[n++] = xstrdup(id);
     }
-    fflush(stdout);
+    if (ids) ids[n] = NULL;
     cJSON_Delete(resp);
+    return ids;
+}
+
+void myra_free_model_ids(char **ids) {
+    for (char **p = ids; p && *p; p++) free(*p);
+    free(ids);
+}
+
+void myra_list_models(myra_agent *a, const char *filter) {
+    char **ids = myra_model_ids(a);
+    for (char **p = ids; p && *p; p++)
+        if (contains_ci(*p, filter)) printf("%s %s\n", strcmp(*p, a->model) ? " " : "*", *p);
+    fflush(stdout);
+    myra_free_model_ids(ids);
 }
 
 /* ---- the loop ---- */

@@ -25,9 +25,23 @@ target_include_directories(cjson PUBLIC vendor/cjson)
 target_link_libraries(cjson PRIVATE m)
 target_compile_options(cjson PRIVATE -Wno-deprecated-declarations) # sprintf, in upstream code
 
+add_library(linenoise STATIC
+            vendor/linenoise/src/linenoise.c
+            vendor/linenoise/src/internal/completion.c
+            vendor/linenoise/src/internal/history.c
+            vendor/linenoise/src/internal/keyparser.c
+            vendor/linenoise/src/internal/render.c
+            vendor/linenoise/src/internal/terminal_posix.c
+            vendor/linenoise/src/internal/utf8.c)
+target_include_directories(linenoise PUBLIC vendor/linenoise/include
+                                     PRIVATE vendor/linenoise/include/internal)
+# Upstream builds as gnu99; we build as strict c11, which hides strdup, fdopen and
+# strcasecmp. Without these their returns pass through int and pointers are truncated.
+target_compile_definitions(linenoise PRIVATE _DEFAULT_SOURCE _DARWIN_C_SOURCE)
+
 set(WARNINGS -Wall -Wextra)
 if(MYRA_WERROR)
-  list(APPEND WARNINGS -Werror) # our targets only: vendored cJSON keeps its warnings
+  list(APPEND WARNINGS -Werror) # our targets only: vendored code keeps its warnings
 endif()
 
 add_library(myralib STATIC src/myra.c)
@@ -39,18 +53,7 @@ target_link_libraries(myralib PUBLIC cjson CURL::libcurl)
 add_executable(myra src/main.c)
 target_compile_options(myra PRIVATE ${WARNINGS})
 target_compile_definitions(myra PRIVATE MYRA_VERSION="${PROJECT_VERSION}")
-target_link_libraries(myra PRIVATE myralib)
-
-# Line editing and history for the REPL; macOS ships libedit, Linux has libedit-dev.
-find_path(EDITLINE_INCLUDE editline/readline.h)
-find_library(EDIT_LIB edit)
-if(EDITLINE_INCLUDE AND EDIT_LIB)
-  target_compile_definitions(myra PRIVATE HAVE_LIBEDIT)
-  target_include_directories(myra PRIVATE ${EDITLINE_INCLUDE})
-  target_link_libraries(myra PRIVATE ${EDIT_LIB})
-else()
-  message(STATUS "libedit not found: the REPL has no line editing")
-endif()
+target_link_libraries(myra PRIVATE myralib linenoise)
 
 install(TARGETS myra RUNTIME DESTINATION bin)
 

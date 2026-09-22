@@ -11,8 +11,7 @@ Minimal code agent in C with four tools:
 
 ## Build
 
-Requires CMake 3.16+ and libcurl, which macOS ships. cJSON 1.7.19 (MIT) is vendored in `vendor/cjson/`.
-The Makefile wraps CMake and uses Ninja when installed.
+Requires CMake 3.16+ and libcurl, which macOS ships. cJSON 1.7.19 (MIT) is vendored in `vendor/cjson/`. The Makefile wraps CMake and uses Ninja when installed.
 
     make              # configure and build into build/; ./agent links to build/agent
     make test         # ctest: unit tests plus the end-to-end suite
@@ -38,10 +37,12 @@ Both use OpenAI chat completions.
 Provider selection:
 
 - `-P local`: local.
-- `-P openrouter`: OpenRouter; exits with an error if `OPENROUTER_API_KEY` is unset.
-- No `-P`: the first cloud provider in the table whose key is set; else exit with an error.
 
-`local` is never chosen implicitly.
+- `-P openrouter`: OpenRouter; exits with an error if `OPENROUTER_API_KEY` is unset.
+
+- No `-P`: the last `-P` used, if it can run now (a cloud provider needs its key set); else the first cloud provider in the table whose key is set; else exit with an error.
+
+`local` is only used after `-P local`, on that run or a remembered one.
 
 | `-P`                   | Key env                     | Base URL env          | Default base URL               | Default model             |
 |------------------------|-----------------------------|-----------------------|--------------------------------|---------------------------|
@@ -49,12 +50,10 @@ Provider selection:
 | `local`                | `LOCAL_API_KEY` (optional)  | `LOCAL_BASE_URL`      | `http://localhost:8080/v1`     | `local`                   |
 
 Model precedence: `-m`, then the last `-m` used with that provider, then the table default.
-The model is saved to `$XDG_STATE_HOME/ant/<provider>.model` (default `~/.local/state/ant/`).
-It is saved only after the server accepts a request, so a mistyped `-m` is not kept.
 
-Requests to `openrouter` carry a top-level `"cache_control": {"type": "ephemeral"}`.
-It turns on prompt caching for Claude models, which is opt-in; other models ignore it.
-See [OpenRouter prompt caching](https://openrouter.ai/docs/features/prompt-caching).
+Choices are saved under `$XDG_STATE_HOME/ant/` (default `~/.local/state/ant/`): `provider` holds the last `-P`, and `<provider>.model` the last model for each provider. They are saved only after the server accepts a request, so a mistyped `-P` or `-m` is not kept.
+
+Requests to `openrouter` carry a top-level `"cache_control": {"type": "ephemeral"}`. It turns on prompt caching for Claude models, which is opt-in; other models ignore it. See [OpenRouter prompt caching](https://openrouter.ai/docs/features/prompt-caching).
 
 `local` covers any OpenAI-compatible server. For llama-server, start it with `--jinja` so tool calls work.
 
@@ -75,5 +74,4 @@ REPL commands:
 | `/models [filter]` | list the provider's models whose id contains `filter`; `*` marks the current one |
 | `/exit`            | quit                                                    |
 
-Model text goes to stdout. Tool calls, prompts and errors go to stderr.
-Confirmation reads from `/dev/tty`. With no terminal and no `-y`, mutating tools are denied.
+Model text goes to stdout. Tool calls, prompts and errors go to stderr. Confirmation reads from `/dev/tty`. With no terminal and no `-y`, mutating tools are denied.

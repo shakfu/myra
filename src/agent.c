@@ -251,11 +251,19 @@ const agent_provider *agent_provider_named(const char *name) {
     return NULL;
 }
 
+static int has_key(const agent_provider *p) {
+    const char *k = getenv(p->key_env);
+    return k && *k;
+}
+
 const agent_provider *agent_provider_default(void) {
-    for (size_t i = 0; i < AGENT_NPROVIDERS; i++) {
-        const char *k = getenv(AGENT_PROVIDERS[i].key_env);
-        if (!AGENT_PROVIDERS[i].key_optional && k && *k) return &AGENT_PROVIDERS[i];
-    }
+    char *last = agent_load_state("provider");
+    const agent_provider *p = last ? agent_provider_named(last) : NULL;
+    free(last);
+    if (p && (p->key_optional || has_key(p))) return p;
+    for (size_t i = 0; i < AGENT_NPROVIDERS; i++) /* local is never picked here */
+        if (!AGENT_PROVIDERS[i].key_optional && has_key(&AGENT_PROVIDERS[i]))
+            return &AGENT_PROVIDERS[i];
     return NULL;
 }
 
@@ -299,6 +307,11 @@ static cJSON *request(agent *a, const char *path, const char *body) {
             free(out.p);
             break;
         }
+        if (rc == CURLE_COULDNT_CONNECT) { /* nothing listening: retrying cannot help */
+            fprintf(stderr, "error: cannot connect to %s; is the server running?\n", url.p);
+            free(out.p);
+            break;
+        }
         int retryable = rc != CURLE_OK || status == 429 || status >= 500;
         fprintf(stderr, "api error (%s, http %ld)%s: %s\n", curl_easy_strerror(rc), status,
                 retryable && attempt < RETRIES ? ", retrying" : "", out.p ? out.p : "");
@@ -324,7 +337,11 @@ static cJSON *call_api(agent *a) {
     cJSON_Delete(req);
     cJSON *resp = request(a, "/chat/completions", body);
     free(body);
-    /* Saved only once the server accepts it, so a mistyped model is not kept. */
+    /* Saved only once the server accepts them, so a mistyped choice is not kept. */
+    if (resp && a->save_provider) {
+        agent_store_state("provider", a->prov->name);
+        a->save_provider = 0;
+    }
     if (resp && a->save_model) {
         char *key = fmt("%s.model", a->prov->name);
         agent_store_state(key, a->model);

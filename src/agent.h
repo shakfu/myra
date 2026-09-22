@@ -19,12 +19,14 @@ typedef struct {
     char *model;         /* owned */
     const char *api_key; /* NULL or empty: no authorization header */
     int save_model;      /* remember model after the next successful response */
+    int save_provider;   /* remember provider likewise; set for an explicit -P */
     int auto_yes;        /* run write/edit/shell without asking */
     cJSON *tools, *messages;
 } agent;
 
 const agent_provider *agent_provider_named(const char *name);
-/* First cloud provider whose key is set, or NULL; local is never chosen. */
+/* The remembered provider if it can run (a cloud one needs its key set), else the
+   first cloud provider whose key is set, else NULL. */
 const agent_provider *agent_provider_default(void);
 
 /* model NULL means the remembered one, else the provider default. -1 if the key is unset. */

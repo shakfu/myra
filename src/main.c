@@ -9,7 +9,8 @@
 static int usage(const char *argv0, int rc) {
     fprintf(rc ? stderr : stdout,
             "usage: %s [-y] [-P provider] [-m model] [-p prompt]\n"
-            "  -P  openrouter or local (default: the first cloud provider whose key is set)\n"
+            "  -P  openrouter or local; remembered. Default: the remembered one if usable,\n"
+            "      else the first cloud provider whose key is set\n"
             "  -m  model id; remembered per provider\n"
             "  -p  run one prompt headless and exit (default: REPL)\n"
             "  -y  run write/edit/shell without asking\n"
@@ -75,6 +76,7 @@ int main(int argc, char **argv) {
 
     agent a;
     if (agent_init(&a, p, model, auto_yes) < 0) return 1;
+    a.save_provider = pname != NULL;
     int rc = 0;
     if (prompt) rc = agent_ask(&a, prompt) < 0;
     else repl(&a);

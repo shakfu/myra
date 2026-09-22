@@ -183,6 +183,23 @@ TEST(provider_selection) {
     return 0;
 }
 
+TEST(provider_default_prefers_usable_remembered) {
+    const agent_provider *local = agent_provider_named("local");
+    const agent_provider *cloud = agent_provider_named("openrouter");
+    agent_store_state("provider", "local");
+    CHECK(agent_provider_default() == local); /* no key needed */
+    setenv("OPENROUTER_API_KEY", "k", 1);
+    CHECK(agent_provider_default() == local); /* remembered beats the key rule */
+    agent_store_state("provider", "openrouter");
+    CHECK(agent_provider_default() == cloud);
+    unsetenv("OPENROUTER_API_KEY");
+    CHECK(!agent_provider_default()); /* unusable, and local is never the fallback */
+    agent_store_state("provider", "anthropic");
+    setenv("OPENROUTER_API_KEY", "k", 1);
+    CHECK(agent_provider_default() == cloud); /* unknown name: key rule */
+    return 0;
+}
+
 TEST(init_requires_cloud_key) {
     CHECK(agent_init(&A, agent_provider_named("openrouter"), NULL, 0) == -1);
     setenv("OPENROUTER_API_KEY", "k", 1);
@@ -291,6 +308,8 @@ static const struct { const char *name; int (*fn)(void); int needs_agent; } TEST
     {"state_roundtrip", test_state_roundtrip, 0},
     {"state_falls_back_to_home", test_state_falls_back_to_home, 0},
     {"provider_selection", test_provider_selection, 0},
+    {"provider_default_prefers_usable_remembered", test_provider_default_prefers_usable_remembered,
+     0},
     {"init_requires_cloud_key", test_init_requires_cloud_key, 0},
     {"init_model_precedence", test_init_model_precedence, 0},
     {"init_builds_system_message_and_tools", test_init_builds_system_message_and_tools, 1},

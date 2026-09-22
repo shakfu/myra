@@ -2,8 +2,10 @@
 
 import json
 import os
+import socket
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -380,7 +382,7 @@ def test_repl_shows_provider_and_model(mock, tmp_path):
     assert p.stderr == "openrouter anthropic/claude-opus-5\n" * 2
 
 
-# ---- provider selection: -P, else first cloud key set, else error ----
+# ---- provider selection: -P, else remembered if usable, else first cloud key, else error ----
 
 def both_keys(tmp_path, mock):
     """Env where either provider could run: OpenRouter key set, both base URLs at the mock."""
@@ -392,23 +394,75 @@ def run_plain(tmp_path, env, *args):
                           capture_output=True, timeout=30, start_new_session=True)
 
 
-def test_provider_is_not_remembered(mock, tmp_path):
+def remember(tmp_path, provider):
+    (tmp_path / ".state/ant").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".state/ant/provider").write_text(provider + "\n")
+
+
+def test_provider_is_remembered(mock, tmp_path):
     env = both_keys(tmp_path, mock)
     Api(mock, "local").reply("a")
     assert run_plain(tmp_path, env, "-P", "local", "-p", "x").returncode == 0
-    Api(mock, "openrouter").reply("b")  # key is set, so openrouter, not the last -P
+    assert (tmp_path / ".state/ant/provider").read_text() == "local\n"
+    Api(mock, "local").reply("b")  # key is set, but the remembered provider wins
     assert run_plain(tmp_path, env, "-p", "x").returncode == 0
-    assert [r["path"] for r in mock.requests] == ["/v1/chat/completions",
-                                                  "/api/v1/chat/completions"]
+    Api(mock, "openrouter").reply("c")  # -P switches and is remembered
+    assert run_plain(tmp_path, env, "-P", "openrouter", "-p", "x").returncode == 0
+    Api(mock, "openrouter").reply("d")
+    assert run_plain(tmp_path, env, "-p", "x").returncode == 0
+    assert [r["path"] for r in mock.requests] == (["/v1/chat/completions"] * 2
+                                                  + ["/api/v1/chat/completions"] * 2)
+
+
+def test_provider_and_model_remembered_together(mock, tmp_path):
+    env = both_keys(tmp_path, mock)
+    Api(mock, "local").reply("a")
+    assert run_plain(tmp_path, env, "-P", "local", "-m", "qwen", "-p", "x").returncode == 0
+    Api(mock, "local").reply("b")
+    assert run_plain(tmp_path, env, "-p", "x").returncode == 0
+    assert mock.requests[1]["path"] == "/v1/chat/completions"
+    assert mock.requests[1]["body"]["model"] == "qwen"
+
+
+def test_default_provider_is_not_saved(mock, tmp_path):
+    Api(mock, "openrouter").reply("hi")  # picked by the key rule, not by -P
+    assert run_plain(tmp_path, both_keys(tmp_path, mock), "-p", "x").returncode == 0
     assert not (tmp_path / ".state/ant/provider").exists()
 
 
-def test_stale_provider_file_is_ignored(mock, tmp_path):
-    (tmp_path / ".state/ant").mkdir(parents=True)
-    (tmp_path / ".state/ant/provider").write_text("local\n")
+def test_rejected_provider_is_not_remembered(mock, tmp_path):
+    mock.replies.append((401, {"error": {"message": "bad key"}}))
+    assert run_plain(tmp_path, both_keys(tmp_path, mock), "-P", "local", "-p", "x").returncode == 1
+    assert not (tmp_path / ".state/ant/provider").exists()
+
+
+def test_unknown_provider_is_not_remembered(mock, tmp_path):
+    assert run_plain(tmp_path, both_keys(tmp_path, mock), "-P", "nope", "-p", "x").returncode == 2
+    assert not (tmp_path / ".state/ant").exists()
+
+
+def test_remembered_local_needs_no_key(mock, tmp_path):
+    remember(tmp_path, "local")
+    api = Api(mock, "local")
+    api.reply("hi")
+    p = api.run(tmp_path, "-p", "x", provider_flag=False, key=None)
+    assert p.returncode == 0, p.stderr
+    assert mock.requests[0]["path"] == "/v1/chat/completions"
+
+
+def test_remembered_cloud_without_key_is_skipped(mock, tmp_path):
+    remember(tmp_path, "openrouter")
     p = Api(mock, "local").run(tmp_path, "-p", "x", provider_flag=False, key=None)
     assert p.returncode == 1 and "set OPENROUTER_API_KEY or pass -P local" in p.stderr
     assert not mock.requests
+
+
+def test_invalid_remembered_provider_falls_back(mock, tmp_path):
+    remember(tmp_path, "anthropic")
+    Api(mock, "openrouter").reply("hi")
+    p = run_plain(tmp_path, both_keys(tmp_path, mock), "-p", "x")
+    assert p.returncode == 0, p.stderr
+    assert mock.requests[0]["path"] == "/api/v1/chat/completions"
 
 
 def test_explicit_local_ignores_cloud_key(mock, tmp_path):
@@ -511,3 +565,30 @@ def test_models_retries_server_errors(mock, tmp_path):
     mock.replies += [(503, {"error": {}}), (200, MODELS)]
     p = api.run(tmp_path, stdin="/models gpt\n")
     assert "retrying" in p.stderr and p.stdout == "  openai/gpt-5.5\n"
+
+
+# ---- connection refused ----
+
+def closed_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.mark.parametrize("stdin", [None, "/models\nhi\n"])
+def test_refused_connection_fails_fast(tmp_path, stdin):
+    url = f"http://127.0.0.1:{closed_port()}/v1"
+    env = {"PATH": "/usr/bin:/bin", "LOCAL_BASE_URL": url, "XDG_STATE_HOME": str(tmp_path / ".state")}
+    args = ["-p", "x"] if stdin is None else []
+    t = time.monotonic()
+    p = subprocess.run([str(AGENT), "-P", "local", *args], cwd=tmp_path, env=env, input=stdin or "",
+                       text=True, capture_output=True, timeout=30, start_new_session=True)
+    assert time.monotonic() - t < 3  # no 1+2+4+8 s back-off
+    assert "retrying" not in p.stderr
+    msg = f"cannot connect to {url}/%s; is the server running?"
+    if stdin is None:
+        assert p.returncode == 1 and msg % "chat/completions" in p.stderr
+    else:  # REPL survives both /models and a prompt
+        assert p.returncode == 0
+        assert msg % "models" in p.stderr and msg % "chat/completions" in p.stderr
+    assert not (tmp_path / ".state/ant/provider").exists()

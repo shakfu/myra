@@ -456,7 +456,7 @@ def test_repl_shows_provider_and_model(mock, tmp_path):
     p = api.run(tmp_path, stdin="/model\n")
     assert p.returncode == 0
     # Piped input: banner and /model output only, no "> " prompts, no color.
-    assert p.stderr == "myra 0.1.1\n" + "openrouter anthropic/claude-opus-5\n" * 2
+    assert p.stderr == "myra 0.1.2\n" + "openrouter anthropic/claude-opus-5\n" * 2
 
 
 # ---- provider selection: -P, else remembered if usable, else first cloud key, else error ----
@@ -733,7 +733,7 @@ def test_repl_survives_sigint_at_prompt_and_mid_turn(mock, tmp_path):
     api.reply(calls=[("s", "shell", {"command": "echo $$ > pid; sleep 30"})])
     api.reply("after")
     p = start(api, tmp_path)
-    assert p.stderr.readline() == "myra 0.1.1\n"
+    assert p.stderr.readline() == "myra 0.1.2\n"
     assert p.stderr.readline() == "local local\n"  # handler is installed by now
     p.send_signal(signal.SIGINT)  # at the prompt: the line is dropped, the REPL stays
     time.sleep(0.3)
@@ -1097,7 +1097,7 @@ def test_edit_explains_non_utf8_mismatch(mock, tmp_path):
 
 def test_version_flag(tmp_path):
     p = subprocess.run([str(AGENT), "-V"], capture_output=True, text=True, timeout=10)
-    assert p.returncode == 0 and p.stdout == "myra 0.1.1\n"
+    assert p.returncode == 0 and p.stdout == "myra 0.1.2\n"
 
 
 MUTATIONS = [("w", "write", {"path": "../out.txt", "content": "x"}),
@@ -1226,7 +1226,7 @@ def test_color_on_a_terminal_only(mock, tmp_path, args, env, colored):
     tty.type(b"\x04")
     assert tty.wait() == 0
     assert (b"\x1b[36m[tool] shell true" in tty.out) == colored
-    assert (b"\x1b[1mmyra 0.1.1" in tty.out) == colored
+    assert (b"\x1b[1mmyra 0.1.2" in tty.out) == colored
 
 
 # ---- limits and stream framing ----

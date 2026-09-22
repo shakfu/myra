@@ -1,5 +1,5 @@
-/* unit.c - agentlib unit tests. Usage: unit NAME. Each case runs in a fresh temp dir. */
-#include "agent.h"
+/* unit.c - myralib unit tests. Usage: unit NAME. Each case runs in a fresh temp dir. */
+#include "myra.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -22,9 +22,9 @@
 
 /* ---- helpers ---- */
 
-static agent A;
+static myra_agent A;
 
-static int local_agent(void) { return agent_init(&A, agent_provider_named("local"), NULL, AGENT_AUTO); }
+static int local_agent(void) { return myra_init(&A, myra_provider_named("local"), NULL, MYRA_AUTO); }
 
 static void put(const char *path, const char *s) {
     FILE *f = fopen(path, "wb");
@@ -44,14 +44,14 @@ static char *get(const char *path) {
 /* Run tool name with JSON input; returns the result (caller frees) and sets *err. */
 static char *tool(const char *name, const char *json, int *err) {
     cJSON *in = cJSON_Parse(json);
-    char *out = agent_run_tool(&A, name, in, err);
+    char *out = myra_run_tool(&A, name, in, err);
     cJSON_Delete(in);
     return out;
 }
 
 static int step(const char *json) {
     cJSON *r = cJSON_Parse(json);
-    int rc = agent_step(&A, r);
+    int rc = myra_step(&A, r);
     cJSON_Delete(r);
     return rc;
 }
@@ -86,7 +86,7 @@ static int no_temp_files(void) {
     struct dirent *e;
     int found = 0;
     while (d && (e = readdir(d)))
-        if (!strncmp(e->d_name, ".myra-tmp-", 12)) found = 1;
+        if (MYRA_STARTS_WITH(e->d_name, ".myra-tmp-")) found = 1;
     if (d) closedir(d);
     return !found;
 }
@@ -126,7 +126,7 @@ TEST(failed_write_keeps_the_original) {
     cJSON_AddStringToObject(in, "path", "keep.txt");
     cJSON_AddStringToObject(in, "content", big);
     int err;
-    char *out = agent_run_tool(&A, "write", in, &err);
+    char *out = myra_run_tool(&A, "write", in, &err);
     cJSON_Delete(in);
     CHECK(err && strstr(out, "cannot write"));
     CHECK(!strcmp(get("keep.txt"), "original\n")); /* not truncated */
@@ -135,7 +135,7 @@ TEST(failed_write_keeps_the_original) {
     cJSON_AddStringToObject(in, "path", "keep.txt");
     cJSON_AddStringToObject(in, "old_string", "original");
     cJSON_AddStringToObject(in, "new_string", big);
-    out = agent_run_tool(&A, "edit", in, &err);
+    out = myra_run_tool(&A, "edit", in, &err);
     cJSON_Delete(in);
     CHECK(err && !strcmp(get("keep.txt"), "original\n"));
     free(out);
@@ -215,7 +215,7 @@ TEST(tool_shell_status_and_redirects) {
 TEST(tool_output_keeps_start_and_end) {
     int err; /* local caps at 16384: the first 3276 bytes, the last 13108 */
     char *out = tool("shell", "{\"command\":\"seq 1 100000\"}", &err);
-    CHECK(!err && !strncmp(out, "1\n2\n3\n", 6));
+    CHECK(!err && MYRA_STARTS_WITH(out, "1\n2\n3\n"));
     const char *mark = strstr(out, "\n[... ");
     CHECK(mark && mark - out == 3276);
     CHECK(strstr(mark, " bytes omitted ...]\n"));
@@ -226,15 +226,15 @@ TEST(tool_output_keeps_start_and_end) {
 }
 
 TEST(max_output_env_override) {
-    agent_free(&A);
+    myra_free(&A);
     setenv("MYRA_MAX_OUTPUT", "2048", 1);
     CHECK(local_agent() == 0 && A.max_output == 2048);
-    agent_free(&A);
+    myra_free(&A);
     setenv("MYRA_MAX_OUTPUT", "10", 1); /* too small: ignored */
     CHECK(local_agent() == 0 && A.max_output == 16384);
-    agent_free(&A);
+    myra_free(&A);
     unsetenv("MYRA_MAX_OUTPUT");
-    CHECK(agent_init(&A, agent_provider_named("local"), NULL, AGENT_AUTO) == 0 && A.max_output == 16384);
+    CHECK(myra_init(&A, myra_provider_named("local"), NULL, MYRA_AUTO) == 0 && A.max_output == 16384);
     return 0;
 }
 
@@ -297,7 +297,6 @@ TEST(read_of_a_huge_file_skips_the_middle) {
 
 TEST(edit_refuses_a_huge_file) {
     int err;
-    CHECK(truncate("big", 0) == 0 || 1);
     FILE *f = fopen("big2", "wb");
     CHECK(fseeko(f, 65 * 1024 * 1024, SEEK_SET) == 0 && fputc('x', f) == 'x');
     fclose(f);
@@ -329,7 +328,7 @@ static int gone(const char *path) {
 
 static void on_alarm(int sig) {
     (void)sig;
-    agent_interrupted = 1;
+    myra_interrupted = 1;
 }
 
 /* Simulate Ctrl-C after one second, the way main.c installs its handler. */
@@ -481,14 +480,14 @@ TEST(utf8_truncation_does_not_split_a_character) {
 /* ---- state ---- */
 
 TEST(state_roundtrip) {
-    CHECK(!agent_load_state("x"));
-    agent_store_state("x", "value");
+    CHECK(!myra_load_state("x"));
+    myra_store_state("x", "value");
     CHECK(!strcmp(get("state/myra/x"), "value\n"));
-    char *v = agent_load_state("x");
+    char *v = myra_load_state("x");
     CHECK(v && !strcmp(v, "value"));
     free(v);
     put("state/myra/x", " \n");
-    CHECK(!agent_load_state("x"));
+    CHECK(!myra_load_state("x"));
     return 0;
 }
 
@@ -497,62 +496,62 @@ TEST(state_falls_back_to_home) {
     CHECK(getcwd(cwd, sizeof cwd));
     unsetenv("XDG_STATE_HOME");
     setenv("HOME", cwd, 1);
-    agent_store_state("y", "v");
+    myra_store_state("y", "v");
     CHECK(!strcmp(get(".local/state/myra/y"), "v\n"));
     unsetenv("HOME");
-    CHECK(!agent_load_state("y"));
+    CHECK(!myra_load_state("y"));
     return 0;
 }
 
 /* ---- providers and session ---- */
 
 TEST(provider_selection) {
-    CHECK(agent_provider_named("local") && !agent_provider_named("anthropic"));
-    CHECK(!agent_provider_default());
+    CHECK(myra_provider_named("local") && !myra_provider_named("anthropic"));
+    CHECK(!myra_provider_default());
     setenv("OPENROUTER_API_KEY", "", 1);
-    CHECK(!agent_provider_default());
+    CHECK(!myra_provider_default());
     setenv("OPENROUTER_API_KEY", "k", 1);
-    CHECK(agent_provider_default() == agent_provider_named("openrouter"));
+    CHECK(myra_provider_default() == myra_provider_named("openrouter"));
     return 0;
 }
 
 TEST(provider_default_prefers_usable_remembered) {
-    const agent_provider *local = agent_provider_named("local");
-    const agent_provider *cloud = agent_provider_named("openrouter");
-    agent_store_state("provider", "local");
-    CHECK(agent_provider_default() == local); /* no key needed */
+    const myra_provider *local = myra_provider_named("local");
+    const myra_provider *cloud = myra_provider_named("openrouter");
+    myra_store_state("provider", "local");
+    CHECK(myra_provider_default() == local); /* no key needed */
     setenv("OPENROUTER_API_KEY", "k", 1);
-    CHECK(agent_provider_default() == local); /* remembered beats the key rule */
-    agent_store_state("provider", "openrouter");
-    CHECK(agent_provider_default() == cloud);
+    CHECK(myra_provider_default() == local); /* remembered beats the key rule */
+    myra_store_state("provider", "openrouter");
+    CHECK(myra_provider_default() == cloud);
     unsetenv("OPENROUTER_API_KEY");
-    CHECK(!agent_provider_default()); /* unusable, and local is never the fallback */
-    agent_store_state("provider", "anthropic");
+    CHECK(!myra_provider_default()); /* unusable, and local is never the fallback */
+    myra_store_state("provider", "anthropic");
     setenv("OPENROUTER_API_KEY", "k", 1);
-    CHECK(agent_provider_default() == cloud); /* unknown name: key rule */
+    CHECK(myra_provider_default() == cloud); /* unknown name: key rule */
     return 0;
 }
 
 TEST(init_requires_cloud_key) {
-    CHECK(agent_init(&A, agent_provider_named("openrouter"), NULL, AGENT_AUTO) == -1);
+    CHECK(myra_init(&A, myra_provider_named("openrouter"), NULL, MYRA_AUTO) == -1);
     setenv("OPENROUTER_API_KEY", "k", 1);
-    CHECK(agent_init(&A, agent_provider_named("openrouter"), NULL, AGENT_AUTO) == 0);
+    CHECK(myra_init(&A, myra_provider_named("openrouter"), NULL, MYRA_AUTO) == 0);
     CHECK(!strcmp(A.api_key, "k") && !strcmp(A.model, "anthropic/claude-opus-5"));
-    agent_free(&A);
+    myra_free(&A);
     return 0;
 }
 
 TEST(init_model_precedence) {
-    const agent_provider *p = agent_provider_named("local");
-    CHECK(agent_init(&A, p, NULL, AGENT_AUTO) == 0 && !strcmp(A.model, "local") && !A.save_model);
-    agent_free(&A);
-    agent_store_state("local.model", "qwen");
-    CHECK(agent_init(&A, p, NULL, AGENT_AUTO) == 0 && !strcmp(A.model, "qwen") && !A.save_model);
-    agent_free(&A);
-    CHECK(agent_init(&A, p, "qwen", AGENT_AUTO) == 0 && !A.save_model); /* same: no rewrite */
-    agent_free(&A);
-    CHECK(agent_init(&A, p, "llama", AGENT_AUTO) == 0 && !strcmp(A.model, "llama") && A.save_model);
-    agent_set_model(&A, "gemma");
+    const myra_provider *p = myra_provider_named("local");
+    CHECK(myra_init(&A, p, NULL, MYRA_AUTO) == 0 && !strcmp(A.model, "local") && !A.save_model);
+    myra_free(&A);
+    myra_store_state("local.model", "qwen");
+    CHECK(myra_init(&A, p, NULL, MYRA_AUTO) == 0 && !strcmp(A.model, "qwen") && !A.save_model);
+    myra_free(&A);
+    CHECK(myra_init(&A, p, "qwen", MYRA_AUTO) == 0 && !A.save_model); /* same: no rewrite */
+    myra_free(&A);
+    CHECK(myra_init(&A, p, "llama", MYRA_AUTO) == 0 && !strcmp(A.model, "llama") && A.save_model);
+    myra_set_model(&A, "gemma");
     CHECK(!strcmp(A.model, "gemma") && A.save_model);
     return 0;
 }
@@ -639,9 +638,9 @@ TEST(clear_keeps_only_system_prompt) {
                "{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read\","
                "\"arguments\":\"{\\\"path\\\":\\\"f\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}") == 1);
     CHECK(cJSON_GetArraySize(A.messages) == 3);
-    agent_clear(&A);
+    myra_clear(&A);
     CHECK(cJSON_GetArraySize(A.messages) == 1 && !strcmp(field(msg(0), "role"), "system"));
-    agent_clear(&A); /* idempotent */
+    myra_clear(&A); /* idempotent */
     CHECK(cJSON_GetArraySize(A.messages) == 1);
     return 0;
 }
@@ -649,12 +648,12 @@ TEST(clear_keeps_only_system_prompt) {
 /* ---- REPL command parsing ---- */
 
 TEST(command_parsing) {
-    CHECK(!strcmp(agent_command("/model", "/model"), ""));
-    CHECK(!strcmp(agent_command("/model   qwen", "/model"), "qwen"));
-    CHECK(!agent_command("/models", "/model"));
-    CHECK(!agent_command("/modelling", "/model"));
-    CHECK(!agent_command("model", "/model"));
-    CHECK(!strcmp(agent_command("/models claude", "/models"), "claude"));
+    CHECK(!strcmp(myra_command("/model", "/model"), ""));
+    CHECK(!strcmp(myra_command("/model   qwen", "/model"), "qwen"));
+    CHECK(!myra_command("/models", "/model"));
+    CHECK(!myra_command("/modelling", "/model"));
+    CHECK(!myra_command("model", "/model"));
+    CHECK(!strcmp(myra_command("/models claude", "/models"), "claude"));
     return 0;
 }
 
@@ -716,15 +715,15 @@ int main(int argc, char **argv) {
         if (strcmp(argv[1], TESTS[i].name)) continue;
         const char *tmp = getenv("TMPDIR");
         char dir[4096];
-        snprintf(dir, sizeof dir, "%s/agent-unit-XXXXXX", tmp && *tmp ? tmp : "/tmp");
+        snprintf(dir, sizeof dir, "%s/myra-unit-XXXXXX", tmp && *tmp ? tmp : "/tmp");
         if (!mkdtemp(dir) || chdir(dir) < 0) { perror(dir); return 1; }
         char state[4200];
         snprintf(state, sizeof state, "%s/state", dir);
         setenv("XDG_STATE_HOME", state, 1);
-        for (size_t j = 0; j < AGENT_NPROVIDERS; j++) unsetenv(AGENT_PROVIDERS[j].key_env);
+        for (size_t j = 0; j < MYRA_NPROVIDERS; j++) unsetenv(MYRA_PROVIDERS[j].key_env);
         if (TESTS[i].needs_agent && local_agent() < 0) return 1;
         int rc = TESTS[i].fn();
-        agent_free(&A);
+        myra_free(&A);
         char rm[4200];
         snprintf(rm, sizeof rm, "rm -rf '%s'", dir);
         if (system(rm) != 0) fprintf(stderr, "warning: could not remove %s\n", dir);

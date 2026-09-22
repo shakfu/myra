@@ -21,7 +21,7 @@ install: all
 
 # Same, in a separate tree with AddressSanitizer and UBSan.
 asan:
-	$(MAKE) test BUILD=build-asan TYPE=Debug CMAKE_ARGS=-DAGENT_SANITIZE=ON LINK=
+	$(MAKE) test BUILD=build-asan TYPE=Debug CMAKE_ARGS=-DMYRA_SANITIZE=ON LINK=
 
 clean:
 	rm -rf build build-asan

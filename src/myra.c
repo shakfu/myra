@@ -1,5 +1,5 @@
-/* agent.c - agentlib: providers, the four tools, and the chat-completions tool loop. */
-#include "agent.h"
+/* myra.c - myralib: providers, the four tools, and the chat-completions tool loop. */
+#include "myra.h"
 
 #include <curl/curl.h>
 #include <errno.h>
@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,14 +46,14 @@ static const char *TOOLS_JSON =
     "\"timeout\":{\"type\":\"integer\"}},"
     "\"required\":[\"command\"],\"additionalProperties\":false}}}]";
 
-volatile sig_atomic_t agent_interrupted;
-int agent_color;
+volatile sig_atomic_t myra_interrupted;
+int myra_color;
 
-void agent_note(agent_style style, const char *fmt, ...) {
-    static const char *const codes[] = {[AGENT_PLAIN] = "", [AGENT_TOOL] = "\033[36m",
-                                        [AGENT_ERROR] = "\033[31m", [AGENT_WARN] = "\033[33m",
-                                        [AGENT_DIM] = "\033[2m", [AGENT_BOLD] = "\033[1m"};
-    int on = agent_color && style != AGENT_PLAIN;
+void myra_note(myra_style style, const char *fmt, ...) {
+    static const char *const codes[] = {[MYRA_PLAIN] = "", [MYRA_TOOL] = "\033[36m",
+                                        [MYRA_ERROR] = "\033[31m", [MYRA_WARN] = "\033[33m",
+                                        [MYRA_DIM] = "\033[2m", [MYRA_BOLD] = "\033[1m"};
+    int on = myra_color && style != MYRA_PLAIN;
     va_list ap;
     va_start(ap, fmt);
     if (on) fputs(codes[style], stderr);
@@ -61,7 +62,7 @@ void agent_note(agent_style style, const char *fmt, ...) {
     va_end(ap);
 }
 
-const agent_provider AGENT_PROVIDERS[] = {
+const myra_provider MYRA_PROVIDERS[] = {
     {"openrouter", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1",
      "anthropic/claude-opus-5", 0, 1, 100 * 1024},
     /* Any OpenAI-compatible server; the default URL is llama-server's. */
@@ -69,13 +70,14 @@ const agent_provider AGENT_PROVIDERS[] = {
     {"local", "LOCAL_API_KEY", "LOCAL_BASE_URL", "http://localhost:8080/v1", "local", 1, 0,
      16 * 1024},
 };
-const size_t AGENT_NPROVIDERS = sizeof AGENT_PROVIDERS / sizeof *AGENT_PROVIDERS;
+const size_t MYRA_NPROVIDERS = sizeof MYRA_PROVIDERS / sizeof *MYRA_PROVIDERS;
 
 /* ---- growable buffer ---- */
 
 typedef struct { char *p; size_t n, cap; } buf;
 
 static void buf_add(buf *b, const char *s, size_t n) {
+    if (n >= SIZE_MAX / 2 - b->n) { fputs("buf_add: size overflow\n", stderr); exit(1); }
     if (b->n + n + 1 > b->cap) {
         b->cap = (b->n + n + 1) * 2;
         b->p = realloc(b->p, b->cap);
@@ -85,6 +87,9 @@ static void buf_add(buf *b, const char *s, size_t n) {
     b->n += n;
     b->p[b->n] = 0;
 }
+
+/* Appends a string literal; "" rejects a pointer, whose sizeof is not its length. */
+#define buf_lit(b, s) buf_add((b), "" s, sizeof(s) - 1)
 
 static char *xstrdup(const char *s) { buf b = {0}; buf_add(&b, s, strlen(s)); return b.p; }
 
@@ -143,7 +148,7 @@ static void sanitize_utf8(buf *b) {
     buf_add(&out, b->p, i);
     while (i < b->n) {
         if ((k = utf8_len(p + i, b->n - i))) buf_add(&out, b->p + i, k), i += k;
-        else buf_add(&out, "\xEF\xBF\xBD", 3), i++;
+        else buf_lit(&out, "\xEF\xBF\xBD"), i++;
     }
     free(b->p);
     *b = out;
@@ -242,7 +247,7 @@ static int slurp(const char *path, buf *b) {
     while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) buf_add(b, chunk, n);
     int err = ferror(f);
     fclose(f);
-    if (!b->p) buf_add(b, "", 0);
+    if (!b->p) buf_lit(b, "");
     return err ? -1 : 0;
 }
 
@@ -275,7 +280,7 @@ static int spit(const char *path, const char *s, size_t n) {
     const char *slash = strrchr(target, '/');
     buf tmp = {0};
     if (slash) buf_add(&tmp, target, (size_t)(slash - target) + 1);
-    buf_add(&tmp, ".myra-tmp-XXXXXX", 18);
+    buf_lit(&tmp, ".myra-tmp-XXXXXX");
     int fd = mkstemp(tmp.p);
     if (fd < 0) { /* in place, as a last resort */
         free(tmp.p);
@@ -325,7 +330,7 @@ static char *tool_read(const char *path, size_t cap, int *err) {
         if (!rc) rc = fill_sink(fd, &s, s.tail_cap, &nul);
         s.total = (size_t)st.st_size;
     } else {
-        rc = fill_sink(fd, &s, AGENT_MAX_RAW, &nul);
+        rc = fill_sink(fd, &s, MYRA_MAX_RAW, &nul);
     }
     close(fd);
     if (rc < 0 || nul) {
@@ -347,7 +352,7 @@ static char *tool_edit(const char *path, const char *old, const char *new, int *
     *err = 1;
     if (!*old) return xstrdup("old_string is empty");
     struct stat st;
-    if (!stat(path, &st) && st.st_size > AGENT_MAX_RAW) /* edit holds the whole file */
+    if (!stat(path, &st) && st.st_size > MYRA_MAX_RAW) /* edit holds the whole file */
         return fmt("%s is too large to edit; use shell (sed, awk)", path);
     buf b = {0};
     if (slurp(path, &b) < 0) { free(b.p); return fmt("cannot read %s", path); }
@@ -424,8 +429,8 @@ static char *tool_shell(const char *cmd, int timeout, size_t cap, int *err) {
     const char *stopped = NULL;
     double deadline = now() + timeout;
     for (;;) {
-        if (agent_interrupted) { stopped = "interrupted by user"; break; }
-        if (s.total > AGENT_MAX_RAW) { stopped = "output limit"; break; }
+        if (myra_interrupted) { stopped = "interrupted by user"; break; }
+        if (s.total > MYRA_MAX_RAW) { stopped = "output limit"; break; }
         double left = deadline - now();
         if (left <= 0) { stopped = "timed out"; break; }
         struct pollfd pfd = {fds[0], POLLIN, 0};
@@ -452,7 +457,7 @@ static char *tool_shell(const char *cmd, int timeout, size_t cap, int *err) {
         snprintf(tail, sizeof tail, "%s[timed out after %ds; killed]", nl, timeout);
     else if (!strcmp(stopped, "output limit"))
         snprintf(tail, sizeof tail, "%s[stopped after %d MB of output; killed]", nl,
-                 AGENT_MAX_RAW / (1024 * 1024));
+                 MYRA_MAX_RAW / (1024 * 1024));
     else
         snprintf(tail, sizeof tail, "%s[interrupted by user; killed]", nl);
     buf r = {0};
@@ -483,13 +488,13 @@ static int outside_cwd(const char *path) {
 
 /* Ask on the controlling terminal so it works in headless mode and the REPL alike.
    Returns NULL if allowed, else why not, for the model to relay. */
-static const char *denied(agent_permissions mode, int outside, const char *name,
+static const char *denied(myra_permissions mode, int outside, const char *name,
                           const char *detail) {
-    if (mode == AGENT_READ_ONLY) return "denied: the agent runs with --permissions read-only";
-    if (mode == AGENT_ALL || (mode == AGENT_AUTO && !outside)) return NULL;
+    if (mode == MYRA_READ_ONLY) return "denied: the agent runs with --permissions read-only";
+    if (mode == MYRA_ALL || (mode == MYRA_AUTO && !outside)) return NULL;
     FILE *tty = fopen("/dev/tty", "r+");
     if (!tty)
-        return mode == AGENT_AUTO ? "denied: outside the working directory; --permissions all allows it"
+        return mode == MYRA_AUTO ? "denied: outside the working directory; --permissions all allows it"
                                   : "denied: no terminal to confirm; --permissions auto skips asking";
     fprintf(tty, "allow %s%s: %s ? [y/N] ", name, outside ? " outside the working directory" : "",
             detail);
@@ -506,9 +511,9 @@ static const char *str_arg(cJSON *input, const char *key) {
 }
 
 /* One line per call, cut to the terminal width, unless verbose. */
-static void tool_log(agent *a, const char *name, const char *detail) {
+static void tool_log(myra_agent *a, const char *name, const char *detail) {
     if (a->verbose) {
-        agent_note(AGENT_TOOL, "[tool] %s %s\n", name, detail);
+        myra_note(MYRA_TOOL, "[tool] %s %s\n", name, detail);
         return;
     }
     struct winsize ws;
@@ -523,10 +528,10 @@ static void tool_log(agent *a, const char *name, const char *detail) {
         while (n && ((unsigned char)detail[n] & 0xC0) == 0x80) n--; /* whole characters */
         cut = 1;
     }
-    agent_note(AGENT_TOOL, "[tool] %s %.*s%s\n", name, (int)n, detail, cut ? " ..." : "");
+    myra_note(MYRA_TOOL, "[tool] %s %.*s%s\n", name, (int)n, detail, cut ? " ..." : "");
 }
 
-char *agent_run_tool(agent *a, const char *name, cJSON *input, int *err) {
+char *myra_run_tool(myra_agent *a, const char *name, cJSON *input, int *err) {
     const char *path = str_arg(input, "path");
     const char *content = str_arg(input, "content");
     const char *old = str_arg(input, "old_string"), *new = str_arg(input, "new_string");
@@ -552,9 +557,9 @@ char *agent_run_tool(agent *a, const char *name, cJSON *input, int *err) {
         tool_log(a, "shell", cmd);
         if ((why = denied(a->permissions, 0, "shell", cmd))) return xstrdup(why); /* unconfinable */
         cJSON *t = cJSON_GetObjectItemCaseSensitive(input, "timeout");
-        double want = cJSON_IsNumber(t) ? t->valuedouble : AGENT_SHELL_TIMEOUT;
+        double want = cJSON_IsNumber(t) ? t->valuedouble : MYRA_SHELL_TIMEOUT;
         /* Clamp before the cast: an out-of-range double to int is undefined. */
-        int secs = !(want >= 1) ? 1 : want > AGENT_SHELL_TIMEOUT_MAX ? AGENT_SHELL_TIMEOUT_MAX
+        int secs = !(want >= 1) ? 1 : want > MYRA_SHELL_TIMEOUT_MAX ? MYRA_SHELL_TIMEOUT_MAX
                                                                     : (int)want;
         return tool_shell(cmd, secs, a->max_output, err);
     }
@@ -563,21 +568,21 @@ char *agent_run_tool(agent *a, const char *name, cJSON *input, int *err) {
 
 /* ---- remembered state ---- */
 
-char *agent_state_path(const char *name, int make_dir) {
+char *myra_state_path(const char *name, int make_dir) {
     const char *xdg = getenv("XDG_STATE_HOME"), *home = getenv("HOME");
     buf b = {0};
     if (xdg && *xdg) buf_add(&b, xdg, strlen(xdg));
-    else if (home && *home) { buf_add(&b, home, strlen(home)); buf_add(&b, "/.local/state", 13); }
+    else if (home && *home) { buf_add(&b, home, strlen(home)); buf_lit(&b, "/.local/state"); }
     else return NULL;
-    buf_add(&b, "/myra/", 8);
+    buf_lit(&b, "/myra/");
     buf_add(&b, name, strlen(name));
     for (char *p = b.p + 1; make_dir && *p; p++) /* mkdir -p the parent */
         if (*p == '/') { *p = 0; mkdir(b.p, 0755); *p = '/'; }
     return b.p;
 }
 
-char *agent_load_state(const char *name) {
-    char *path = agent_state_path(name, 0);
+char *myra_load_state(const char *name) {
+    char *path = myra_state_path(name, 0);
     buf b = {0};
     int rc = path ? slurp(path, &b) : -1;
     free(path);
@@ -587,36 +592,36 @@ char *agent_load_state(const char *name) {
     return b.p;
 }
 
-void agent_store_state(const char *name, const char *value) {
-    char *path = agent_state_path(name, 1);
+void myra_store_state(const char *name, const char *value) {
+    char *path = myra_state_path(name, 1);
     if (!path) return;
     char *line = fmt("%s\n", value);
-    if (spit(path, line, strlen(line)) < 0) agent_note(AGENT_WARN, "warning: cannot save %s\n", path);
+    if (spit(path, line, strlen(line)) < 0) myra_note(MYRA_WARN, "warning: cannot save %s\n", path);
     free(line);
     free(path);
 }
 
 /* ---- providers ---- */
 
-const agent_provider *agent_provider_named(const char *name) {
-    for (size_t i = 0; i < AGENT_NPROVIDERS; i++)
-        if (!strcmp(name, AGENT_PROVIDERS[i].name)) return &AGENT_PROVIDERS[i];
+const myra_provider *myra_provider_named(const char *name) {
+    for (size_t i = 0; i < MYRA_NPROVIDERS; i++)
+        if (!strcmp(name, MYRA_PROVIDERS[i].name)) return &MYRA_PROVIDERS[i];
     return NULL;
 }
 
-static int has_key(const agent_provider *p) {
+static int has_key(const myra_provider *p) {
     const char *k = getenv(p->key_env);
     return k && *k;
 }
 
-const agent_provider *agent_provider_default(void) {
-    char *last = agent_load_state("provider");
-    const agent_provider *p = last ? agent_provider_named(last) : NULL;
+const myra_provider *myra_provider_default(void) {
+    char *last = myra_load_state("provider");
+    const myra_provider *p = last ? myra_provider_named(last) : NULL;
     free(last);
     if (p && (p->key_optional || has_key(p))) return p;
-    for (size_t i = 0; i < AGENT_NPROVIDERS; i++) /* local is never picked here */
-        if (!AGENT_PROVIDERS[i].key_optional && has_key(&AGENT_PROVIDERS[i]))
-            return &AGENT_PROVIDERS[i];
+    for (size_t i = 0; i < MYRA_NPROVIDERS; i++) /* local is never picked here */
+        if (!MYRA_PROVIDERS[i].key_optional && has_key(&MYRA_PROVIDERS[i]))
+            return &MYRA_PROVIDERS[i];
     return NULL;
 }
 
@@ -625,7 +630,7 @@ const agent_provider *agent_provider_default(void) {
 /* curl calls this about once a second, and sooner on activity; nonzero aborts. */
 static int on_progress(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut, curl_off_t un) {
     (void)ud, (void)dt, (void)dn, (void)ut, (void)un;
-    return agent_interrupted;
+    return myra_interrupted;
 }
 
 static size_t on_body(char *p, size_t sz, size_t n, void *ud) {
@@ -784,7 +789,7 @@ static void stream_event(stream *st, const char *data) {
 }
 
 static void stream_line(stream *st, char *line) {
-    if (strncmp(line, "data:", 5)) return; /* comments (":") and other fields are ignored */
+    if (!MYRA_STARTS_WITH(line, "data:")) return; /* comments (":") and other fields are ignored */
     const char *data = line + 5 + (line[5] == ' ');
     if (!strcmp(data, "[DONE]")) st->done = 1;
     else stream_event(st, data);
@@ -846,7 +851,7 @@ static cJSON *stream_result(stream *st) {
 
 /* POST body to path (streamed when streaming is set), or GET path when body is NULL.
    Retries 429, 5xx and network errors, unless streamed text was already printed. */
-static cJSON *request(agent *a, const char *path, const char *body, int streaming) {
+static cJSON *request(myra_agent *a, const char *path, const char *body, int streaming) {
     const char *base = getenv(a->prov->base_env);
     buf url = {0};
     base = base && *base ? base : a->prov->base;
@@ -869,7 +874,7 @@ static cJSON *request(agent *a, const char *path, const char *body, int streamin
             struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
             nanosleep(&ts, NULL);
         }
-        if (agent_interrupted) break;
+        if (myra_interrupted) break;
         stream st = {0};
         CURL *c = st.c = curl_easy_init();
         curl_easy_setopt(c, CURLOPT_URL, url.p);
@@ -892,17 +897,17 @@ static cJSON *request(agent *a, const char *path, const char *body, int streamin
         int truncated = st.events && !st.finish[0] && !st.done;
         if (rc == CURLE_OK && status == 200 && !st.error && !truncated) {
             resp = st.events ? stream_result(&st) : cJSON_Parse(out); /* "stream" ignored */
-            if (!resp) agent_note(AGENT_ERROR, "error: response is not JSON\n");
+            if (!resp) myra_note(MYRA_ERROR, "error: response is not JSON\n");
             stream_free(&st);
             break;
         }
         if (rc == CURLE_ABORTED_BY_CALLBACK) {
-            agent_note(AGENT_WARN, "interrupted\n");
+            myra_note(MYRA_WARN, "interrupted\n");
             stream_free(&st);
             break;
         }
         if (rc == CURLE_COULDNT_CONNECT) { /* nothing listening: retrying cannot help */
-            agent_note(AGENT_ERROR, "error: cannot connect to %s; is the server running?\n", url.p);
+            myra_note(MYRA_ERROR, "error: cannot connect to %s; is the server running?\n", url.p);
             stream_free(&st);
             break;
         }
@@ -913,8 +918,8 @@ static cJSON *request(agent *a, const char *path, const char *body, int streamin
         int retryable = (rc != CURLE_OK || status == 429 || status >= 500 || st.error || truncated) &&
                         !st.printed && !a->context_full; /* retrying cannot shrink the context */
         const char *again = retryable && attempt < RETRIES ? ", retrying" : "";
-        if (st.error || truncated) agent_note(AGENT_ERROR, "stream error%s: %s\n", again, out);
-        else agent_note(AGENT_ERROR, "api error (%s, http %ld)%s: %s\n", curl_easy_strerror(rc),
+        if (st.error || truncated) myra_note(MYRA_ERROR, "stream error%s: %s\n", again, out);
+        else myra_note(MYRA_ERROR, "api error (%s, http %ld)%s: %s\n", curl_easy_strerror(rc),
                         status, again, out);
         free(err);
         stream_free(&st);
@@ -926,7 +931,7 @@ static cJSON *request(agent *a, const char *path, const char *body, int streamin
     return resp;
 }
 
-static cJSON *call_api(agent *a) {
+static cJSON *call_api(myra_agent *a) {
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "model", a->model);
     cJSON_AddItemReferenceToObject(req, "tools", a->tools);
@@ -943,22 +948,22 @@ static cJSON *call_api(agent *a) {
     free(body);
     /* Saved only once the server accepts them, so a mistyped choice is not kept. */
     if (resp && a->save_provider) {
-        agent_store_state("provider", a->prov->name);
+        myra_store_state("provider", a->prov->name);
         a->save_provider = 0;
     }
     if (resp && a->save_model) {
         char *key = fmt("%s.model", a->prov->name);
-        agent_store_state(key, a->model);
+        myra_store_state(key, a->model);
         free(key);
         a->save_model = 0;
     }
     return resp;
 }
 
-void agent_list_models(agent *a, const char *filter) {
+void myra_list_models(myra_agent *a, const char *filter) {
     cJSON *resp = request(a, "/models", NULL, 0), *m;
     cJSON *data = cJSON_GetObjectItem(resp, "data");
-    if (resp && !cJSON_IsArray(data)) agent_note(AGENT_ERROR, "error: no model list in response\n");
+    if (resp && !cJSON_IsArray(data)) myra_note(MYRA_ERROR, "error: no model list in response\n");
     cJSON_ArrayForEach(m, data) {
         const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(m, "id"));
         if (id && contains_ci(id, filter)) printf("%s %s\n", strcmp(id, a->model) ? " " : "*", id);
@@ -975,12 +980,12 @@ static void print_text(const char *s) {
     fflush(stdout);
 }
 
-int agent_step(agent *a, cJSON *resp) {
+int myra_step(myra_agent *a, cJSON *resp) {
     cJSON *choice = cJSON_GetArrayItem(cJSON_GetObjectItem(resp, "choices"), 0);
     cJSON *msg = cJSON_DetachItemFromObject(choice, "message");
     if (!cJSON_IsObject(msg)) {
         char *s = cJSON_PrintUnformatted(resp);
-        agent_note(AGENT_ERROR, "error: no message in response: %s\n", s);
+        myra_note(MYRA_ERROR, "error: no message in response: %s\n", s);
         free(s);
         cJSON_Delete(msg);
         return -1;
@@ -988,14 +993,14 @@ int agent_step(agent *a, cJSON *resp) {
     const char *finish = get_str(choice, "finish_reason");
     finish = finish ? finish : "";
     if (!strcmp(finish, "content_filter")) {
-        agent_note(AGENT_ERROR, "refused: content_filter\n");
+        myra_note(MYRA_ERROR, "refused: content_filter\n");
         cJSON_Delete(msg);
         return -1;
     }
     /* Calls cut off by length may be truncated JSON, and dropping them keeps the
        history valid: every tool call must be followed by its result. */
     if (!strcmp(finish, "length")) {
-        agent_note(AGENT_WARN, "warning: reply hit the length limit\n");
+        myra_note(MYRA_WARN, "warning: reply hit the length limit\n");
         cJSON_DeleteItemFromObject(msg, "tool_calls");
     }
     if (!a->streamed) print_text(get_str(msg, "content")); /* else already shown */
@@ -1023,13 +1028,13 @@ int agent_step(agent *a, cJSON *resp) {
         cJSON *input = cJSON_Parse(args ? args : "");
         int err = 1;
         /* Every call still gets a result, so the history stays valid. */
-        char *out = agent_interrupted       ? xstrdup("skipped: interrupted by user")
-                    : cJSON_IsObject(input) ? agent_run_tool(a, name ? name : "", input, &err)
+        char *out = myra_interrupted       ? xstrdup("skipped: interrupted by user")
+                    : cJSON_IsObject(input) ? myra_run_tool(a, name ? name : "", input, &err)
                                             : fmt("invalid JSON arguments for %s", name ? name : "?");
         cJSON_Delete(input);
         /* Chat completions has no is_error field, so mark failures in the text. */
         char *content = err ? fmt("error: %s", out) : fmt("%s", out);
-        if (a->verbose) agent_note(AGENT_DIM, "%s\n", content);
+        if (a->verbose) myra_note(MYRA_DIM, "%s\n", content);
         cJSON *r = cJSON_CreateObject();
         cJSON_AddStringToObject(r, "role", "tool");
         cJSON_AddStringToObject(r, "tool_call_id", get_str(call, "id"));
@@ -1038,8 +1043,8 @@ int agent_step(agent *a, cJSON *resp) {
         free(content);
         free(out);
     }
-    if (agent_interrupted) {
-        agent_note(AGENT_WARN, "interrupted\n");
+    if (myra_interrupted) {
+        myra_note(MYRA_WARN, "interrupted\n");
         return 0; /* end the turn without asking the model again */
     }
     return ncalls > 0;
@@ -1052,7 +1057,7 @@ static int is_tool(cJSON *m) {
 
 /* Blank every tool result except the trailing batch, which the next reply needs.
    Returns how many were blanked. */
-static int drop_old_tool_output(agent *a) {
+static int drop_old_tool_output(myra_agent *a) {
     static const char *const dropped = "[output dropped to fit the context]";
     int n = cJSON_GetArraySize(a->messages), last = n, count = 0;
     while (last > 0 && is_tool(cJSON_GetArrayItem(a->messages, last - 1))) last--;
@@ -1067,7 +1072,7 @@ static int drop_old_tool_output(agent *a) {
 }
 
 /* Add one response's usage; OpenRouter's cost is in credits, which are dollars. */
-static void usage_add(agent_usage *u, cJSON *usage) {
+static void usage_add(myra_usage *u, cJSON *usage) {
     if (!cJSON_IsObject(usage)) return;
     u->requests++;
     u->in += get_num(usage, "prompt_tokens");
@@ -1080,18 +1085,18 @@ static void usage_add(agent_usage *u, cJSON *usage) {
     }
 }
 
-static void usage_print(const char *label, const agent_usage *u) {
+static void usage_print(const char *label, const myra_usage *u) {
     if (!u->requests) return;
     char cost[32] = "";
     if (u->costed) snprintf(cost, sizeof cost, ", $%.4f", u->cost);
-    agent_note(AGENT_DIM, "%s %d request%s: %.0f in (%.0f cached), %.0f out%s\n", label,
+    myra_note(MYRA_DIM, "%s %d request%s: %.0f in (%.0f cached), %.0f out%s\n", label,
                u->requests, u->requests == 1 ? "" : "s", u->in, u->cached, u->out, cost);
 }
 
-void agent_report_session(agent *a) { usage_print("[session]", &a->session); }
+void myra_report_session(myra_agent *a) { usage_print("[session]", &a->session); }
 
-int agent_ask(agent *a, const char *text) {
-    agent_interrupted = 0;
+int myra_ask(myra_agent *a, const char *text) {
+    myra_interrupted = 0;
     a->turn_calls = 0;
     int before = cJSON_GetArraySize(a->messages);
     cJSON *m = cJSON_CreateObject();
@@ -1099,7 +1104,7 @@ int agent_ask(agent *a, const char *text) {
     cJSON_AddStringToObject(m, "content", text);
     cJSON_AddItemToArray(a->messages, m);
     int rc;
-    agent_usage turn = {0};
+    myra_usage turn = {0};
     for (;;) { /* call the model and run tools until it stops asking for them */
         cJSON *resp = call_api(a);
         usage_add(&turn, cJSON_GetObjectItem(resp, "usage"));
@@ -1107,19 +1112,19 @@ int agent_ask(agent *a, const char *text) {
         if (!resp && a->context_full) {
             int n = drop_old_tool_output(a);
             if (n) {
-                agent_note(AGENT_WARN, "context full: dropped %d old tool output%s, retrying\n",
+                myra_note(MYRA_WARN, "context full: dropped %d old tool output%s, retrying\n",
                            n, n == 1 ? "" : "s");
                 continue;
             }
-            agent_note(AGENT_WARN, "hint: the conversation no longer fits the model's context; "
+            myra_note(MYRA_WARN, "hint: the conversation no longer fits the model's context; "
                                    "/clear starts a new one\n");
         }
         if (!resp) { rc = -1; break; }
-        rc = agent_step(a, resp);
+        rc = myra_step(a, resp);
         cJSON_Delete(resp);
         if (rc != 1) break;
-        if (a->turn_calls >= AGENT_MAX_TOOL_CALLS) { /* a model looping on tools */
-            agent_note(AGENT_WARN, "stopped: %d tool calls in one turn\n", a->turn_calls);
+        if (a->turn_calls >= MYRA_MAX_TOOL_CALLS) { /* a model looping on tools */
+            myra_note(MYRA_WARN, "stopped: %d tool calls in one turn\n", a->turn_calls);
             rc = 0;
             break;
         }
@@ -1133,7 +1138,7 @@ int agent_ask(agent *a, const char *text) {
 
 /* ---- session ---- */
 
-int agent_init(agent *a, const agent_provider *p, const char *model, agent_permissions perms) {
+int myra_init(myra_agent *a, const myra_provider *p, const char *model, myra_permissions perms) {
     memset(a, 0, sizeof *a);
     a->prov = p;
     a->permissions = perms;
@@ -1141,11 +1146,11 @@ int agent_init(agent *a, const agent_provider *p, const char *model, agent_permi
     a->max_output = cap && atol(cap) >= 1024 ? (size_t)atol(cap) : p->max_output;
     a->api_key = getenv(p->key_env);
     if ((!a->api_key || !*a->api_key) && !p->key_optional) {
-        agent_note(AGENT_ERROR, "error: %s is not set\n", p->key_env);
+        myra_note(MYRA_ERROR, "error: %s is not set\n", p->key_env);
         return -1;
     }
     char *key = fmt("%s.model", p->name);
-    char *remembered = agent_load_state(key);
+    char *remembered = myra_load_state(key);
     free(key);
     if (model) a->save_model = !remembered || strcmp(model, remembered);
     a->model = xstrdup(model ? model : remembered ? remembered : p->model);
@@ -1158,7 +1163,7 @@ int agent_init(agent *a, const agent_provider *p, const char *model, agent_permi
                        "can. Be concise.", cwd);
     a->tools = cJSON_Parse(TOOLS_JSON);
     a->messages = cJSON_CreateArray();
-    cJSON *sys = cJSON_CreateObject(); /* rollback in agent_ask never reaches index 0 */
+    cJSON *sys = cJSON_CreateObject(); /* rollback in myra_ask never reaches index 0 */
     cJSON_AddStringToObject(sys, "role", "system");
     cJSON_AddStringToObject(sys, "content", prompt);
     cJSON_AddItemToArray(a->messages, sys);
@@ -1167,26 +1172,26 @@ int agent_init(agent *a, const agent_provider *p, const char *model, agent_permi
     return 0;
 }
 
-void agent_free(agent *a) {
-    if (a->messages) curl_global_cleanup(); /* paired with a successful agent_init */
+void myra_free(myra_agent *a) {
+    if (a->messages) curl_global_cleanup(); /* paired with a successful myra_init */
     cJSON_Delete(a->messages);
     cJSON_Delete(a->tools);
     free(a->model);
     memset(a, 0, sizeof *a);
 }
 
-void agent_clear(agent *a) {
+void myra_clear(myra_agent *a) {
     while (cJSON_GetArraySize(a->messages) > 1)
         cJSON_DeleteItemFromArray(a->messages, cJSON_GetArraySize(a->messages) - 1);
 }
 
-void agent_set_model(agent *a, const char *model) {
+void myra_set_model(myra_agent *a, const char *model) {
     free(a->model);
     a->model = xstrdup(model);
     a->save_model = 1;
 }
 
-const char *agent_command(const char *line, const char *name) {
+const char *myra_command(const char *line, const char *name) {
     size_t n = strlen(name);
     if (strncmp(line, name, n) || (line[n] && line[n] != ' ')) return NULL;
     for (line += n; *line == ' '; line++);

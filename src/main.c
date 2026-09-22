@@ -1,5 +1,5 @@
 /* main.c - the agent CLI: options, provider choice, headless mode and the REPL. */
-#include "agent.h"
+#include "myra.h"
 
 #include <errno.h>
 #include <getopt.h>
@@ -53,7 +53,7 @@ static int usage(const char *argv0, int rc) {
 
 static void on_sigint(int sig) {
     (void)sig;
-    agent_interrupted = 1;
+    myra_interrupted = 1;
 #ifdef HAVE_LIBEDIT
     if (at_prompt) {
         at_prompt = 0;
@@ -91,14 +91,14 @@ static char *next_line(int edit, char **line, size_t *cap) {
     return *line;
 }
 
-static void repl(agent *a) {
-    agent_note(AGENT_BOLD, "myra %s\n", AGENT_VERSION);
-    agent_note(AGENT_DIM, "%s %s\n", a->prov->name, a->model);
+static void repl(myra_agent *a) {
+    myra_note(MYRA_BOLD, "myra %s\n", MYRA_VERSION);
+    myra_note(MYRA_DIM, "%s %s\n", a->prov->name, a->model);
     char *line = NULL;
     size_t cap = 0;
     int tty = isatty(STDIN_FILENO); /* no prompt or editing when input is piped */
 #ifdef HAVE_LIBEDIT
-    char *hist = tty ? agent_state_path("history", 1) : NULL;
+    char *hist = tty ? myra_state_path("history", 1) : NULL;
     if (tty) {
         setlocale(LC_CTYPE, ""); /* libedit decodes and encodes input with it */
         rl_outstream = stderr; /* the prompt stays off stdout, like the other chatter */
@@ -109,11 +109,11 @@ static void repl(agent *a) {
 #endif
     for (;;) {
         if (!next_line(tty, &line, &cap)) {
-            if (!agent_interrupted) { /* EOF or read error */
+            if (!myra_interrupted) { /* EOF or read error */
                 if (tty) fputc('\n', stderr); /* leave the prompt's line */
                 break;
             }
-            agent_interrupted = 0; /* Ctrl-C at the prompt: drop the line */
+            myra_interrupted = 0; /* Ctrl-C at the prompt: drop the line */
             clearerr(stdin);
 #ifndef HAVE_LIBEDIT
             fputc('\n', stderr);
@@ -130,20 +130,20 @@ static void repl(agent *a) {
             continue;
         }
         if (!strcmp(line, "/clear")) {
-            agent_clear(a);
-            agent_note(AGENT_DIM, "history cleared\n");
+            myra_clear(a);
+            myra_note(MYRA_DIM, "history cleared\n");
             continue;
         }
-        if ((arg = agent_command(line, "/models"))) {
-            agent_list_models(a, arg);
+        if ((arg = myra_command(line, "/models"))) {
+            myra_list_models(a, arg);
             continue;
         }
-        if ((arg = agent_command(line, "/model"))) {
-            if (*arg) agent_set_model(a, arg); /* history is kept */
-            agent_note(AGENT_DIM, "%s %s\n", a->prov->name, a->model);
+        if ((arg = myra_command(line, "/model"))) {
+            if (*arg) myra_set_model(a, arg); /* history is kept */
+            myra_note(MYRA_DIM, "%s %s\n", a->prov->name, a->model);
             continue;
         }
-        agent_ask(a, line);
+        myra_ask(a, line);
     }
     free(line);
 #ifdef HAVE_LIBEDIT
@@ -154,19 +154,19 @@ static void repl(agent *a) {
 
 int main(int argc, char **argv) {
     const char *prompt = NULL, *pname = NULL, *model = NULL;
-    static const char *const modes[] = {[AGENT_AUTO] = "auto", [AGENT_ASK] = "ask",
-                                        [AGENT_ALL] = "all", [AGENT_READ_ONLY] = "read-only"};
+    static const char *const modes[] = {[MYRA_AUTO] = "auto", [MYRA_ASK] = "ask",
+                                        [MYRA_ALL] = "all", [MYRA_READ_ONLY] = "read-only"};
     static const struct option longopts[] = {{"permissions", required_argument, NULL, 'W'},
                                              {"verbose", no_argument, NULL, 'v'},
                                              {"no-color", no_argument, NULL, 'C'},
                                              {NULL, 0, NULL, 0}};
-    agent_permissions perms = AGENT_AUTO;
+    myra_permissions perms = MYRA_AUTO;
     int opt, verbose = 0, color = 1;
     const char *no_color = getenv("NO_COLOR"); /* https://no-color.org */
     if (no_color && *no_color) color = 0;
     while ((opt = getopt_long(argc, argv, "p:P:m:hV", longopts, NULL)) != -1) {
         if (opt == 'V') {
-            printf("myra %s\n", AGENT_VERSION);
+            printf("myra %s\n", MYRA_VERSION);
             return 0;
         }
         if (opt == 'v') verbose = 1;
@@ -175,10 +175,10 @@ int main(int argc, char **argv) {
             size_t i = 0;
             while (i < sizeof modes / sizeof *modes && strcmp(optarg, modes[i])) i++;
             if (i == sizeof modes / sizeof *modes) {
-                agent_note(AGENT_ERROR, "error: unknown permissions mode %s\n", optarg);
+                myra_note(MYRA_ERROR, "error: unknown permissions mode %s\n", optarg);
                 return usage(argv[0], 2);
             }
-            perms = (agent_permissions)i;
+            perms = (myra_permissions)i;
         }
         else if (opt == 'p') prompt = optarg;
         else if (opt == 'P') pname = optarg;
@@ -186,30 +186,30 @@ int main(int argc, char **argv) {
         else return usage(argv[0], opt == 'h' ? 0 : 2);
     }
     if (optind < argc) return usage(argv[0], 2);
-    agent_color = color && isatty(STDERR_FILENO);
-    if (prompt && agent_provider_named(prompt)) { /* -p and -P differ only by case */
-        agent_note(AGENT_ERROR, "error: -p takes a prompt; did you mean -P %s?\n", prompt);
+    myra_color = color && isatty(STDERR_FILENO);
+    if (prompt && myra_provider_named(prompt)) { /* -p and -P differ only by case */
+        myra_note(MYRA_ERROR, "error: -p takes a prompt; did you mean -P %s?\n", prompt);
         return 2;
     }
 
-    const agent_provider *p;
+    const myra_provider *p;
     if (pname) {
-        if (!(p = agent_provider_named(pname))) {
-            agent_note(AGENT_ERROR, "error: unknown provider %s\n", pname);
+        if (!(p = myra_provider_named(pname))) {
+            myra_note(MYRA_ERROR, "error: unknown provider %s\n", pname);
             return usage(argv[0], 2);
         }
-    } else if (!(p = agent_provider_default())) {
+    } else if (!(p = myra_provider_default())) {
         char keys[256] = "";
-        for (size_t i = 0; i < AGENT_NPROVIDERS; i++)
-            if (!AGENT_PROVIDERS[i].key_optional)
+        for (size_t i = 0; i < MYRA_NPROVIDERS; i++)
+            if (!MYRA_PROVIDERS[i].key_optional)
                 snprintf(keys + strlen(keys), sizeof keys - strlen(keys), " %s",
-                         AGENT_PROVIDERS[i].key_env);
-        agent_note(AGENT_ERROR, "error: no provider: set%s or pass -P local\n", keys);
+                         MYRA_PROVIDERS[i].key_env);
+        myra_note(MYRA_ERROR, "error: no provider: set%s or pass -P local\n", keys);
         return 1;
     }
 
-    agent a;
-    if (agent_init(&a, p, model, perms) < 0) return 1;
+    myra_agent a;
+    if (myra_init(&a, p, model, perms) < 0) return 1;
     a.verbose = verbose;
     a.save_provider = pname != NULL;
     /* No SA_RESTART: blocking reads return EINTR, so Ctrl-C takes effect at once. */
@@ -220,12 +220,12 @@ int main(int argc, char **argv) {
 
     int rc = 0;
     if (prompt) {
-        rc = agent_ask(&a, prompt) < 0;
-        if (agent_interrupted) rc = 130; /* 128 + SIGINT, as a shell would report */
+        rc = myra_ask(&a, prompt) < 0;
+        if (myra_interrupted) rc = 130; /* 128 + SIGINT, as a shell would report */
     } else {
         repl(&a);
-        agent_report_session(&a);
+        myra_report_session(&a);
     }
-    agent_free(&a);
+    myra_free(&a);
     return rc;
 }

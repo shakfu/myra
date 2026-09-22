@@ -1,6 +1,6 @@
 # myra
 
-Minimal code agent in C with four tools:
+myra, which means *ant* in Swedish, is a minimal code agent in C with four tools:
 
 | Tool    | Does                                              |
 |---------|---------------------------------------------------|
@@ -13,6 +13,10 @@ Tool output is capped per provider (see the table below). Over the cap, the firs
 
 Only what is kept is held in memory, so a huge file or a flood of output costs nothing extra. `read` skips the middle of a large file; `shell` is killed after 64 MB of output; `edit` refuses a file above 64 MB, since it rewrites the whole file. A turn stops after 100 tool calls.
 
+## Why C
+
+myra builds to one binary of about 110 KB (macOS, Release). It links only libc, libcurl and, optionally, libedit, so no interpreter or package manager is needed.
+
 ## Build
 
 Requires CMake 3.16+ and libcurl; libedit, if found, adds line editing to the REPL. macOS ships both libraries. On Debian or Ubuntu: `apt install libcurl4-openssl-dev libedit-dev`. cJSON 1.7.19 (MIT) is vendored in `vendor/cjson/`. The Makefile wraps CMake and uses Ninja when installed.
@@ -22,7 +26,7 @@ Requires CMake 3.16+ and libcurl; libedit, if found, adds line editing to the RE
     make asan         # the same, in build-asan/ with AddressSanitizer and UBSan
     make install      # PREFIX=/usr/local by default
     make clean
-    make BUILD=out TYPE=Debug CMAKE_ARGS=-DAGENT_SANITIZE=ON   # overrides
+    make BUILD=out TYPE=Debug CMAKE_ARGS=-DMYRA_SANITIZE=ON   # overrides
 
 CI runs `make test` and `make asan` on Linux and macOS (`.github/workflows/ci.yml`).
 
@@ -30,9 +34,9 @@ Layout:
 
 | Path                  | Contains                                                         |
 |-----------------------|------------------------------------------------------------------|
-| `src/agent.{h,c}`     | `agentlib`: providers, tools, remembered state, streaming, the tool loop |
+| `src/myra.{h,c}`      | `myralib`: providers, tools, remembered state, streaming, the tool loop |
 | `src/main.c`          | the CLI: options, provider choice, headless mode, REPL           |
-| `tests/unit.c`        | `agentlib` unit tests; each `TEST(name)` is a ctest `unit.<name>` |
+| `tests/unit.c`        | `myralib` unit tests; each `TEST(name)` is a ctest `unit.<name>` |
 | `tests/test_agent.py` | end-to-end tests against a mock server; ctest `e2e`, needs `uv`  |
 
 CMake writes `build/compile_commands.json`, which clangd finds automatically.
@@ -77,7 +81,9 @@ Requests to `openrouter` carry a top-level `"cache_control": {"type": "ephemeral
 Replies stream to stdout as they arrive. Everything else goes to stderr:
 
 - The REPL starts with `myra <version>`, then the provider and model.
+
 - Each tool call gets one line, cut to the terminal width. `--verbose` shows the full arguments and the result instead.
+
 - Each turn ends with `[usage]`: requests, tokens in (cached) and out, and the cost where the server reports it. OpenRouter does, in credits, which are dollars; llama-server does not. Leaving the REPL prints the `[session]` totals.
 
 stderr is colored on a terminal. `--no-color`, or a non-empty `NO_COLOR` ([no-color.org](https://no-color.org)), turns it off.
@@ -112,8 +118,11 @@ The working-directory check guards against mistakes, not an adversary. `shell` c
 Ctrl-C:
 
 - During a `shell` command: kills the command and its children, skips the turn's remaining tool calls, and ends the turn.
+
 - While waiting for the model: stops the request within about a second; the turn is rolled back.
+
 - At the REPL prompt: drops the line.
+
 - Headless: the same, then exit with status 130.
 
 When a request exceeds the model's context, older tool outputs are replaced by a placeholder and the request is retried once. If nothing is left to drop, the agent suggests `/clear`.
@@ -143,10 +152,17 @@ Besides the provider variables above:
 ## Limitations
 
 - `auto` cannot confine `shell`: a command can still write anywhere. Use `ask` or `read-only` where that matters.
+
 - `read` is not confined either: the model can read any file you can, including keys and history outside the project.
+
 - The REPL history file holds your prompts verbatim. Delete it, or point `XDG_STATE_HOME` elsewhere, if they are sensitive.
+
 - The atomic replacement falls back to writing in place where no temporary file can be created, such as a read-only directory holding a writable file. That path can still truncate on failure.
+
 - Commands cannot read the terminal. A `sudo` or `ssh` password prompt waits until the timeout.
+
 - A background job must redirect its output (`cmd >log 2>&1 &`), or the call waits for it until the timeout.
+
 - `edit` cannot match text that `read` showed as U+FFFD in a file that is not UTF-8. Use `shell`, e.g. `sed` or `iconv`.
+
 - Reasoning text from thinking models is kept in the history but not shown, so a reply can start after a long silence.

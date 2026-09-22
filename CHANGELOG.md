@@ -1,10 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.1.2
 
 ### Changed
 
-- Renamed to `myra`, Swedish for ant. The binary, the state directory (`~/.local/state/myra/`) and the environment variables (`MYRA_MAX_OUTPUT`, `MYRA_RETRY_DELAY_MS`) follow the name. Move the old state directory across to keep a remembered provider and model. The C API keeps its `agent_` prefix, which no shell ever sees.
+- Renamed to `myra`, Swedish for ant. The binary, the state directory (`~/.local/state/myra/`) and the environment variables (`MYRA_MAX_OUTPUT`, `MYRA_RETRY_DELAY_MS`) follow the name. Move the old state directory across to keep a remembered provider and model. The C API follows: `myra.h`, `myralib`, the `myra_agent` type, and the `myra_`/`MYRA_` prefixes, including CMake options `MYRA_SANITIZE` and `MYRA_WERROR`. The old `agent` names were generic enough to clash when embedded.
+
+- String literals passed to `buf_add` and `strncmp` take their length from `sizeof`, via `buf_lit` and `MYRA_STARTS_WITH`. The rename left three hand-written lengths stale. One of them cut the state path at `myra/`, so no state was saved.
+
+### Fixed
+
+- GCC builds with `-DMYRA_WERROR=ON` failed on Linux. GCC could not rule out `b->n + n + 1` wrapping to 0 in `buf_add`, and warned of a `memcpy` of `SIZE_MAX` bytes. `buf_add` now exits on overflow instead. A unit test also ignored the result of `truncate`, which glibc marks `warn_unused_result`; that call was dead and is removed.
 
 ## 0.1.1
 

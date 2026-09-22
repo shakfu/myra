@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(myra VERSION 0.1.1 LANGUAGES C)
+project(myra VERSION 0.1.2 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -9,9 +9,9 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-option(AGENT_SANITIZE "Build with AddressSanitizer and UBSan" OFF)
-option(AGENT_WERROR "Treat our own warnings as errors (CI)" OFF)
-if(AGENT_SANITIZE)
+option(MYRA_SANITIZE "Build with AddressSanitizer and UBSan" OFF)
+option(MYRA_WERROR "Treat our own warnings as errors (CI)" OFF)
+if(MYRA_SANITIZE)
   # no-recover: undefined behaviour fails the test instead of printing a warning.
   add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
   add_link_options(-fsanitize=address,undefined)
@@ -26,20 +26,20 @@ target_link_libraries(cjson PRIVATE m)
 target_compile_options(cjson PRIVATE -Wno-deprecated-declarations) # sprintf, in upstream code
 
 set(WARNINGS -Wall -Wextra)
-if(AGENT_WERROR)
+if(MYRA_WERROR)
   list(APPEND WARNINGS -Werror) # our targets only: vendored cJSON keeps its warnings
 endif()
 
-add_library(agentlib STATIC src/agent.c)
-target_include_directories(agentlib PUBLIC src)
-target_compile_definitions(agentlib PUBLIC _DEFAULT_SOURCE _DARWIN_C_SOURCE)
-target_compile_options(agentlib PRIVATE ${WARNINGS})
-target_link_libraries(agentlib PUBLIC cjson CURL::libcurl)
+add_library(myralib STATIC src/myra.c)
+target_include_directories(myralib PUBLIC src)
+target_compile_definitions(myralib PUBLIC _DEFAULT_SOURCE _DARWIN_C_SOURCE)
+target_compile_options(myralib PRIVATE ${WARNINGS})
+target_link_libraries(myralib PUBLIC cjson CURL::libcurl)
 
 add_executable(myra src/main.c)
 target_compile_options(myra PRIVATE ${WARNINGS})
-target_compile_definitions(myra PRIVATE AGENT_VERSION="${PROJECT_VERSION}")
-target_link_libraries(myra PRIVATE agentlib)
+target_compile_definitions(myra PRIVATE MYRA_VERSION="${PROJECT_VERSION}")
+target_link_libraries(myra PRIVATE myralib)
 
 # Line editing and history for the REPL; macOS ships libedit, Linux has libedit-dev.
 find_path(EDITLINE_INCLUDE editline/readline.h)
@@ -58,7 +58,7 @@ enable_testing()
 
 add_executable(unit tests/unit.c)
 target_compile_options(unit PRIVATE ${WARNINGS})
-target_link_libraries(unit PRIVATE agentlib)
+target_link_libraries(unit PRIVATE myralib)
 # One ctest entry per TEST(name) in unit.c; reconfigure when it changes.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS tests/unit.c)
 file(STRINGS tests/unit.c UNIT_LINES REGEX "^TEST\\([a-z_0-9]+\\)")

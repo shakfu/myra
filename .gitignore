@@ -60,6 +60,7 @@ build-asan/
 __pycache__/
 .DS_Store
 *._cache
+.cache
 
 .claude
 CLAUDE.md

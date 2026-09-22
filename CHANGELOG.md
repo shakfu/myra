@@ -10,11 +10,27 @@
 
 ### Added
 
+- `--help`, the long form of `-h`.
+
+- `scripts/agent.py`: myra in Python 3.11+, stdlib only, for machines without a C toolchain or libcurl. It shares myra's options, saved state and history file, and ctest `e2e-py` runs the end-to-end suite against it. Line editing uses the `readline` module, so on macOS it is libedit. A lone completion gets a trailing space, the prompt goes to stdout, and the 600 s request timeout applies to each socket read rather than the whole request.
+
 - Tab completion in the REPL: a command at the start of a line, a model id after `/model `, a path anywhere else. Model ids cost one `/models` request, made once per session and only when a completion asks for them.
 
 - `myra_model_ids` and `myra_free_model_ids` return the provider's model ids; `myra_list_models` now prints that list rather than fetching its own.
 
 ### Fixed
+
+- Truncated tool output lost its head after the first invalid UTF-8 byte: the cut meant for a trailing partial character stopped at any invalid byte, and everything after it was counted as omitted. Only a trailing incomplete sequence is cut now.
+
+- A context-overflow error left `context_full` set, so any later failed request, such as a refused connection or a Ctrl-C, dropped old tool output and retried. It is now reset per request.
+
+- `MYRA_MAX_OUTPUT` above 64 MB let `read` return a file cut at 64 MB with no omission marker, since a file under the cap is read whole and that read stops at 64 MB. The cap is clamped to 64 MB. A pipe or device that outlasts 64 MB ends with `[stopped after 64 MB; the rest was not read]`.
+
+- Responses had no size limit, and a streamed reply kept every received byte. A request now stops, without retrying, after 64 MB, and an event stream is no longer kept once its events arrive.
+
+- The 100-call limit per turn was checked only after a reply's whole batch ran, so one reply could run any number of calls. Calls past the limit are now skipped, each with a result so the history stays valid, and the turn ends.
+
+- After a turn interrupted by Ctrl-C, the interrupt flag stayed set until the next turn, so a `/models` in between printed nothing. The REPL now clears it before each line.
 
 - A failed `cmake` configure left `build/CMakeCache.txt` behind, so the next `make` treated the tree as configured and reported a missing `Makefile` instead of the real error. `.DELETE_ON_ERROR` drops the half-written cache.
 

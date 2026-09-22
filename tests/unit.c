@@ -6,7 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <netinet/in.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -295,6 +297,28 @@ TEST(read_of_a_huge_file_skips_the_middle) {
     return 0;
 }
 
+TEST(read_cap_is_clamped_to_the_raw_limit) {
+    /* Above MYRA_MAX_RAW, a file under the cap was read to MYRA_MAX_RAW and cut unmarked. */
+    myra_free(&A);
+    setenv("MYRA_MAX_OUTPUT", "1000000000", 1);
+    CHECK(local_agent() == 0 && A.max_output == MYRA_MAX_RAW);
+    FILE *f = fopen("big", "wb"); /* 1 MB over the limit, ending in z */
+    char *block = malloc(1 << 20);
+    memset(block, 'a', 1 << 20);
+    for (int i = 0; i <= MYRA_MAX_RAW >> 20; i++) {
+        if (i == MYRA_MAX_RAW >> 20) block[(1 << 20) - 1] = 'z';
+        fwrite(block, 1, 1 << 20, f);
+    }
+    free(block);
+    fclose(f);
+    int err;
+    char *out = tool("read", "{\"path\":\"big\"}", &err);
+    CHECK(!err && strstr(out, "\n[... 1048576 bytes omitted ...]\n"));
+    CHECK(out[strlen(out) - 1] == 'z');
+    free(out);
+    return 0;
+}
+
 TEST(edit_refuses_a_huge_file) {
     int err;
     FILE *f = fopen("big2", "wb");
@@ -477,6 +501,18 @@ TEST(utf8_truncation_does_not_split_a_character) {
     return 0;
 }
 
+TEST(truncation_keeps_the_head_after_an_invalid_byte) {
+    /* The head was cut at its first invalid byte, not just at a trailing partial character. */
+    int err;
+    char *out = tool("shell", "{\"command\":\"printf 'x\\\\377y'; "
+                              "head -c 20000 /dev/zero | tr '\\\\0' b\"}", &err);
+    CHECK(!err && !strncmp(out, "x" FFFD "y", 5));
+    CHECK(strspn(out + 5, "b") == 3276 - 3); /* the rest of the 3276-byte head */
+    CHECK(strstr(out, "\n[... 3619 bytes omitted ...]\n")); /* 20003 - 3276 - 13108 */
+    free(out);
+    return 0;
+}
+
 /* ---- state ---- */
 
 TEST(state_roundtrip) {
@@ -647,6 +683,36 @@ TEST(clear_keeps_only_system_prompt) {
 
 /* ---- REPL command parsing ---- */
 
+/* A port with nothing listening, so a request fails at once. */
+static int closed_port(void) {
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t len = sizeof sa;
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0 || bind(s, (struct sockaddr *)&sa, sizeof sa) < 0 ||
+        getsockname(s, (struct sockaddr *)&sa, &len) < 0)
+        return -1;
+    close(s);
+    return ntohs(sa.sin_port);
+}
+
+TEST(stale_context_full_does_not_drop_tool_output) {
+    /* context_full outlived the failed request that set it, so an unrelated later failure
+       blanked old tool output and retried. */
+    int port = closed_port();
+    CHECK(port > 0);
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/v1", port);
+    setenv("LOCAL_BASE_URL", url, 1);
+    put("f", "data");
+    CHECK(step("{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":["
+               "{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read\","
+               "\"arguments\":\"{\\\"path\\\":\\\"f\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}") == 1);
+    A.context_full = 1; /* as an earlier context error left it */
+    CHECK(myra_ask(&A, "next") == -1);
+    CHECK(!strcmp(field(msg(2), "content"), "data"));
+    return 0;
+}
+
 TEST(command_parsing) {
     CHECK(!strcmp(myra_command("/model", "/model"), ""));
     CHECK(!strcmp(myra_command("/model   qwen", "/model"), "qwen"));
@@ -675,12 +741,15 @@ static const struct { const char *name; int (*fn)(void); int needs_agent; } TEST
     {"shell_output_does_not_grow_memory", test_shell_output_does_not_grow_memory, 1},
     {"shell_stops_after_the_raw_output_limit", test_shell_stops_after_the_raw_output_limit, 1},
     {"read_of_a_huge_file_skips_the_middle", test_read_of_a_huge_file_skips_the_middle, 1},
+    {"read_cap_is_clamped_to_the_raw_limit", test_read_cap_is_clamped_to_the_raw_limit, 1},
     {"edit_refuses_a_huge_file", test_edit_refuses_a_huge_file, 1},
     {"utf8_invalid_bytes_are_replaced", test_utf8_invalid_bytes_are_replaced, 1},
     {"utf8_valid_text_is_unchanged", test_utf8_valid_text_is_unchanged, 1},
     {"utf8_read_replaces_latin1", test_utf8_read_replaces_latin1, 1},
     {"utf8_truncation_does_not_split_a_character", test_utf8_truncation_does_not_split_a_character,
      1},
+    {"truncation_keeps_the_head_after_an_invalid_byte",
+     test_truncation_keeps_the_head_after_an_invalid_byte, 1},
     {"shell_timeout_kills_process_group", test_shell_timeout_kills_process_group, 1},
     {"shell_timeout_is_clamped", test_shell_timeout_is_clamped, 1},
     {"shell_background_job_with_redirect_returns", test_shell_background_job_with_redirect_returns,
@@ -703,6 +772,8 @@ static const struct { const char *name; int (*fn)(void); int needs_agent; } TEST
      test_step_null_content_without_calls_becomes_empty, 1},
     {"step_failures_leave_history_alone", test_step_failures_leave_history_alone, 1},
     {"clear_keeps_only_system_prompt", test_clear_keeps_only_system_prompt, 1},
+    {"stale_context_full_does_not_drop_tool_output",
+     test_stale_context_full_does_not_drop_tool_output, 1},
     {"command_parsing", test_command_parsing, 0},
 };
 

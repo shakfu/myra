@@ -718,6 +718,19 @@ def test_sigint_during_shell_kills_it_and_exits_130(mock, tmp_path):
     assert len(mock.requests) == 1  # no follow-up request after the interrupt
 
 
+def test_second_sigint_does_not_stop_the_kill(mock, tmp_path):
+    api = Api(mock, "local")  # SIGTERM is ignored, so only the SIGKILL 2 s later ends it
+    api.reply(calls=[("s", "shell", {"command": "trap '' TERM; sleep 30 & echo $! > pid; wait"})])
+    p = start(api, tmp_path, "-p", "go")
+    wait_for(lambda: (tmp_path / "pid").exists() and (tmp_path / "pid").read_text().strip())
+    p.send_signal(signal.SIGINT)
+    time.sleep(0.5)  # inside the grace period
+    p.send_signal(signal.SIGINT)
+    out, err = p.communicate(timeout=10)
+    assert p.returncode == 130, err
+    assert pid_gone(tmp_path / "pid")
+
+
 def test_sigint_during_request_exits_130(mock, tmp_path):
     api = Api(mock, "local")
     mock.replies.append((200, {"choices": []}, 20))  # the server stalls
@@ -1147,9 +1160,33 @@ def test_edit_explains_non_utf8_mismatch(mock, tmp_path):
     assert (tmp_path / "l1.txt").read_bytes() == b"caf\xe9 noir\n"  # the raw byte is kept
 
 
+def test_read_of_an_endless_pipe_says_it_stopped(mock, tmp_path):
+    os.mkfifo(tmp_path / "fifo")
+    writer = subprocess.Popen(["sh", "-c", "exec yes > fifo"], cwd=tmp_path, stderr=subprocess.DEVNULL)
+    api = Api(mock, "local")
+    api.reply(calls=[("r", "read", {"path": "fifo"})])
+    api.reply("ok")
+    try:
+        p = api.run(tmp_path, "-p", "go")
+    finally:
+        writer.kill()
+        writer.wait()
+    assert p.returncode == 0, p.stderr
+    content, err = api.results(mock.requests[1])["r"]
+    assert not err and content.startswith("y\ny\n") and " bytes omitted ...]\n" in content
+    assert content.endswith("\n[stopped after 64 MB; the rest was not read]")
+
+
 def test_version_flag(tmp_path):
     p = subprocess.run([str(AGENT), "-V"], capture_output=True, text=True, timeout=10)
     assert p.returncode == 0 and p.stdout == "myra 0.1.2\n"
+
+
+@pytest.mark.parametrize("flag", ["-h", "--help"])
+def test_help_flag(tmp_path, flag):
+    p = subprocess.run([str(AGENT), flag], capture_output=True, text=True, timeout=10)
+    assert p.returncode == 0 and p.stdout.startswith("usage:") and "--help" in p.stdout
+    assert p.stderr == ""
 
 
 MUTATIONS = [("w", "write", {"path": "../out.txt", "content": "x"}),
@@ -1296,6 +1333,35 @@ def test_tool_calls_per_turn_are_capped(mock, tmp_path):
     assert mock.requests[100]["body"]["messages"][-1]["content"] == "and now?"
 
 
+@pytest.mark.parametrize("batches,skipped", [([101], 1), ([60, 60], 20)], ids=["one", "crossing"])
+def test_tool_call_cap_holds_within_a_batch(mock, tmp_path, batches, skipped):
+    api = Api(mock, "local")
+    n = 0
+    for size in batches:
+        api.reply(calls=[(f"c{n + i}", "shell", {"command": f"touch f{n + i}"}) for i in range(size)])
+        n += size
+    p = api.run(tmp_path, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert f"stopped: 100 tool calls in one turn; skipped {skipped}" in p.stderr
+    assert len(mock.requests) == len(batches)  # no request after the cap
+    assert len(list(tmp_path.glob("f*"))) == 100 and not (tmp_path / "f100").exists()
+
+
+def test_models_works_after_an_interrupted_turn(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[("s", "shell", {"command": "echo $$ > pid; sleep 30"})])
+    mock.replies.append((200, MODELS))
+    p = start(api, tmp_path)
+    p.stdin.write("go\n")
+    p.stdin.flush()
+    wait_for(lambda: (tmp_path / "pid").exists() and (tmp_path / "pid").read_text().strip())
+    p.send_signal(signal.SIGINT)
+    wait_for(lambda: pid_gone(tmp_path / "pid"))
+    out, err = p.communicate("/models gpt\n", timeout=10)
+    assert p.returncode == 0, err
+    assert out == "  openai/gpt-5.5\n", err  # the interrupt ended with its turn
+
+
 def test_last_event_without_a_blank_line_is_kept(mock, tmp_path):
     mock.replies.append((200, {"_sse": ['data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n',
                                         'data: {"choices":[{"index":0,"delta":{},'
@@ -1322,6 +1388,18 @@ def test_cut_off_stream_after_text_is_not_retried(mock, tmp_path):
     assert p.returncode == 1 and p.stdout == "half an ans\n"
     assert "the stream ended early" in p.stderr and "retrying" not in p.stderr
     assert len(mock.requests) == 1
+
+
+@pytest.mark.parametrize("stdin", ["/models\n", "hi\n"], ids=["get", "post"])
+def test_oversized_response_is_refused(mock, tmp_path, stdin):
+    # Plain JSON either way: the POST takes the streaming path with no events, which keeps all.
+    mock.replies.append((200, {"_plain": True, "data": [{"id": "x"}], "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "pad": "a" * (64 * 1024 * 1024)}))
+    p = Api(mock, "local").run(tmp_path, stdin=stdin)
+    assert p.returncode == 0, p.stderr
+    assert "error: response exceeds 64 MB" in p.stderr and "retrying" not in p.stderr
+    assert p.stdout == "" and len(mock.requests) == 1
 
 
 @pytest.mark.parametrize("value", ["abc", "0", "-5", ""])

@@ -11,7 +11,7 @@ myra, which means *ant* in Swedish, is a minimal code agent in C with four tools
 
 Tool output is capped per provider (see the table below). Over the cap, the first fifth and the last four fifths are kept, since errors and summaries come last. Output is cleaned to valid UTF-8: invalid bytes and NUL become U+FFFD.
 
-Only what is kept is held in memory, so a huge file or a flood of output costs nothing extra. `read` skips the middle of a large file; `shell` is killed after 64 MB of output; `edit` refuses a file above 64 MB, since it rewrites the whole file. A turn stops after 100 tool calls.
+Only what is kept is held in memory, so a huge file or a flood of output costs nothing extra. `read` skips the middle of a large file; `shell` is killed after 64 MB of output; `edit` refuses a file above 64 MB, since it rewrites the whole file. A turn stops after 100 tool calls; calls beyond that in the same reply are skipped.
 
 ## Why C
 
@@ -52,6 +52,7 @@ Layout:
 | `src/main.c`          | the CLI: options, provider choice, headless mode, REPL, completion |
 | `tests/unit.c`        | `myralib` unit tests; each `TEST(name)` is a ctest `unit.<name>` |
 | `tests/test_agent.py` | end-to-end tests against a mock server; ctest `e2e`, needs `uv`  |
+| `scripts/agent.py`    | myra in Python 3.11+, stdlib only; same options and state. ctest `e2e-py` runs the suite against it |
 
 CMake writes `build/compile_commands.json`, which clangd finds automatically.
 
@@ -91,6 +92,7 @@ Requests to `openrouter` carry a top-level `"cache_control": {"type": "ephemeral
     ./myra --verbose                    # full tool arguments and results
     ./myra --no-color                   # plain stderr
     ./myra -V                           # version
+    ./myra --help                       # options and REPL commands
 
 Replies stream to stdout as they arrive. Everything else goes to stderr:
 

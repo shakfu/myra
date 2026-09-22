@@ -9,6 +9,7 @@
 #define MYRA_SHELL_TIMEOUT 120 /* seconds, when the model gives none */
 #define MYRA_SHELL_TIMEOUT_MAX 600
 #define MYRA_MAX_RAW (64 * 1024 * 1024) /* bytes read before a tool gives up */
+#define MYRA_MAX_RESPONSE (64 * 1024 * 1024) /* bytes received before a request gives up */
 #define MYRA_MAX_TOOL_CALLS 100 /* per turn, so a looping model stops */
 
 /* Nonzero if s starts with the string literal lit; needs <string.h>. */

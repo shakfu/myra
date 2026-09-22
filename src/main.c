@@ -41,6 +41,7 @@ static int usage(const char *argv0, int rc) {
             "  -m  model id; remembered per provider\n"
             "  -p  run one prompt headless and exit (default: REPL)\n"
             "  -V  print the version\n"
+            "  -h, --help  print this help\n"
             "  --verbose   show each tool call's full arguments and result, not one line\n"
             "  --no-color  plain stderr; also when NO_COLOR is set or stderr is not a terminal\n"
             "  --permissions  when write, edit and shell run without asking:\n"
@@ -171,13 +172,14 @@ static void repl(myra_agent *a) {
     }
     for (;;) {
         int interrupted;
+        /* An interrupted turn leaves the flag set; cleared here, before completion can fetch. */
+        myra_interrupted = 0;
         if (!next_line(ctx, &line, &cap, &interrupted)) {
             if (!interrupted) { /* EOF or read error */
                 if (tty) fputc('\n', stderr); /* leave the prompt's line */
                 break;
             }
-            myra_interrupted = 0; /* Ctrl-C at the prompt: drop the line */
-            clearerr(stdin);
+            clearerr(stdin); /* Ctrl-C at the prompt: drop the line */
             if (!ctx) fputc('\n', stderr); /* linenoise already ended the line */
             continue;
         }
@@ -221,6 +223,7 @@ int main(int argc, char **argv) {
     static const struct option longopts[] = {{"permissions", required_argument, NULL, 'W'},
                                              {"verbose", no_argument, NULL, 'v'},
                                              {"no-color", no_argument, NULL, 'C'},
+                                             {"help", no_argument, NULL, 'h'},
                                              {NULL, 0, NULL, 0}};
     myra_permissions perms = MYRA_AUTO;
     int opt, verbose = 0, color = 1;

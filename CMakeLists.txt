@@ -83,6 +83,20 @@ if(UV)
   add_test(NAME e2e COMMAND ${UV} run --no-project --with pytest pytest -q tests
            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   set_tests_properties(e2e PROPERTIES ENVIRONMENT "MYRA_BIN=$<TARGET_FILE:myra>")
+  # The same suite against scripts/agent.py. The tests set PATH=/usr/bin:/bin, where python3
+  # may predate 3.11, so a wrapper pins the interpreter found here.
+  find_package(Python3 3.11 COMPONENTS Interpreter)
+  if(Python3_FOUND)
+    file(WRITE ${CMAKE_BINARY_DIR}/tmp/agent-py
+         "#!/bin/sh\nexec '${Python3_EXECUTABLE}' '${CMAKE_SOURCE_DIR}/scripts/agent.py' \"$@\"\n")
+    file(COPY ${CMAKE_BINARY_DIR}/tmp/agent-py DESTINATION ${CMAKE_BINARY_DIR}
+         FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE)
+    add_test(NAME e2e-py COMMAND ${UV} run --no-project --with pytest pytest -q tests
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(e2e-py PROPERTIES ENVIRONMENT "MYRA_BIN=${CMAKE_BINARY_DIR}/agent-py")
+  else()
+    message(WARNING "Python 3.11+ not found: e2e-py (scripts/agent.py) is not registered")
+  endif()
 else()
   message(WARNING "uv not found: end-to-end tests (tests/test_agent.py) are not registered")
 endif()

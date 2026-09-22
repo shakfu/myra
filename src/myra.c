@@ -213,10 +213,14 @@ static char *sink_take(sink *s) {
     size_t dropped = s->total - s->head.n - s->tail_len;
     buf head = s->head;
     if (dropped) { /* keep whole characters on both sides of the gap */
-        size_t keep = 0, k;
-        while (keep < head.n && (k = utf8_len((const unsigned char *)head.p + keep, head.n - keep)) &&
-               keep + k <= head.n)
-            keep += k;
+        size_t keep = head.n;
+        for (size_t i = 1; i <= 3 && i <= head.n; i++) { /* back to the last lead byte */
+            unsigned char c = (unsigned char)head.p[head.n - i];
+            if (is_cont((char)c)) continue;
+            size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+            if (need > i) keep = head.n - i; /* its sequence runs into the gap */
+            break;
+        }
         head.n = keep;
         size_t skip = 0;
         while (skip < tail.n && is_cont(tail.p[skip])) skip++;
@@ -339,6 +343,18 @@ static char *tool_read(const char *path, size_t cap, int *err) {
         return fmt(nul ? "%s is binary" : "cannot read %s", path);
     }
     char *out = sink_take(&s);
+    /* A pipe or device can outlast the limit; a regular file here is under the cap. */
+    if (!S_ISREG(st.st_mode) && s.total >= MYRA_MAX_RAW) {
+        size_t len = strlen(out);
+        char note[64];
+        snprintf(note, sizeof note, "%s[stopped after %d MB; the rest was not read]",
+                 len && out[len - 1] != '\n' ? "\n" : "", MYRA_MAX_RAW / (1024 * 1024));
+        buf b = {0};
+        buf_add(&b, out, len);
+        buf_add(&b, note, strlen(note));
+        free(out);
+        out = b.p;
+    }
     sink_free(&s);
     return out;
 }
@@ -633,10 +649,6 @@ static int on_progress(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut, cu
     return myra_interrupted;
 }
 
-static size_t on_body(char *p, size_t sz, size_t n, void *ud) {
-    buf_add(ud, p, sz * n);
-    return sz * n;
-}
 
 /* Case-insensitive strstr; strcasestr needs _GNU_SOURCE on glibc. */
 static int contains_ci(const char *s, const char *sub) {
@@ -675,7 +687,23 @@ typedef struct {
     cJSON *usage, *error;
     char finish[32];
     int events, printed, done; /* done: the server sent [DONE] */
+    size_t received;
+    int oversize; /* received passed MYRA_MAX_RESPONSE; the transfer was aborted */
 } stream;
+
+/* Count len more bytes; 0 once over the cap, which curl takes as an abort. */
+static int within_cap(stream *st, size_t len) {
+    st->received += len;
+    if (st->received > MYRA_MAX_RESPONSE) st->oversize = 1;
+    return !st->oversize;
+}
+
+static size_t on_body(char *p, size_t sz, size_t n, void *ud) {
+    stream *st = ud;
+    if (!within_cap(st, sz * n)) return 0;
+    buf_add(&st->raw, p, sz * n);
+    return sz * n;
+}
 
 static void stream_free(stream *st) {
     free(st->line.p);
@@ -798,7 +826,9 @@ static void stream_line(stream *st, char *line) {
 static size_t on_stream(char *p, size_t sz, size_t n, void *ud) {
     stream *st = ud;
     size_t len = sz * n;
-    buf_add(&st->raw, p, len);
+    if (!within_cap(st, len)) return 0;
+    /* raw serves error bodies and servers that ignore "stream"; an event stream needs none */
+    if (!st->events) buf_add(&st->raw, p, len);
     long status = 0;
     curl_easy_getinfo(st->c, CURLINFO_RESPONSE_CODE, &status);
     if (status != 200) return len; /* an error body: plain JSON, kept in raw */
@@ -867,7 +897,7 @@ static cJSON *request(myra_agent *a, const char *path, const char *body, int str
     if (delay_ms < 1) delay_ms = 1000;
     if (delay_ms > 60000) delay_ms = 60000; /* a minute of back-off is plenty */
     cJSON *resp = NULL;
-    a->streamed = 0;
+    a->streamed = a->context_full = 0;
     for (int attempt = 0; attempt <= RETRIES; attempt++) {
         if (attempt) { /* a signal ends the wait early */
             long ms = delay_ms << (attempt - 1);
@@ -881,7 +911,7 @@ static cJSON *request(myra_agent *a, const char *path, const char *body, int str
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
         if (body) curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, streaming ? on_stream : on_body);
-        curl_easy_setopt(c, CURLOPT_WRITEDATA, streaming ? (void *)&st : (void *)&st.raw);
+        curl_easy_setopt(c, CURLOPT_WRITEDATA, &st);
         curl_easy_setopt(c, CURLOPT_TIMEOUT, 600L);
         curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, on_progress);
@@ -898,6 +928,11 @@ static cJSON *request(myra_agent *a, const char *path, const char *body, int str
         if (rc == CURLE_OK && status == 200 && !st.error && !truncated) {
             resp = st.events ? stream_result(&st) : cJSON_Parse(out); /* "stream" ignored */
             if (!resp) myra_note(MYRA_ERROR, "error: response is not JSON\n");
+            stream_free(&st);
+            break;
+        }
+        if (st.oversize) { /* a retry would receive the same */
+            myra_note(MYRA_ERROR, "error: response exceeds %d MB\n", MYRA_MAX_RESPONSE / (1024 * 1024));
             stream_free(&st);
             break;
         }
@@ -1034,6 +1069,7 @@ int myra_step(myra_agent *a, cJSON *resp) {
         cJSON_AddStringToObject(msg, "content", "");
     }
     cJSON_AddItemToArray(a->messages, msg);
+    int budget = MYRA_MAX_TOOL_CALLS - a->turn_calls, skipped = 0; /* the cap holds within a batch */
     a->turn_calls += ncalls;
     for (int i = 0; i < ncalls; i++) {
         cJSON *call = cJSON_GetArrayItem(calls, i), *fn = cJSON_GetObjectItem(call, "function");
@@ -1050,9 +1086,11 @@ int myra_step(myra_agent *a, cJSON *resp) {
         cJSON *input = cJSON_Parse(args ? args : "");
         int err = 1;
         /* Every call still gets a result, so the history stays valid. */
-        char *out = myra_interrupted       ? xstrdup("skipped: interrupted by user")
-                    : cJSON_IsObject(input) ? myra_run_tool(a, name ? name : "", input, &err)
-                                            : fmt("invalid JSON arguments for %s", name ? name : "?");
+        char *out;
+        if (myra_interrupted) out = xstrdup("skipped: interrupted by user");
+        else if (i >= budget) out = (skipped++, xstrdup("skipped: the turn reached its tool call limit"));
+        else if (cJSON_IsObject(input)) out = myra_run_tool(a, name ? name : "", input, &err);
+        else out = fmt("invalid JSON arguments for %s", name ? name : "?");
         cJSON_Delete(input);
         /* Chat completions has no is_error field, so mark failures in the text. */
         char *content = err ? fmt("error: %s", out) : fmt("%s", out);
@@ -1068,6 +1106,11 @@ int myra_step(myra_agent *a, cJSON *resp) {
     if (myra_interrupted) {
         myra_note(MYRA_WARN, "interrupted\n");
         return 0; /* end the turn without asking the model again */
+    }
+    if (skipped) {
+        myra_note(MYRA_WARN, "stopped: %d tool calls in one turn; skipped %d\n", MYRA_MAX_TOOL_CALLS,
+                  skipped);
+        return 0;
     }
     return ncalls > 0;
 }
@@ -1166,6 +1209,8 @@ int myra_init(myra_agent *a, const myra_provider *p, const char *model, myra_per
     a->permissions = perms;
     const char *cap = getenv("MYRA_MAX_OUTPUT");
     a->max_output = cap && atol(cap) >= 1024 ? (size_t)atol(cap) : p->max_output;
+    /* read takes the whole-file path for a file up to the cap, and that path stops at MYRA_MAX_RAW */
+    if (a->max_output > MYRA_MAX_RAW) a->max_output = MYRA_MAX_RAW;
     a->api_key = getenv(p->key_env);
     if ((!a->api_key || !*a->api_key) && !p->key_optional) {
         myra_note(MYRA_ERROR, "error: %s is not set\n", p->key_env);

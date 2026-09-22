@@ -17,6 +17,14 @@ if(MYRA_SANITIZE)
   add_link_options(-fsanitize=address,undefined)
 endif()
 
+# Let the linker drop what nothing reaches: most of vendored linenoise is unused here.
+add_compile_options(-ffunction-sections -fdata-sections)
+if(APPLE)
+  add_link_options(-Wl,-dead_strip) # ld64's spelling of --gc-sections
+else()
+  add_link_options(-Wl,--gc-sections)
+endif()
+
 find_package(CURL REQUIRED)
 
 # Vendored; built without our warning flags.

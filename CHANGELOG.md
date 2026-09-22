@@ -4,7 +4,9 @@
 
 ### Changed
 
-- Line editing comes from linenoise, vendored in `vendor/linenoise/` (BSD-2), instead of system libedit. libedit was optional, so a build that could not find it had no line editing at all, and it forced a `siglongjmp` out of the SIGINT handler: libedit retries `read()` after `EINTR`, which swallowed the first Ctrl-C. linenoise hands over the read loop, so Ctrl-C at the prompt is an ordinary keystroke and the jump is gone. The binary grows about 41 KB and stops linking libedit, libtinfo, libbsd and libmd.
+- Line editing comes from linenoise, vendored in `vendor/linenoise/` (BSD-2), instead of system libedit. libedit was optional, so a build that could not find it had no line editing at all, and it forced a `siglongjmp` out of the SIGINT handler: libedit retries `read()` after `EINTR`, which swallowed the first Ctrl-C. linenoise hands over the read loop, so Ctrl-C at the prompt is an ordinary keystroke and the jump is gone. The binary grows about 21 KB net and stops linking libedit, libtinfo, libbsd and libmd.
+
+- Builds compile with `-ffunction-sections -fdata-sections` and link with `--gc-sections`, or `-dead_strip` on macOS. That drops 20 KB the program never reaches, most of it linenoise's blocking API, mouse and multiline modes and its allocator hook. Deleting those from `vendor/linenoise/` would have saved the same bytes while making the copy diverge from upstream.
 
 ### Added
 

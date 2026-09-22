@@ -15,7 +15,7 @@ Only what is kept is held in memory, so a huge file or a flood of output costs n
 
 ## Why C
 
-myra builds to one binary of about 139 KB (Linux, Release). It links only libc and libcurl, so no interpreter or package manager is needed.
+myra builds to one binary of about 119 KB (Linux, Release). It links only libc and libcurl, so no interpreter or package manager is needed.
 
 ## Build
 

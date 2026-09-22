@@ -2,10 +2,12 @@
 BUILD ?= build
 TYPE ?= Release
 CMAKE_ARGS ?=
+LINK ?= agent # symlink to the built binary; empty to skip
 GENERATOR := $(if $(shell command -v ninja),-G Ninja,)
 
 all: $(BUILD)/CMakeCache.txt
 	cmake --build $(BUILD)
+	$(if $(strip $(LINK)),ln -sfn $(BUILD)/agent $(strip $(LINK)))
 
 $(BUILD)/CMakeCache.txt:
 	cmake -S . -B $(BUILD) $(GENERATOR) -DCMAKE_BUILD_TYPE=$(TYPE) $(CMAKE_ARGS)
@@ -15,9 +17,10 @@ test: all
 
 # Same, in a separate tree with AddressSanitizer and UBSan.
 asan:
-	$(MAKE) test BUILD=build-asan TYPE=Debug CMAKE_ARGS=-DAGENT_SANITIZE=ON
+	$(MAKE) test BUILD=build-asan TYPE=Debug CMAKE_ARGS=-DAGENT_SANITIZE=ON LINK=
 
 clean:
 	rm -rf build build-asan
+	rm -f agent
 
 .PHONY: all test asan clean

@@ -55,6 +55,7 @@ dkms.conf
 *.dwo
 build/
 build-asan/
+/agent
 .pytest_cache/
 __pycache__/
 .DS_Store

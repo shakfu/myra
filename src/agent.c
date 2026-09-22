@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -156,17 +157,18 @@ static char *tool_shell(const char *cmd, int *err) {
     return r.p;
 }
 
-/* Ask on the controlling terminal so it works in headless mode and the REPL alike. */
-static int confirm(int auto_yes, const char *name, const char *detail) {
-    if (auto_yes) return 1;
+/* Ask on the controlling terminal so it works in headless mode and the REPL alike.
+   Returns NULL if allowed, else why not, for the model to relay. */
+static const char *denied(int auto_yes, const char *name, const char *detail) {
+    if (auto_yes) return NULL;
     FILE *tty = fopen("/dev/tty", "r+");
-    if (!tty) return 0;
+    if (!tty) return "denied: no terminal to confirm; run with -y";
     fprintf(tty, "allow %s: %s ? [y/N] ", name, detail);
     fflush(tty);
     char line[16] = {0};
     int ok = fgets(line, sizeof line, tty) && (line[0] == 'y' || line[0] == 'Y');
     fclose(tty);
-    return ok;
+    return ok ? NULL : "denied by user";
 }
 
 static const char *str_arg(cJSON *input, const char *key) {
@@ -178,27 +180,27 @@ char *agent_run_tool(agent *a, const char *name, cJSON *input, int *err) {
     const char *path = str_arg(input, "path");
     const char *content = str_arg(input, "content");
     const char *old = str_arg(input, "old_string"), *new = str_arg(input, "new_string");
-    const char *cmd = str_arg(input, "command");
+    const char *cmd = str_arg(input, "command"), *why;
     *err = 1;
     if (!strcmp(name, "read") && path) {
-        fprintf(stderr, "> read %s\n", path);
+        fprintf(stderr, "[tool] read %s\n", path);
         *err = 0;
         return tool_read(path, err);
     }
     if (!strcmp(name, "write") && path && content) {
-        fprintf(stderr, "> write %s\n", path);
-        if (!confirm(a->auto_yes, "write", path)) return xstrdup("denied by user");
+        fprintf(stderr, "[tool] write %s\n", path);
+        if ((why = denied(a->auto_yes, "write", path))) return xstrdup(why);
         *err = 0;
         return tool_write(path, content, err);
     }
     if (!strcmp(name, "edit") && path && old && new) {
-        fprintf(stderr, "> edit %s\n", path);
-        if (!confirm(a->auto_yes, "edit", path)) return xstrdup("denied by user");
+        fprintf(stderr, "[tool] edit %s\n", path);
+        if ((why = denied(a->auto_yes, "edit", path))) return xstrdup(why);
         return tool_edit(path, old, new, err);
     }
     if (!strcmp(name, "shell") && cmd) {
-        fprintf(stderr, "> shell %s\n", cmd);
-        if (!confirm(a->auto_yes, "shell", cmd)) return xstrdup("denied by user");
+        fprintf(stderr, "[tool] shell %s\n", cmd);
+        if ((why = denied(a->auto_yes, "shell", cmd))) return xstrdup(why);
         return tool_shell(cmd, err);
     }
     return fmt("unknown tool or missing arguments: %s", name);
@@ -332,13 +334,21 @@ static cJSON *call_api(agent *a) {
     return resp;
 }
 
+/* Case-insensitive strstr; strcasestr needs _GNU_SOURCE on glibc. */
+static int contains_ci(const char *s, const char *sub) {
+    size_t n = strlen(sub);
+    for (; *s; s++)
+        if (!strncasecmp(s, sub, n)) return 1;
+    return !n;
+}
+
 void agent_list_models(agent *a, const char *filter) {
     cJSON *resp = request(a, "/models", NULL), *m;
     cJSON *data = cJSON_GetObjectItem(resp, "data");
     if (resp && !cJSON_IsArray(data)) fprintf(stderr, "error: no model list in response\n");
     cJSON_ArrayForEach(m, data) {
         const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(m, "id"));
-        if (id && strstr(id, filter)) printf("%s %s\n", strcmp(id, a->model) ? " " : "*", id);
+        if (id && contains_ci(id, filter)) printf("%s %s\n", strcmp(id, a->model) ? " " : "*", id);
     }
     fflush(stdout);
     cJSON_Delete(resp);

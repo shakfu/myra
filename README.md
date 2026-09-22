@@ -14,7 +14,7 @@ Minimal code agent in C with four tools:
 Requires CMake 3.16+ and libcurl, which macOS ships. cJSON 1.7.19 (MIT) is vendored in `vendor/cjson/`.
 The Makefile wraps CMake and uses Ninja when installed.
 
-    make              # configure and build into build/; the binary is build/agent
+    make              # configure and build into build/; ./agent links to build/agent
     make test         # ctest: unit tests plus the end-to-end suite
     make asan         # the same, in build-asan/ with AddressSanitizer and UBSan
     make clean
@@ -61,11 +61,11 @@ See [OpenRouter prompt caching](https://openrouter.ai/docs/features/prompt-cachi
 ## Use
 
     export OPENROUTER_API_KEY=...
-    build/agent                              # REPL; /exit or EOF quits
-    build/agent -p "fix the build"           # headless: one task, then exit
-    build/agent -m openai/gpt-5.5 -p "..."   # any OpenRouter model id; remembered
-    build/agent -P local                     # llama-server on :8080
-    build/agent -y -p "..."                  # run write/edit/shell without asking
+    ./agent                              # REPL; /exit or EOF quits
+    ./agent -p "fix the build"           # headless: one task, then exit
+    ./agent -m openai/gpt-5.5 -p "..."   # any OpenRouter model id; remembered
+    ./agent -P local                     # llama-server on :8080
+    ./agent -y -p "..."                  # run write/edit/shell without asking
 
 REPL commands:
 

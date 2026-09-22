@@ -141,6 +141,8 @@ def test_all_four_tools_in_one_turn(api, tmp_path):
     p = api.run(tmp_path, "-y", "-p", "go")
     assert p.returncode == 0, p.stderr
     assert p.stdout == "working\ndone\n"
+    assert p.stderr == ("[tool] write a.txt\n[tool] edit a.txt\n[tool] read a.txt\n"
+                        "[tool] shell wc -l < a.txt; exit 3 # comment\n")
     assert (tmp_path / "a.txt").read_text() == "one\n2\n"
     msgs = api.mock.requests[1]["body"]["messages"]
     assert msgs[2]["role"] == "assistant"
@@ -201,8 +203,8 @@ def test_mutating_tools_denied_without_tty(api, tmp_path):
     p = api.run(tmp_path, "-p", "go")
     assert p.returncode == 0, p.stderr
     r = api.results(api.mock.requests[1])
-    assert r["w"] == ("denied by user", True)
-    assert r["s"] == ("denied by user", True)
+    assert r["w"] == ("denied: no terminal to confirm; run with -y", True)
+    assert r["s"] == ("denied: no terminal to confirm; run with -y", True)
     assert r["r"] == ("readable", False)  # read needs no confirmation
     assert not (tmp_path / "c.txt").exists() and not (tmp_path / "d.txt").exists()
 
@@ -372,9 +374,10 @@ def test_unwritable_state_warns_but_runs(mock, tmp_path):
 
 def test_repl_shows_provider_and_model(mock, tmp_path):
     api = Api(mock, "openrouter")
-    p = api.run(tmp_path, stdin="")
+    p = api.run(tmp_path, stdin="/model\n")
     assert p.returncode == 0
-    assert p.stderr.startswith("openrouter anthropic/claude-opus-5\n")
+    # Piped input: banner and /model output only, no "> " prompts.
+    assert p.stderr == "openrouter anthropic/claude-opus-5\n" * 2
 
 
 # ---- provider selection: -P, else first cloud key set, else error ----
@@ -453,7 +456,8 @@ def test_model_prefix_is_not_a_command(mock, tmp_path):
 # ---- /models ----
 
 MODELS = {"object": "list", "data": [{"id": "anthropic/claude-opus-5"}, {"id": "openai/gpt-5.5"},
-                                     {"id": "anthropic/claude-sonnet-5"}, {"name": "no id"}]}
+                                     {"id": "anthropic/claude-sonnet-5"}, {"name": "no id"},
+                                     {"id": "/models/Qwen3-4B-Q8_0.gguf"}]}
 
 
 def test_models_lists_and_stars_current(api, tmp_path):
@@ -471,7 +475,15 @@ def test_models_output_and_filter(mock, tmp_path):
     p = api.run(tmp_path, stdin="/models\n/models   claude \n")
     assert p.returncode == 0, p.stderr
     assert p.stdout == ("* anthropic/claude-opus-5\n  openai/gpt-5.5\n  anthropic/claude-sonnet-5\n"
+                        "  /models/Qwen3-4B-Q8_0.gguf\n"
                         "* anthropic/claude-opus-5\n  anthropic/claude-sonnet-5\n")
+
+
+@pytest.mark.parametrize("filter_", ["qwen", "QWEN3", "q8_0.GGUF"])
+def test_models_filter_ignores_case(mock, tmp_path, filter_):
+    mock.replies.append((200, MODELS))
+    p = Api(mock, "local").run(tmp_path, stdin=f"/models {filter_}\n")
+    assert p.stdout == "  /models/Qwen3-4B-Q8_0.gguf\n"
 
 
 def test_models_does_not_touch_history(mock, tmp_path):

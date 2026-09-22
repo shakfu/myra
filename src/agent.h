@@ -35,7 +35,7 @@ void agent_free(agent *a);
 int agent_ask(agent *a, const char *text);
 /* Switch model; it is remembered after the next successful response. */
 void agent_set_model(agent *a, const char *model);
-/* Print the provider's model ids that contain filter; the current one is starred. */
+/* Print the provider's model ids that contain filter, ignoring case; the current one is starred. */
 void agent_list_models(agent *a, const char *filter);
 
 /* Lower-level pieces, exposed for tests. */

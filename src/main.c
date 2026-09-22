@@ -25,8 +25,9 @@ static void repl(agent *a) {
     char *line = NULL;
     size_t cap = 0;
     ssize_t n;
+    int tty = isatty(STDIN_FILENO); /* no prompt when input is piped */
     for (;;) {
-        fputs("> ", stderr);
+        if (tty) fputs("> ", stderr);
         if ((n = getline(&line, &cap, stdin)) < 0) break;
         while (n && strchr(" \t\r\n", line[n - 1])) line[--n] = 0;
         if (!n) continue;

@@ -265,15 +265,24 @@ static int write_all(int fd, const char *s, size_t n) {
     return 0;
 }
 
+/* A symlink whose target does not exist. Writing would replace the link itself, since
+   realpath fails on it and the path then looks like a new file. */
+static int dangling_symlink(const char *path) {
+    struct stat st;
+    return !lstat(path, &st) && S_ISLNK(st.st_mode) && stat(path, &st) != 0;
+}
+
 /* Replace path's contents atomically: a failed write leaves the old file intact.
    Writes a temporary file beside the target (symlinks followed, mode kept) and renames
-   it over; a hard-linked file thus gets its own copy. Where no temporary file can be
-   made, e.g. a read-only directory holding a writable file, it writes in place. */
+   it over; a hard-linked file thus gets its own copy. A dangling symlink is refused,
+   not replaced by a regular file. Where no temporary file can be made, e.g. a read-only
+   directory holding a writable file, it writes in place. */
 static int spit(const char *path, const char *s, size_t n) {
     char real[PATH_MAX];
     const char *target = realpath(path, real) ? real : path; /* a new file: as given */
     struct stat st;
     mode_t mode;
+    if (target == path && dangling_symlink(path)) return -1; /* the rename would eat the link */
     if (stat(target, &st) == 0) {
         mode = st.st_mode & 07777;
     } else {
@@ -360,6 +369,7 @@ static char *tool_read(const char *path, size_t cap, int *err) {
 }
 
 static char *tool_write(const char *path, const char *content, int *err) {
+    if (dangling_symlink(path)) { *err = 1; return fmt("%s is a symlink to a missing file", path); }
     if (spit(path, content, strlen(content)) < 0) { *err = 1; return fmt("cannot write %s", path); }
     return fmt("wrote %s", path);
 }
@@ -367,11 +377,15 @@ static char *tool_write(const char *path, const char *content, int *err) {
 static char *tool_edit(const char *path, const char *old, const char *new, int *err) {
     *err = 1;
     if (!*old) return xstrdup("old_string is empty");
+    if (dangling_symlink(path)) return fmt("%s is a symlink to a missing file", path);
     struct stat st;
     if (!stat(path, &st) && st.st_size > MYRA_MAX_RAW) /* edit holds the whole file */
         return fmt("%s is too large to edit; use shell (sed, awk)", path);
     buf b = {0};
     if (slurp(path, &b) < 0) { free(b.p); return fmt("cannot read %s", path); }
+    /* The searches below are strstr: a NUL hides any match past it, including a second
+       one, so the unique-match guarantee would not hold. read refuses these files too. */
+    if (memchr(b.p, 0, b.n)) { free(b.p); return fmt("%s is binary", path); }
     char *hit = strstr(b.p, old);
     if (!hit && strstr(old, "\xEF\xBF\xBD") && !valid_utf8(&b)) { /* U+FFFD from read */
         free(b.p);

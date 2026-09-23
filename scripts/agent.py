@@ -205,16 +205,25 @@ def store_state(name: str, value: str) -> None:
 
 # ---- files ----
 
+def dangling_symlink(path: str | Path) -> bool:
+    """A symlink whose target does not exist. Writing would replace the link itself, since
+    realpath fails on it and the path then looks like a new file."""
+    return os.path.islink(path) and not os.path.exists(path)
+
+
 def spit(path: str | Path, data: bytes) -> None:
     """Replace path's contents atomically: a failed write leaves the old file intact.
 
     Writes a temporary file beside the target (symlinks followed, mode kept) and renames it
-    over; a hard-linked file thus gets its own copy. Where no temporary file can be made,
-    e.g. a read-only directory holding a writable file, it writes in place. Raises OSError.
+    over; a hard-linked file thus gets its own copy. A dangling symlink is refused, not
+    replaced by a regular file. Where no temporary file can be made, e.g. a read-only
+    directory holding a writable file, it writes in place. Raises OSError.
     """
     try:
         target = os.path.realpath(path, strict=True)
     except OSError:
+        if dangling_symlink(path):
+            raise  # the rename would eat the link
         target = os.fspath(path)  # a new file: as given
     try:
         mode = stat.S_IMODE(os.stat(target).st_mode)
@@ -308,6 +317,8 @@ def tool_read(path: str, cap: int) -> tuple[str, bool]:
 
 
 def tool_write(path: str, content: str) -> tuple[str, bool]:
+    if dangling_symlink(path):
+        return f"{path} is a symlink to a missing file", True
     try:
         spit(path, content.encode())
     except OSError:
@@ -318,6 +329,8 @@ def tool_write(path: str, content: str) -> tuple[str, bool]:
 def tool_edit(path: str, old: str, new: str) -> tuple[str, bool]:
     if not old:
         return "old_string is empty", True
+    if dangling_symlink(path):
+        return f"{path} is a symlink to a missing file", True
     with suppress(OSError):
         if os.stat(path).st_size > MAX_RAW:  # edit holds the whole file
             return f"{path} is too large to edit; use shell (sed, awk)", True
@@ -325,6 +338,8 @@ def tool_edit(path: str, old: str, new: str) -> tuple[str, bool]:
         data = Path(path).read_bytes()
     except OSError:
         return f"cannot read {path}", True
+    if b"\0" in data:  # read refuses these; myra cannot search them safely (strstr)
+        return f"{path} is binary", True
     old_b = old.encode()
     hit = data.find(old_b)
     if hit < 0 and "�" in old:  # U+FFFD from read

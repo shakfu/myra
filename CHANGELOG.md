@@ -20,6 +20,10 @@
 
 ### Fixed
 
+- `edit` reported a unique match in a file containing a NUL byte: the file was held with its length but searched with `strstr`, so the uniqueness check stopped at the first NUL and never saw an occurrence past it. Both agents now refuse such a file with the "is binary" error `read` gives. `scripts/agent.py` counted both matches correctly and gives up that ability to keep one contract across the two.
+
+- `write` and `edit` through a symlink whose target did not exist replaced the link with a regular file: `realpath` fails on a dangling link, so the path was treated as a new file and the rename landed on the link. Both agents now refuse it. Following the link instead would need `outside_cwd` to resolve the target, since it falls back to the link's own directory and would auto-approve a link pointing outside the working directory.
+
 - Truncated tool output lost its head after the first invalid UTF-8 byte: the cut meant for a trailing partial character stopped at any invalid byte, and everything after it was counted as omitted. Only a trailing incomplete sequence is cut now.
 
 - A context-overflow error left `context_full` set, so any later failed request, such as a refused connection or a Ctrl-C, dropped old tool output and retried. It is now reset per request.

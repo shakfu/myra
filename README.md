@@ -132,7 +132,7 @@ A call that would ask is refused when there is no terminal.
 
 The working-directory check guards against mistakes, not an adversary. `shell` can write anywhere, and a symlink swapped between the check and the write can redirect it.
 
-`write` and `edit` replace a file atomically: a failed write leaves the old contents. The new file keeps the mode and follows symlinks, but a hard-linked file gets its own copy.
+`write` and `edit` replace a file atomically: a failed write leaves the old contents. The new file keeps the mode and follows symlinks, but a hard-linked file gets its own copy. A symlink whose target does not exist is refused, not followed. `edit` refuses a file containing NUL bytes, as `read` does.
 
 Ctrl-C:
 

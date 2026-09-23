@@ -230,6 +230,29 @@ def test_edit_errors(api, tmp_path, inp, msg):
     assert (tmp_path / "b.txt").read_text() == "x x\n"
 
 
+def test_write_and_edit_refuse_a_dangling_symlink(api, tmp_path):
+    (tmp_path / "link").symlink_to("nowhere.txt")
+    api.reply(calls=[("w", "write", {"path": "link", "content": "x"}),
+                     ("e", "edit", {"path": "link", "old_string": "a", "new_string": "b"})])
+    api.reply("ok")
+    api.run(tmp_path, "-p", "go")
+    r = api.results(api.mock.requests[1])
+    for k in ("w", "e"):
+        assert r[k][1] and r[k][0] == "link is a symlink to a missing file"
+    assert (tmp_path / "link").is_symlink()          # the link survives
+    assert not (tmp_path / "nowhere.txt").exists()   # and nothing was created
+
+
+def test_edit_refuses_a_file_with_nul_bytes(api, tmp_path):
+    (tmp_path / "bin").write_bytes(b"x\0x")  # two matches for "x", one on each side
+    api.reply(calls=[("e", "edit", {"path": "bin", "old_string": "x", "new_string": "Y"})])
+    api.reply("ok")
+    api.run(tmp_path, "-p", "go")
+    content, err = api.results(api.mock.requests[1])["e"]
+    assert err and content == "bin is binary"
+    assert (tmp_path / "bin").read_bytes() == b"x\0x"
+
+
 def test_read_and_argument_errors(api, tmp_path):
     (tmp_path / "bin").write_bytes(b"a\0b")
     api.reply(calls=[("r1", "read", {"path": "bin"}), ("r2", "read", {"path": "nope"}),

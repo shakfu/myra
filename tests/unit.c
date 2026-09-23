@@ -116,6 +116,40 @@ TEST(write_keeps_mode_and_follows_symlinks) {
     return 0;
 }
 
+TEST(write_refuses_a_dangling_symlink) {
+    int err;
+    CHECK(symlink("nowhere.txt", "dangling") == 0);
+    char *out = tool("write", "{\"path\":\"dangling\",\"content\":\"x\"}", &err);
+    CHECK(err && !strcmp(out, "dangling is a symlink to a missing file"));
+    free(out);
+    struct stat st;
+    CHECK(lstat("dangling", &st) == 0 && S_ISLNK(st.st_mode)); /* the link survives */
+    CHECK(stat("nowhere.txt", &st) != 0);                      /* and nothing was created */
+    out = tool("edit", "{\"path\":\"dangling\",\"old_string\":\"a\",\"new_string\":\"b\"}", &err);
+    CHECK(err && !strcmp(out, "dangling is a symlink to a missing file"));
+    free(out);
+    CHECK(lstat("dangling", &st) == 0 && S_ISLNK(st.st_mode));
+    CHECK(no_temp_files());
+    return 0;
+}
+
+TEST(edit_refuses_a_file_with_nul_bytes) {
+    int err;
+    FILE *f = fopen("nul.bin", "wb");
+    fwrite("x\0x", 1, 3, f); /* two matches for "x", the second hidden behind the NUL */
+    fclose(f);
+    char *out = tool("edit", "{\"path\":\"nul.bin\",\"old_string\":\"x\",\"new_string\":\"Y\"}",
+                     &err);
+    CHECK(err && !strcmp(out, "nul.bin is binary"));
+    free(out);
+    char b[4] = {0};
+    f = fopen("nul.bin", "rb");
+    CHECK(fread(b, 1, sizeof b, f) == 3 && !memcmp(b, "x\0x", 3));
+    fclose(f);
+    CHECK(no_temp_files());
+    return 0;
+}
+
 TEST(failed_write_keeps_the_original) {
     signal(SIGXFSZ, SIG_IGN); /* a write past the limit then fails with EFBIG */
     struct rlimit rl = {4096, 4096};
@@ -728,6 +762,8 @@ TEST(command_parsing) {
 static const struct { const char *name; int (*fn)(void); int needs_agent; } TESTS[] = {
     {"tool_write_then_read", test_tool_write_then_read, 1},
     {"write_keeps_mode_and_follows_symlinks", test_write_keeps_mode_and_follows_symlinks, 1},
+    {"write_refuses_a_dangling_symlink", test_write_refuses_a_dangling_symlink, 1},
+    {"edit_refuses_a_file_with_nul_bytes", test_edit_refuses_a_file_with_nul_bytes, 1},
     {"failed_write_keeps_the_original", test_failed_write_keeps_the_original, 1},
     {"write_in_place_when_directory_is_read_only", test_write_in_place_when_directory_is_read_only,
      1},

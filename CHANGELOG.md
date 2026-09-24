@@ -1,8 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 ### Changed
+
+- `make install` installs a stripped `myra` to `~/.local/bin` by default. `PREFIX=/usr/local` restores the old location. A per-user prefix needs no `sudo`.
 
 - Line editing comes from linenoise, vendored in `vendor/linenoise/` (BSD-2), instead of system libedit. libedit was optional, so a build that could not find it had no line editing at all, and it forced a `siglongjmp` out of the SIGINT handler: libedit retries `read()` after `EINTR`, which swallowed the first Ctrl-C. linenoise hands over the read loop, so Ctrl-C at the prompt is an ordinary keystroke and the jump is gone. The binary grows about 21 KB net and stops linking libedit, libtinfo, libbsd and libmd.
 
@@ -43,6 +45,10 @@
 - The 100-call limit per turn was checked only after a reply's whole batch ran, so one reply could run any number of calls. Calls past the limit are now skipped, each with a result so the history stays valid, and the turn ends.
 
 - After a turn interrupted by Ctrl-C, the interrupt flag stayed set until the next turn, so a `/models` in between printed nothing. The REPL now clears it before each line.
+
+- In both agents, the shell tool's timeout and Ctrl-C stopped applying once the command closed stdout and stderr. The tool then waited for the shell with no deadline, and reported `[exit 0]`, so `exec >/dev/null 2>&1; sleep 30` ran for 30 s. The shell is now polled after EOF, so both still kill the process group. Polling was chosen over `pidfd`, which macOS lacks.
+
+- `myra` rescanned a partial SSE line for a newline on every 16 KB network read, so a line near the 64 MB cap took 4 s to receive. Each read now scans only its own bytes. `scripts/agent.py` reads lines with `readline` and was not affected.
 
 - A failed `cmake` configure left `build/CMakeCache.txt` behind, so the next `make` treated the tree as configured and reported a missing `Makefile` instead of the real error. `.DELETE_ON_ERROR` drops the half-written cache.
 

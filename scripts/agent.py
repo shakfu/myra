@@ -33,7 +33,7 @@ try:
 except ImportError:  # no line editing, as when input is piped
     readline = None
 
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 SHELL_TIMEOUT = 120  # seconds, when the model gives none
 SHELL_TIMEOUT_MAX = 600
 MAX_RAW = 64 * 1024 * 1024  # bytes read before a tool gives up
@@ -399,8 +399,14 @@ def tool_shell(cmd: str, timeout: int, cap: int) -> tuple[str, bool]:
                 if not (chunk := os.read(fd, 65536)):
                     break  # EOF: every writer has exited
                 sink.add(chunk)
-        if not stopped:
-            proc.wait()
+        # EOF: sh may have closed its output and kept running.
+        while not stopped and proc.poll() is None:
+            if interrupted:
+                stopped = "interrupted by user"
+            elif time.monotonic() >= deadline:
+                stopped = f"timed out after {timeout}s"
+            else:
+                time.sleep(0.01)
     finally:
         proc.stdout.close()
         if stopped:

@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import select
 import signal
 import socket
@@ -19,6 +20,9 @@ from pathlib import Path
 import pytest
 
 AGENT = Path(os.environ.get("MYRA_BIN") or Path(__file__).resolve().parent.parent / "build/myra")
+# The project version, as the binary reports it.
+VERSION = re.search(r"project\(myra VERSION (\S+)",
+                    (Path(__file__).resolve().parent.parent / "CMakeLists.txt").read_text())[1]
 
 # provider -> (key env, base-url env, base-url suffix)
 PROVIDERS = {
@@ -482,7 +486,7 @@ def test_repl_shows_provider_and_model(mock, tmp_path):
     p = api.run(tmp_path, stdin="/model\n")
     assert p.returncode == 0
     # Piped input: banner and /model output only, no "> " prompts, no color.
-    assert p.stderr == "myra 0.1.2\n" + "openrouter anthropic/claude-opus-5\n" * 2
+    assert p.stderr == f"myra {VERSION}\n" + "openrouter anthropic/claude-opus-5\n" * 2
 
 
 # ---- provider selection: -P, else remembered if usable, else first cloud key, else error ----
@@ -772,7 +776,7 @@ def test_repl_survives_sigint_at_prompt_and_mid_turn(mock, tmp_path):
     api.reply(calls=[("s", "shell", {"command": "echo $$ > pid; sleep 30"})])
     api.reply("after")
     p = start(api, tmp_path)
-    assert p.stderr.readline() == "myra 0.1.2\n"
+    assert p.stderr.readline() == f"myra {VERSION}\n"
     assert p.stderr.readline() == "local local\n"  # handler is installed by now
     p.send_signal(signal.SIGINT)  # at the prompt: the line is dropped, the REPL stays
     time.sleep(0.3)
@@ -788,6 +792,38 @@ def test_repl_survives_sigint_at_prompt_and_mid_turn(mock, tmp_path):
     assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool", "user"]
     assert msgs[3]["content"] == "error: [interrupted by user; killed]"
     assert msgs[4]["content"] == "second"
+
+
+@pytest.mark.parametrize("cmd", ["exec >/dev/null 2>&1; echo $$ > pid; sleep 30",
+                                 "sleep 30 >/dev/null 2>&1 & echo $! > pid; exec >&- 2>&-; wait"])
+def test_shell_timeout_holds_after_output_closes(mock, tmp_path, cmd):
+    api = Api(mock, "local")
+    api.reply(calls=[("s", "shell", {"command": cmd, "timeout": 1})])
+    api.reply("done")
+    t = time.monotonic()
+    p = api.run(tmp_path, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert time.monotonic() - t < 5
+    assert Api.results(mock.requests[1]) == {"s": ("[timed out after 1s; killed]", True)}
+    assert pid_gone(tmp_path / "pid")
+
+
+def test_sigint_stops_shell_after_output_closes(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[("s", "shell", {"command": "exec >/dev/null 2>&1; echo $$ > pid; sleep 30"})])
+    api.reply("after")
+    p = start(api, tmp_path)
+    assert p.stderr.readline() == f"myra {VERSION}\n"
+    assert p.stderr.readline() == "local local\n"  # handler is installed by now
+    p.stdin.write("first\n")
+    p.stdin.flush()
+    wait_for(lambda: (tmp_path / "pid").exists() and (tmp_path / "pid").read_text().strip())
+    p.send_signal(signal.SIGINT)
+    wait_for(lambda: pid_gone(tmp_path / "pid"))
+    out, err = p.communicate("", timeout=10)
+    assert p.returncode == 0 and out == "", err
+    assert mock.requests[0]["body"]["messages"][-1]["content"] == "first"
+    assert len(mock.requests) == 1  # the interrupted turn ends without asking the model again
 
 
 # ---- /clear ----
@@ -1223,7 +1259,7 @@ def test_read_of_an_endless_pipe_says_it_stopped(mock, tmp_path):
 
 def test_version_flag(tmp_path):
     p = subprocess.run([str(AGENT), "-V"], capture_output=True, text=True, timeout=10, check=False)
-    assert p.returncode == 0 and p.stdout == "myra 0.1.2\n"
+    assert p.returncode == 0 and p.stdout == f"myra {VERSION}\n"
 
 
 @pytest.mark.parametrize("flag", ["-h", "--help"])
@@ -1359,7 +1395,7 @@ def test_color_on_a_terminal_only(mock, tmp_path, args, env, colored):
     tty.type(b"\x04")
     assert tty.wait() == 0
     assert (b"\x1b[36m[tool] shell true" in tty.out) == colored
-    assert (b"\x1b[1mmyra 0.1.2" in tty.out) == colored
+    assert (f"\x1b[1mmyra {VERSION}".encode() in tty.out) == colored
 
 
 # ---- limits and stream framing ----

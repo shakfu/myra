@@ -38,7 +38,7 @@ Missing libcurl stops configure with `Could NOT find CURL`. A missing optional d
     make              # configure and build into build/; ./myra links to build/myra
     make test         # ctest: unit tests plus the end-to-end suite
     make asan         # the same, in build-asan/ with AddressSanitizer and UBSan
-    make install      # PREFIX=/usr/local by default
+    make install      # stripped, to PREFIX/bin; PREFIX=~/.local by default
     make clean
     make BUILD=out TYPE=Debug CMAKE_ARGS=-DMYRA_SANITIZE=ON   # overrides
 

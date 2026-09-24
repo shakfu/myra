@@ -475,8 +475,14 @@ static char *tool_shell(const char *cmd, int timeout, size_t cap, int *err) {
     }
     close(fds[0]);
     int st = 0;
+    while (!stopped) { /* EOF: sh may have closed its output and kept running */
+        pid_t w = waitpid(pid, &st, WNOHANG);
+        if (w == pid || (w < 0 && errno != EINTR)) break;
+        if (myra_interrupted) stopped = "interrupted by user";
+        else if (now() >= deadline) stopped = "timed out";
+        else usleep(10000);
+    }
     if (stopped) kill_group(pid, &st);
-    else reap(pid, &st);
 
     char *out = sink_take(&s);
     size_t len = strlen(out);
@@ -855,13 +861,14 @@ static size_t on_stream(char *p, size_t sz, size_t n, void *ud) {
     long status = 0;
     curl_easy_getinfo(st->c, CURLINFO_RESPONSE_CODE, &status);
     if (status != 200) return len; /* an error body: plain JSON, kept in raw */
+    size_t old = st->line.n;
     buf_add(&st->line, p, len);
-    char *start = st->line.p, *nl;
-    while ((nl = memchr(start, '\n', st->line.n - (size_t)(start - st->line.p)))) {
+    char *start = st->line.p, *from = start + old, *nl; /* earlier bytes hold no '\n' */
+    while ((nl = memchr(from, '\n', st->line.n - (size_t)(from - st->line.p)))) {
         *nl = 0;
         if (nl > start && nl[-1] == '\r') nl[-1] = 0;
         stream_line(st, start);
-        start = nl + 1;
+        start = from = nl + 1;
     }
     st->line.n -= (size_t)(start - st->line.p);
     memmove(st->line.p, start, st->line.n);

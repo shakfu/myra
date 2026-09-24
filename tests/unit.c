@@ -463,6 +463,35 @@ TEST(shell_interrupt_kills_process_group) {
     return 0;
 }
 
+TEST(shell_timeout_after_output_closed) {
+    const char *cmds[] = {
+        "{\"command\":\"exec >/dev/null 2>&1; echo $$ > pid; sleep 30\",\"timeout\":1}",
+        "{\"command\":\"sleep 30 >/dev/null 2>&1 & echo $! > pid; exec >&- 2>&-; wait\","
+        "\"timeout\":1}"};
+    for (int i = 0; i < 2; i++) {
+        int err;
+        double t = secs();
+        char *out = tool("shell", cmds[i], &err);
+        CHECK(secs() - t < 4);
+        CHECK(err && !strcmp(out, "[timed out after 1s; killed]"));
+        CHECK(gone("pid"));
+        free(out);
+    }
+    return 0;
+}
+
+TEST(shell_interrupt_after_output_closed) {
+    int err;
+    interrupt_in_1s();
+    double t = secs();
+    char *out = tool("shell", "{\"command\":\"exec >/dev/null 2>&1; echo $$ > pid; sleep 30\"}", &err);
+    CHECK(secs() - t < 4);
+    CHECK(err && !strcmp(out, "[interrupted by user; killed]"));
+    CHECK(gone("pid"));
+    free(out);
+    return 0;
+}
+
 TEST(step_interrupt_skips_remaining_calls) {
     interrupt_in_1s();
     CHECK(step("{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":["
@@ -790,6 +819,8 @@ static const struct { const char *name; int (*fn)(void); int needs_agent; } TEST
     T(shell_timeout_is_clamped, 1),
     T(shell_background_job_with_redirect_returns, 1),
     T(shell_interrupt_kills_process_group, 1),
+    T(shell_timeout_after_output_closed, 1),
+    T(shell_interrupt_after_output_closed, 1),
     T(step_interrupt_skips_remaining_calls, 1),
     T(state_roundtrip, 0),
     T(state_falls_back_to_home, 0),

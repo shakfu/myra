@@ -129,7 +129,7 @@ class Api:
         flag = ["-P", self.provider] if provider_flag else []
         return subprocess.run([str(AGENT), *flag, *args], cwd=cwd,
                               env={**self.env(cwd, key), **(env or {})}, input=stdin, text=True,
-                              capture_output=True, timeout=60, start_new_session=True)
+                              capture_output=True, timeout=60, start_new_session=True, check=False)
 
     def reply(self, text=None, calls=(), stop=None):
         """calls: (id, name, input dict or raw argument string)."""
@@ -403,7 +403,7 @@ def test_provider_name_as_prompt_hints_at_P(mock, tmp_path, name, flags):
 @pytest.mark.parametrize("name", ["nope", "anthropic", "openai", "compat"])
 def test_unknown_provider(tmp_path, name):
     p = subprocess.run([str(AGENT), "-P", name, "-p", "x"], cwd=tmp_path,
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, timeout=10, check=False)
     assert p.returncode == 2 and f"unknown provider {name}" in p.stderr
 
 
@@ -494,7 +494,7 @@ def both_keys(tmp_path, mock):
 
 def run_plain(tmp_path, env, *args):
     return subprocess.run([str(AGENT), *args], cwd=tmp_path, env=env, text=True,
-                          capture_output=True, timeout=30, start_new_session=True)
+                          capture_output=True, timeout=30, start_new_session=True, check=False)
 
 
 def remember(tmp_path, provider):
@@ -685,7 +685,7 @@ def test_refused_connection_fails_fast(tmp_path, stdin):
     args = ["-p", "x"] if stdin is None else []
     t = time.monotonic()
     p = subprocess.run([str(AGENT), "-P", "local", *args], cwd=tmp_path, env=env, input=stdin or "",
-                       text=True, capture_output=True, timeout=30, start_new_session=True)
+                       text=True, capture_output=True, timeout=30, start_new_session=True, check=False)
     assert time.monotonic() - t < 3  # no 1+2+4+8 s back-off
     assert "retrying" not in p.stderr
     msg = f"cannot connect to {url}/%s; is the server running?"
@@ -732,7 +732,7 @@ def test_sigint_during_shell_kills_it_and_exits_130(mock, tmp_path):
     wait_for(lambda: (tmp_path / "pid").exists() and (tmp_path / "pid").read_text().strip())
     t = time.monotonic()
     p.send_signal(signal.SIGINT)
-    out, err = p.communicate(timeout=10)
+    _, err = p.communicate(timeout=10)
     assert time.monotonic() - t < 4
     assert p.returncode == 130, err
     assert "interrupted" in err
@@ -749,7 +749,7 @@ def test_second_sigint_does_not_stop_the_kill(mock, tmp_path):
     p.send_signal(signal.SIGINT)
     time.sleep(0.5)  # inside the grace period
     p.send_signal(signal.SIGINT)
-    out, err = p.communicate(timeout=10)
+    _, err = p.communicate(timeout=10)
     assert p.returncode == 130, err
     assert pid_gone(tmp_path / "pid")
 
@@ -761,7 +761,7 @@ def test_sigint_during_request_exits_130(mock, tmp_path):
     wait_for(lambda: mock.requests)
     t = time.monotonic()
     p.send_signal(signal.SIGINT)
-    out, err = p.communicate(timeout=10)
+    _, err = p.communicate(timeout=10)
     assert time.monotonic() - t < 3  # curl checks roughly once a second
     assert p.returncode == 130 and "interrupted" in err
     assert "retrying" not in err
@@ -827,6 +827,8 @@ CONTEXT_ERRORS = [  # llama-server, OpenAI-style, Anthropic via OpenRouter
                "message": "the request exceeds the available context size, try increasing it"}},
     {"error": {"message": "This model's maximum context length is 8192 tokens."}},
     {"error": {"message": "prompt is too long: 250000 tokens > 200000 maximum"}},
+    {"error": {"code": "context_length_exceeded", "message": "reworded"}},  # matched by code
+    {"error": {"code": 400, "type": "exceed_context_size_error", "message": "reworded"}},  # by type
 ]
 
 
@@ -858,6 +860,23 @@ def test_context_full_keeps_newest_batch_then_hints(mock, tmp_path):
     assert "/clear starts a new one" in p.stderr and "dropped" not in p.stderr
     assert len(mock.requests) == 2  # no pointless retry
     assert api.results(mock.requests[1])["c1"] == ("data", False)
+
+
+def test_failed_turn_restores_dropped_tool_output(mock, tmp_path):
+    (tmp_path / "f").write_text("data")
+    api = Api(mock, "local")
+    api.reply(calls=[("c1", "read", {"path": "f"})])
+    api.reply("ok")
+    mock.replies.append((400, CONTEXT_ERRORS[0]))
+    mock.replies.append((400, {"error": {"message": "invalid model"}}))  # the retry fails otherwise
+    api.reply("fine")
+    p = api.run(tmp_path, stdin="one\ntwo\nthree\n")
+    assert p.returncode == 0, p.stderr
+    assert "context full: dropped 1 old tool output, retrying" in p.stderr
+    assert mock.requests[3]["body"]["messages"][3]["content"] == "[output dropped to fit the context]"
+    msgs = mock.requests[4]["body"]["messages"]
+    assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool", "assistant", "user"]
+    assert msgs[3]["content"] == "data" and msgs[5]["content"] == "three"
 
 
 def test_other_400_is_not_a_context_error(mock, tmp_path):
@@ -981,8 +1000,10 @@ def test_midstream_error_after_text_is_not_retried(mock, tmp_path):
     assert len(mock.requests) == 1
 
 
-def test_midstream_context_error_is_recognised(mock, tmp_path):
-    mock.replies.append((200, sse({"error": {"message": "prompt is too long: 300000 tokens"}})))
+@pytest.mark.parametrize("error", [{"message": "prompt is too long: 300000 tokens"},
+                                   {"type": "exceed_context_size_error", "message": "reworded"}])
+def test_midstream_context_error_is_recognised(mock, tmp_path, error):
+    mock.replies.append((200, sse({"error": error})))
     p = Api(mock, "local").run(tmp_path, "-p", "go")
     assert p.returncode == 1 and "/clear starts a new one" in p.stderr
 
@@ -1201,13 +1222,13 @@ def test_read_of_an_endless_pipe_says_it_stopped(mock, tmp_path):
 
 
 def test_version_flag(tmp_path):
-    p = subprocess.run([str(AGENT), "-V"], capture_output=True, text=True, timeout=10)
+    p = subprocess.run([str(AGENT), "-V"], capture_output=True, text=True, timeout=10, check=False)
     assert p.returncode == 0 and p.stdout == "myra 0.1.2\n"
 
 
 @pytest.mark.parametrize("flag", ["-h", "--help"])
 def test_help_flag(tmp_path, flag):
-    p = subprocess.run([str(AGENT), flag], capture_output=True, text=True, timeout=10)
+    p = subprocess.run([str(AGENT), flag], capture_output=True, text=True, timeout=10, check=False)
     assert p.returncode == 0 and p.stdout.startswith("usage:") and "--help" in p.stdout
     assert p.stderr == ""
 
@@ -1256,13 +1277,13 @@ def test_default_is_auto(mock, tmp_path, flags):
 
 def test_y_is_gone(tmp_path):
     p = subprocess.run([str(AGENT), "-y", "-p", "x"], cwd=tmp_path, capture_output=True,
-                       text=True, timeout=10)
+                       text=True, timeout=10, check=False)
     assert p.returncode == 2 and "usage:" in p.stderr
 
 
 def test_unknown_permissions_mode(tmp_path):
     p = subprocess.run([str(AGENT), "--permissions", "yolo", "-p", "x"], cwd=tmp_path,
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, timeout=10, check=False)
     assert p.returncode == 2 and "unknown permissions mode yolo" in p.stderr
 
 
@@ -1387,8 +1408,8 @@ def test_models_works_after_an_interrupted_turn(mock, tmp_path):
 
 def test_last_event_without_a_blank_line_is_kept(mock, tmp_path):
     mock.replies.append((200, {"_sse": ['data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n',
-                                        'data: {"choices":[{"index":0,"delta":{},'
-                                        '"finish_reason":"stop"}]}']}))  # no trailing newline
+                                        ('data: {"choices":[{"index":0,"delta":{},'
+                                         '"finish_reason":"stop"}]}')]}))  # no trailing newline
     p = Api(mock, "local").run(tmp_path, "-p", "go")
     assert p.returncode == 0 and p.stdout == "hi\n", p.stderr
 
@@ -1405,8 +1426,8 @@ def test_cut_off_stream_is_retried(mock, tmp_path):
 
 def test_cut_off_stream_after_text_is_not_retried(mock, tmp_path):
     api = Api(mock, "local")
-    mock.replies.append((200, {"_sse": ['data: {"choices":[{"index":0,"delta":'
-                                        '{"content":"half an ans"}}]}\n\n']}))
+    mock.replies.append((200, {"_sse": [('data: {"choices":[{"index":0,"delta":'
+                                         '{"content":"half an ans"}}]}\n\n')]}))
     p = api.run(tmp_path, "-p", "go")
     assert p.returncode == 1 and p.stdout == "half an ans\n"
     assert "the stream ended early" in p.stderr and "retrying" not in p.stderr

@@ -2,13 +2,14 @@
 """agent.py - myra in Python 3.11+, stdlib only: providers, the four tools, the tool loop and the REPL.
 
 Behaves as ./myra does and shares its saved state; tests/test_agent.py runs against either.
-See README.md for the user-facing behaviour.
+See README.md for the user-facing behaviour, and docs/dev/divergences.md for where the two differ.
 """
 
 from __future__ import annotations
 
 import argparse
 import codecs
+import copy
 import http.client
 import json
 import os
@@ -243,6 +244,7 @@ def spit(path: str | Path, data: bytes) -> None:
             f.flush()
             os.fchmod(f.fileno(), mode)
             os.fsync(f.fileno())
+        # The directory is not fsync'ed: the rename survives a crash, not necessarily power loss.
         os.replace(tmp, target)
     except BaseException:
         with suppress(OSError):
@@ -433,7 +435,7 @@ def denied(mode: Permissions, outside: bool, name: str, detail: str) -> str | No
     if mode is Permissions.ALL or (mode is Permissions.AUTO and not outside):
         return None
     try:
-        tty = open("/dev/tty", "r+")
+        tty = open("/dev/tty", "r+")  # noqa: SIM115 - closed by `with tty`; the try is for open only
     except OSError:
         if mode is Permissions.AUTO:
             return "denied: outside the working directory; --permissions all allows it"
@@ -469,7 +471,15 @@ def compact(obj: Any) -> str:
 
 
 def is_context_error(body: str) -> bool:
-    """Wording varies by server: llama-server, OpenAI-style APIs, Anthropic."""
+    """OpenAI's code and llama-server's type first; wording, which varies by server, after."""
+    try:
+        j = json.loads(body)
+    except ValueError:
+        j = None
+    e = j.get("error") if isinstance(j, dict) else None
+    e = e if isinstance(e, dict) else j if isinstance(j, dict) else {}  # mid-stream: the error itself
+    if e.get("code") == "context_length_exceeded" or e.get("type") == "exceed_context_size_error":
+        return True
     body = body.lower()
     return any(h in body for h in ("context size", "context length", "context window",
                                    "maximum context", "prompt is too long", "too many tokens"))
@@ -925,12 +935,15 @@ class Agent:
         before = len(self.messages)
         self.messages.append({"role": "user", "content": text})
         turn = Usage()
+        undropped = None  # history before the first drop, restored if the turn fails
         while True:  # call the model and run tools until it stops asking for them
             resp = self.call_api()
             usage = resp.get("usage") if isinstance(resp, dict) else None
             turn.add(usage)
             self.session.add(usage)
             if resp is None and self.context_full:
+                if undropped is None:
+                    undropped = copy.deepcopy(self.messages)
                 if n := self.drop_old_tool_output():
                     note(f"context full: dropped {n} old tool output{'' if n == 1 else 's'}, "
                          "retrying\n", Style.WARN)
@@ -947,6 +960,8 @@ class Agent:
                 rc = 0
                 break
         turn.report("[usage]")
+        if rc < 0 and undropped is not None:  # a misread error must not blank the conversation for good
+            self.messages = undropped
         if rc < 0:
             del self.messages[before:]
         return rc

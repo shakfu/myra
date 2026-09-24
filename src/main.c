@@ -69,8 +69,11 @@ static char *next_line(linenoise_context_t *ctx, char **line, size_t *cap, int *
         /* The editing loop is ours, so Ctrl-C needs no signal: linenoise clears ISIG
            and reports the keystroke. The prompt goes to stderr, like the other chatter. */
         linenoise_state_t st;
-        if (linenoise_edit_start_dynamic(ctx, &st, STDIN_FILENO, STDERR_FILENO, 128, "> ") < 0)
+        if (linenoise_edit_start_dynamic(ctx, &st, STDIN_FILENO, STDERR_FILENO, 128, "> ") < 0) {
+            /* ends the REPL like EOF; without this it would exit silently */
+            myra_note(MYRA_ERROR, "error: cannot start line editing: %s\n", strerror(errno));
             return NULL;
+        }
         char *l;
         while ((l = linenoise_edit_feed(&st)) == linenoise_edit_more) continue;
         linenoise_edit_stop(&st);

@@ -96,6 +96,7 @@ static char *xstrdup(const char *s) { buf b = {0}; buf_add(&b, s, strlen(s)); re
 static char *fmt(const char *f, const char *a) {
     size_t n = strlen(f) + strlen(a) + 1;
     char *s = malloc(n);
+    if (!s) { perror("malloc"); exit(1); }
     snprintf(s, n, f, a);
     return s;
 }
@@ -302,6 +303,7 @@ static int spit(const char *path, const char *s, size_t n) {
         int ok = fwrite(s, 1, n, f) == n;
         return (fclose(f) == 0 && ok) ? 0 : -1;
     }
+    /* The directory is not fsync'ed: the rename survives a crash, not necessarily power loss. */
     int ok = !write_all(fd, s, n) && !fchmod(fd, mode) && !fsync(fd);
     ok = !close(fd) && ok && !rename(tmp.p, target);
     if (!ok) unlink(tmp.p);
@@ -672,8 +674,15 @@ static int contains_ci(const char *s, const char *sub) {
     return !n;
 }
 
-/* Wording varies by server: llama-server, OpenAI-style APIs, Anthropic. */
+/* OpenAI's code and llama-server's type first; wording, which varies by server, after. */
 static int is_context_error(const char *body) {
+    cJSON *j = cJSON_Parse(body), *e = cJSON_GetObjectItem(j, "error");
+    if (!cJSON_IsObject(e)) e = j; /* a mid-stream error is the error object itself */
+    const char *code = get_str(e, "code"), *type = get_str(e, "type");
+    int hit = (code && !strcmp(code, "context_length_exceeded")) ||
+              (type && !strcmp(type, "exceed_context_size_error"));
+    cJSON_Delete(j);
+    if (hit) return 1;
     static const char *const hints[] = {"context size", "context length", "context window",
                                         "maximum context", "prompt is too long", "too many tokens"};
     for (size_t i = 0; i < sizeof hints / sizeof *hints; i++)
@@ -1184,11 +1193,13 @@ int myra_ask(myra_agent *a, const char *text) {
     cJSON_AddItemToArray(a->messages, m);
     int rc;
     myra_usage turn = {0};
+    cJSON *undropped = NULL; /* history before the first drop, restored if the turn fails */
     for (;;) { /* call the model and run tools until it stops asking for them */
         cJSON *resp = call_api(a);
         usage_add(&turn, cJSON_GetObjectItem(resp, "usage"));
         usage_add(&a->session, cJSON_GetObjectItem(resp, "usage"));
         if (!resp && a->context_full) {
+            if (!undropped) undropped = cJSON_Duplicate(a->messages, 1);
             int n = drop_old_tool_output(a);
             if (n) {
                 myra_note(MYRA_WARN, "context full: dropped %d old tool output%s, retrying\n",
@@ -1209,6 +1220,12 @@ int myra_ask(myra_agent *a, const char *text) {
         }
     }
     usage_print("[usage]", &turn);
+    if (rc < 0 && undropped) { /* a misread error must not blank the conversation for good */
+        cJSON_Delete(a->messages);
+        a->messages = undropped;
+        undropped = NULL;
+    }
+    cJSON_Delete(undropped);
     if (rc < 0)
         while (cJSON_GetArraySize(a->messages) > before)
             cJSON_DeleteItemFromArray(a->messages, cJSON_GetArraySize(a->messages) - 1);

@@ -144,7 +144,7 @@ Ctrl-C:
 
 - Headless: the same, then exit with status 130.
 
-When a request exceeds the model's context, older tool outputs are replaced by a placeholder and the request is retried once. If nothing is left to drop, the agent suggests `/clear`.
+When a request exceeds the model's context, older tool outputs are replaced by a placeholder and the request is retried once. If nothing is left to drop, the agent suggests `/clear`. If the turn fails anyway, the outputs are restored.
 
 ## Saved state
 

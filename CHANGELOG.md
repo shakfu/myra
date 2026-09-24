@@ -12,6 +12,10 @@
 
 - `--help`, the long form of `-h`.
 
+- `make lint` runs clang's static analyzer on `src/` and ruff on the Python; CI runs it on Linux. Ruff is pinned, since new versions add rules.
+
+- `docs/dev/divergences.md` lists where `scripts/agent.py` and `myra` differ. Each difference is marked intended or undecided.
+
 - `scripts/agent.py`: myra in Python 3.11+, stdlib only, for machines without a C toolchain or libcurl. It shares myra's options, saved state and history file, and ctest `e2e-py` runs the end-to-end suite against it. Line editing uses the `readline` module, so on macOS it is libedit. A lone completion gets a trailing space, the prompt goes to stdout, and the 600 s request timeout applies to each socket read rather than the whole request.
 
 - Tab completion in the REPL: a command at the start of a line, a model id after `/model `, a path anywhere else. Model ids cost one `/models` request, made once per session and only when a completion asks for them.
@@ -25,6 +29,10 @@
 - `write` and `edit` through a symlink whose target did not exist replaced the link with a regular file: `realpath` fails on a dangling link, so the path was treated as a new file and the rename landed on the link. Both agents now refuse it. Following the link instead would need `outside_cwd` to resolve the target, since it falls back to the link's own directory and would auto-approve a link pointing outside the working directory.
 
 - Truncated tool output lost its head after the first invalid UTF-8 byte: the cut meant for a trailing partial character stopped at any invalid byte, and everything after it was counted as omitted. Only a trailing incomplete sequence is cut now.
+
+- A turn that failed after a context-full retry left older tool output blanked for the rest of the session. The rollback removed only the turn's own messages. So a 400 misread as a context error, or a retry the server rejected, blanked every earlier result permanently. The blanked outputs are now restored when the turn fails. Context errors also match on OpenAI's `context_length_exceeded` code and llama-server's `exceed_context_size_error` type, so a reworded message from either still counts.
+
+- The REPL exited silently, as at EOF, when linenoise could not start editing. It now prints why.
 
 - A context-overflow error left `context_full` set, so any later failed request, such as a refused connection or a Ctrl-C, dropped old tool output and retried. It is now reset per request.
 

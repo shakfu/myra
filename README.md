@@ -15,7 +15,7 @@ Only what is kept is held in memory, so a huge file or a flood of output costs n
 
 ## Why C
 
-myra builds to one binary of about 119 KB (Linux, Release). It links only libc and libcurl, so no interpreter or package manager is needed.
+myra builds to one binary of about 135 KB (Linux, Release). It links only libc and libcurl, so no interpreter or package manager is needed.
 
 ## Build
 
@@ -91,10 +91,11 @@ Requests to `openrouter` carry a top-level `"cache_control": {"type": "ephemeral
     ./myra --permissions ask            # approve each write, edit and shell
     ./myra --verbose                    # full tool arguments and results
     ./myra --no-color                   # plain stderr
+    ./myra --raw                        # raw markdown on stdout
     ./myra -V                           # version
     ./myra --help                       # options and REPL commands
 
-Replies stream to stdout as they arrive. Everything else goes to stderr:
+Replies stream to stdout as they arrive. On a terminal, their markdown is rendered with ANSI styles: headings, bold, italic, inline and fenced code, bullets, quotes and rules. Fence lines are hidden. Everything else goes to stderr:
 
 - The REPL starts with `myra <version>`, then the provider and model.
 
@@ -102,7 +103,9 @@ Replies stream to stdout as they arrive. Everything else goes to stderr:
 
 - Each turn ends with `[usage]`: requests, tokens in (cached) and out, and the cost where the server reports it. OpenRouter does, in credits, which are dollars; llama-server does not. Leaving the REPL prints the `[session]` totals.
 
-stderr is colored on a terminal. `--no-color`, or a non-empty `NO_COLOR` ([no-color.org](https://no-color.org)), turns it off.
+stderr is colored when it is a terminal, and markdown is rendered when stdout is. `--no-color` turns off color, `--raw` turns off rendering, and a non-empty `NO_COLOR` ([no-color.org](https://no-color.org)) turns off both.
+
+Control characters from the model or a tool are shown in caret notation on a terminal: ESC as `^[`, DEL as `^?`, C1 as `M-^[`. So a reply, `[tool]` line or `--verbose` result cannot move the cursor, set the title or write the clipboard. A lone `\r` shows as `^M`; `\r\n` stays a line break. Piped output is not escaped. No option turns this off; pipe the output to get the raw bytes.
 
 REPL commands:
 
@@ -111,6 +114,7 @@ REPL commands:
 | `/model [id]`      | show the current model, or switch to `id` (remembered)  |
 | `/models [filter]` | list the provider's models whose id contains `filter`, ignoring case; `*` marks the current one |
 | `/clear`           | start a new conversation; provider and model are kept   |
+| `/raw`             | print the last reply as raw markdown, for copying       |
 | `/help`            | list these commands                                     |
 | `/exit`            | quit; so does Ctrl-D                                    |
 
@@ -129,6 +133,8 @@ per session and only if you ask for it. Piped input is read line by line, withou
 | `read-only`      | none: they are refused; `read` still runs                   |
 
 A call that would ask is refused when there is no terminal.
+
+The permission prompt always escapes control characters, `\n` included (`^J`), so a `\r` or erase-line in a command cannot hide what runs.
 
 The working-directory check guards against mistakes, not an adversary. `shell` can write anywhere, and a symlink swapped between the check and the write can redirect it.
 
@@ -183,5 +189,7 @@ Besides the provider variables above:
 - A background job must redirect its output (`cmd >log 2>&1 &`), or the call waits for it until the timeout.
 
 - `edit` cannot match text that `read` showed as U+FFFD in a file that is not UTF-8. Use `shell`, e.g. `sed` or `iconv`.
+
+- Markdown rendering is a subset. Tables, links and emphasis across lines stay raw. A `*`, `_` or backtick is decided without seeing the rest of the line, so an unclosed one styles the line to its end.
 
 - Reasoning text from thinking models is kept in the history but not shown, so a reply can start after a long silence.

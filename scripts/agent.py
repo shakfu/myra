@@ -22,7 +22,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -77,6 +77,7 @@ COMMANDS = [
     ("/model", " [id]", "show or switch the model"),
     ("/models", " [filter]", "list the provider's models whose id contains filter"),
     ("/clear", "", "start a new conversation"),
+    ("/raw", "", "print the last reply as raw markdown"),
     ("/help", "", "show this list"),
     ("/exit", "", "quit (also Ctrl-D)"),
 ]
@@ -97,12 +98,243 @@ class Style(StrEnum):
     BOLD = "\033[1m"
 
 
+# ---- control characters ----
+
+escape_out = escape_err = False  # set when stdout, stderr is a terminal; see escape()
+
+# C0, DEL and C1 in caret notation, as myra_escape in src/myra.c.
+CARET = ({c: "^" + chr(c + 64) for c in range(32)} | {127: "^?"}
+         | {c: "M-^" + chr(c - 64) for c in range(128, 160)})
+CARET_LINES = {c: v for c, v in CARET.items() if c not in (9, 10)}  # keeps \t and \n
+
+
+def escape(s: str, nl: bool = False) -> str:
+    """s with control characters shown, so they cannot drive the terminal. nl: '\\n',
+    '\\t' and '\\r' too; else CRLF becomes '\\n'."""
+    return s.translate(CARET) if nl else s.replace("\r\n", "\n").translate(CARET_LINES)
+
+
+class Escape:
+    """escape() over a stream: a trailing '\\r' is held, since a '\\n' may follow."""
+
+    def __init__(self):
+        self.cr = False
+
+    def feed(self, s: str) -> str:
+        s = "\r" * self.cr + s
+        self.cr = s.endswith("\r")
+        return escape(s[:-1] if self.cr else s)
+
+    def end(self) -> str:
+        out, self.cr = "^M" * self.cr, False
+        return out
+
+
 def note(msg: str, style: Style = Style.PLAIN) -> None:
     """Write msg to stderr, colored by style when color is on."""
+    if escape_err:
+        msg = escape(msg)
     if color and style:
         msg = f"{style}{msg}\033[0m"
     sys.stderr.write(msg)
     sys.stderr.flush()
+
+
+# ---- markdown ----
+
+markdown = False  # render replies; set when stdout is a terminal, unless --raw or NO_COLOR
+
+# Line kinds. A fence or rule is known only at the line's end.
+PLAIN, UNDECIDED, HEADING, QUOTE, BULLET, FENCE, CLOSE, HR, CODE = range(9)
+# Styles; SGR codes in Markdown.set_style.
+MD_H, MD_B, MD_I, MD_C, MD_D = 1, 2, 4, 8, 16
+LINE_MAX = 256  # characters held at a line start before it counts as plain
+
+
+def md_space(c: str) -> bool:
+    return c in ("", " ", "\t", "\n")
+
+
+def md_word(c: str) -> bool:  # ASCII only, as in myra
+    return c.isascii() and c.isalnum()
+
+
+class Markdown:
+    """Streaming markdown renderer: headings, bold, italic, inline code, fenced code,
+    bullets, quotes and rules. Mirrors myra_md in src/myra.c."""
+
+    def __init__(self):
+        self.line = ""  # the start of a line, held until its block kind is known
+        self.mid = False  # past the start of the line
+        self.block = PLAIN
+        self.fence, self.fence_n = "", 0  # inside a code block opened by fence_n of fence
+        self.em, self.code = 0, False  # open emphasis (bold, italic) and inline code
+        self.pend, self.pend_n, self.prev = "", 0, ""  # a held '*', '_' or '\\' run
+        self.style = 0  # the SGR styles set on the output
+        self.out: list[str] = []
+
+    def set_style(self, style: int) -> None:
+        if style == self.style:
+            return
+        codes = ["0"] if self.style else []
+        codes += [c for bit, c in ((MD_H | MD_B, "1"), (MD_D, "2"), (MD_I, "3"), (MD_H, "4"),
+                                   (MD_C, "32")) if style & bit]
+        self.out.append(f"\033[{';'.join(codes)}m")
+        self.style = style
+
+    def put(self, c: str, style: int) -> None:
+        self.set_style(style)
+        self.out.append(c)
+        self.prev = c
+
+    def emit(self, c: str) -> None:
+        self.put(c, (MD_H if self.block == HEADING else 0) | self.em | (MD_C if self.code else 0))
+
+    def resolve(self, nxt: str) -> None:
+        """A held run of '*' or '_' opens or closes emphasis, by CommonMark's flanking rules
+        less punctuation; else it is literal. nxt is "" at the end of the line."""
+        c, n, self.pend_n = self.pend, self.pend_n, 0
+        if c == "\\":
+            self.emit(c)
+            return
+        left, right = not md_space(nxt), not md_space(self.prev)
+        if c == "_":  # not inside a word: snake_case stays
+            left = left and not md_word(self.prev)
+            right = right and not md_word(nxt)
+        want = (MD_B if n >= 2 else 0) | (MD_I if n != 2 else 0)
+        on = self.em & want
+        if n <= 3 and ((on == want and right) or (not on and left)):
+            self.em ^= want
+            self.prev = c
+        else:
+            for _ in range(n):
+                self.emit(c)
+
+    def inline(self, c: str) -> None:
+        if self.pend_n:
+            if self.pend == "\\":
+                self.pend_n = 0
+                if " " < c < "\x7f" and not md_word(c):  # escaped
+                    self.emit(c)
+                    return
+                self.emit("\\")
+            elif c == self.pend:
+                self.pend_n += 1
+                return
+            else:
+                self.resolve(c)
+        if self.code:
+            if c == "`":
+                self.code, self.prev = False, c
+            else:
+                self.emit(c)
+        elif c in "\\*_":
+            self.pend, self.pend_n = c, 1
+        elif c == "`":
+            self.code, self.prev = True, c
+        else:
+            self.emit(c)
+
+    def classify(self, complete: bool) -> tuple[int, int]:
+        """The kind of the held line start, and how many characters of marker to drop."""
+        s = self.line
+        n, i = len(s), len(s) - len(s.lstrip(" "))
+        if self.fence:  # only a closing fence ends the block
+            k = i
+            while k < n and s[k] == self.fence:
+                k += 1
+            e = k
+            while e < n and s[e] in " \t":
+                e += 1
+            if i > 3 or e < n or (e > k and k - i < self.fence_n):
+                return CODE, 0
+            return (UNDECIDED if not complete else CLOSE if k - i >= self.fence_n else CODE), 0
+        if i == n:
+            return (PLAIN if complete else UNDECIDED), 0
+        r = s[i:]
+        c = r[0]
+        k = len(r) - len(r.lstrip(c))
+        run = k == len(r)  # so far the line is one run of c
+        if c == "#" and i <= 3 and k <= 6:
+            if run:
+                return (PLAIN if complete else UNDECIDED), 0
+            return (HEADING, i + k + 1) if r[k] == " " else (PLAIN, 0)
+        if c in "`~" and i <= 3 and (k >= 3 or run):
+            if not complete:
+                return UNDECIDED, 0
+            if k < 3 or (c == "`" and "`" in r[k:]):  # inline code
+                return PLAIN, 0
+            return FENCE, 0
+        if c == ">":
+            if len(r) == 1 and not complete:
+                return UNDECIDED, 0
+            return QUOTE, i + 1 + (r[1:2] == " ")
+        if c in "-*_" and run:
+            return (UNDECIDED if not complete else HR if k >= 3 else PLAIN), 0
+        if c == "+" and run:
+            return (PLAIN if complete else UNDECIDED), 0
+        if c in "-*+" and k == 1 and r[1] == " ":
+            return BULLET, i + 2
+        return PLAIN, 0
+
+    def apply(self, kind: int, skip: int) -> None:
+        """Write the held line start as kind, and render the rest of it."""
+        line, self.line = self.line, ""
+        self.mid, self.block = True, kind
+        i = len(line) - len(line.lstrip(" "))
+        if kind == FENCE:  # fence lines are not shown
+            self.fence = line[i]
+            self.fence_n = len(line[i:]) - len(line[i:].lstrip(self.fence))
+        elif kind == CLOSE:
+            self.fence = ""
+        elif kind in (HR, CODE):
+            for c in line:
+                self.put(c, MD_D if kind == HR else MD_C)
+        else:
+            if kind == QUOTE:
+                self.put("|", MD_D)
+                self.put(" ", MD_D)
+            elif kind == BULLET:
+                for c in " " * i + "- ":
+                    self.put(c, 0)
+            self.prev = ""
+            for c in line[skip:]:
+                self.inline(c)
+
+    def eol(self) -> None:
+        if not self.mid:
+            self.apply(*self.classify(True))
+        if self.pend_n:
+            self.resolve("")
+        self.set_style(0)
+        if self.block not in (FENCE, CLOSE):
+            self.out.append("\n")
+        self.mid, self.block, self.em, self.code, self.prev = False, PLAIN, 0, False, ""
+
+    def feed(self, s: str) -> str:
+        """Render s, holding back what the next characters decide."""
+        for c in s:
+            if c == "\n":
+                self.eol()
+            elif self.mid:
+                if self.block == CODE:
+                    self.put(c, MD_C)
+                else:
+                    self.inline(c)
+            else:
+                self.line += c
+                kind, skip = self.classify(False) if len(self.line) < LINE_MAX else (
+                    CODE if self.fence else PLAIN, 0)
+                if kind != UNDECIDED:
+                    self.apply(kind, skip)
+        out, self.out = "".join(self.out), []
+        return out
+
+    def end(self) -> str:
+        """Flush what is held, end a started line, and reset."""
+        out = self.feed("\n") if self.mid or self.line else ""
+        self.__init__()
+        return out
 
 
 def on_sigint(sig: int, frame: object) -> None:
@@ -440,19 +672,22 @@ def denied(mode: Permissions, outside: bool, name: str, detail: str) -> str | No
         return "denied: the agent runs with --permissions read-only"
     if mode is Permissions.ALL or (mode is Permissions.AUTO and not outside):
         return None
-    try:
-        tty = open("/dev/tty", "r+")  # noqa: SIM115 - closed by `with tty`; the try is for open only
-    except OSError:
-        if mode is Permissions.AUTO:
-            return "denied: outside the working directory; --permissions all allows it"
-        return "denied: no terminal to confirm; --permissions auto skips asking"
-    with tty:
+    with ExitStack() as tty:
+        # Two handles: text mode "r+" needs a seekable file, which a terminal is not.
+        try:
+            tty_in = tty.enter_context(open("/dev/tty"))
+            tty_out = tty.enter_context(open("/dev/tty", "w"))
+        except OSError:
+            if mode is Permissions.AUTO:
+                return "denied: outside the working directory; --permissions all allows it"
+            return "denied: no terminal to confirm; --permissions auto skips asking"
         where = " outside the working directory" if outside else ""
-        tty.write(f"allow {name}{where}: {detail} ? [y/N] ")
-        tty.flush()
+        # Escaped, else \r and ESC could hide the real command.
+        tty_out.write(f"allow {name}{where}: {escape(detail, nl=True)} ? [y/N] ")
+        tty_out.flush()
         try:
             with interruptible():
-                ok = tty.readline(16)[:1] in ("y", "Y")
+                ok = tty_in.readline(16)[:1] in ("y", "Y")
         except KeyboardInterrupt:  # interrupted is set: the turn's remaining calls are skipped
             ok = False
     return None if ok else "denied by user"
@@ -523,6 +758,12 @@ class Usage:
 
 # ---- streaming (server-sent events) ----
 
+def show(esc: Escape, md: Markdown, s: str | None) -> None:
+    """Write reply text to stdout, escaped and rendered as set; s None flushes what is held."""
+    text = (esc.feed(s) if s is not None else esc.end()) if escape_out else (s or "")
+    sys.stdout.write(md.feed(text) if markdown else text)
+
+
 class Stream:
     """One streamed reply, rebuilt into the shape of a non-streamed one."""
 
@@ -539,6 +780,7 @@ class Stream:
         self.events = 0
         self.received = 0
         self.printed = self.done = False  # done: the server sent [DONE]
+        self.esc, self.md = Escape(), Markdown()
 
     def feed(self, line: bytes) -> None:
         if not self.events:
@@ -571,7 +813,7 @@ class Stream:
         for k, v in (delta.items() if isinstance(delta, dict) else ()):
             match k, v:
                 case "content", str() if v:
-                    sys.stdout.write(v)
+                    show(self.esc, self.md, v)
                     sys.stdout.flush()
                     self.printed = True
                     self.content.append(v)
@@ -685,6 +927,13 @@ class Agent:
             "can. Be concise.")})
         return a
 
+    def last_reply(self) -> str | None:
+        """The text of the last assistant message that has any."""
+        for m in reversed(self.messages[1:]):
+            if m.get("role") == "assistant" and isinstance(t := m.get("content"), str) and t:
+                return t
+        return None
+
     def clear(self) -> None:
         """Drop the conversation, keeping the system prompt."""
         del self.messages[1:]
@@ -745,7 +994,8 @@ class Agent:
                 return None
             finally:
                 if st.printed:  # end the streamed line
-                    sys.stdout.write("\n")
+                    show(st.esc, st.md, None)
+                    sys.stdout.write(st.md.end() if markdown else "\n")
                     sys.stdout.flush()
                 self.streamed = st.printed
 
@@ -809,7 +1059,8 @@ class Agent:
         """Print the model ids that contain filter, ignoring case; the current one is starred."""
         for id_ in self.model_ids() or []:
             if filter_.lower() in id_.lower():
-                print(f"{'*' if id_ == self.model else ' '} {id_}", flush=True)
+                shown = escape(id_, nl=True) if escape_out else id_  # from the server
+                print(f"{'*' if id_ == self.model else ' '} {shown}", flush=True)
 
     # ---- the loop ----
 
@@ -818,6 +1069,8 @@ class Agent:
         if self.verbose:
             note(f"[tool] {name} {detail}\n", Style.TOOL)
             return
+        if escape_err:  # measured as shown
+            detail = escape(detail)
         width = 100
         if sys.stderr.isatty():
             with suppress(OSError):
@@ -872,7 +1125,11 @@ class Agent:
             msg.pop("tool_calls", None)
         content = msg.get("content")
         if not self.streamed and isinstance(content, str) and content:  # else already shown
-            print(content, flush=True)
+            esc, md = Escape(), Markdown()
+            show(esc, md, content)
+            show(esc, md, None)
+            sys.stdout.write(md.end() if markdown else "\n")
+            sys.stdout.flush()
         calls = msg.get("tool_calls")
         calls = [c for c in calls if isinstance(c, dict)] if isinstance(calls, list) else []
         if calls:
@@ -1104,6 +1361,11 @@ def repl(agent: Agent) -> None:
                     break
                 case "/help":
                     repl_help(sys.stderr)
+                case "/raw":
+                    if (text := agent.last_reply()) is not None:
+                        print(escape(text) if escape_out else text, flush=True)
+                    else:
+                        note("no reply yet\n", Style.DIM)
                 case "/clear":
                     agent.clear()
                     note("history cleared\n", Style.DIM)
@@ -1150,7 +1412,10 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--verbose", action="store_true",
                     help="show each tool call's full arguments and result, not one line")
     ap.add_argument("--no-color", action="store_true",
-                    help="plain stderr; also when NO_COLOR is set or stderr is not a terminal")
+                    help="plain stderr; also when stderr is not a terminal")
+    ap.add_argument("--raw", action="store_true",
+                    help="raw markdown on stdout; also when stdout is not a terminal\n"
+                         "NO_COLOR set means both")
     ap.add_argument("--permissions", type=permissions_arg, default=Permissions.AUTO,
                     metavar="mode",
                     help="when write, edit and shell run without asking:\n"
@@ -1162,9 +1427,11 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    global color
+    global color, markdown, escape_out, escape_err
     args = parser().parse_args(argv)
     color = not args.no_color and not os.environ.get("NO_COLOR") and sys.stderr.isatty()
+    markdown = not args.raw and not os.environ.get("NO_COLOR") and sys.stdout.isatty()
+    escape_out, escape_err = sys.stdout.isatty(), sys.stderr.isatty()
     for f in (sys.stdin, sys.stdout):  # invalid bytes in and lone surrogates out: U+FFFD
         f.reconfigure(errors="replace")
     if args.prompt is not None and args.prompt in PROVIDERS:  # -p and -P differ only by case

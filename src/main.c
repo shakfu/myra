@@ -18,6 +18,7 @@ static const struct { const char *name, *args, *help; } COMMANDS[] = {
     {"/model", " [id]", "show or switch the model"},
     {"/models", " [filter]", "list the provider's models whose id contains filter"},
     {"/clear", "", "start a new conversation"},
+    {"/raw", "", "print the last reply as raw markdown"},
     {"/help", "", "show this list"},
     {"/exit", "", "quit (also Ctrl-D)"},
 };
@@ -43,7 +44,9 @@ static int usage(const char *argv0, int rc) {
             "  -V  print the version\n"
             "  -h, --help  print this help\n"
             "  --verbose   show each tool call's full arguments and result, not one line\n"
-            "  --no-color  plain stderr; also when NO_COLOR is set or stderr is not a terminal\n"
+            "  --no-color  plain stderr; also when stderr is not a terminal\n"
+            "  --raw       raw markdown on stdout; also when stdout is not a terminal\n"
+            "              NO_COLOR set means both\n"
             "  --permissions  when write, edit and shell run without asking:\n"
             "      auto       always, except write/edit outside the working directory (default)\n"
             "      ask        never: ask on the terminal each time\n"
@@ -198,6 +201,14 @@ static void repl(myra_agent *a) {
             myra_note(MYRA_DIM, "history cleared\n");
             continue;
         }
+        if (!strcmp(line, "/raw")) {
+            const char *text = myra_last_reply(a);
+            char *shown = text && myra_escape_out ? myra_escape(NULL, text, 0) : NULL;
+            if (text) printf("%s\n", shown ? shown : text), fflush(stdout);
+            else myra_note(MYRA_DIM, "no reply yet\n");
+            free(shown);
+            continue;
+        }
         if ((arg = myra_command(line, "/models"))) {
             myra_list_models(a, arg);
             continue;
@@ -226,12 +237,13 @@ int main(int argc, char **argv) {
     static const struct option longopts[] = {{"permissions", required_argument, NULL, 'W'},
                                              {"verbose", no_argument, NULL, 'v'},
                                              {"no-color", no_argument, NULL, 'C'},
+                                             {"raw", no_argument, NULL, 'R'},
                                              {"help", no_argument, NULL, 'h'},
                                              {NULL, 0, NULL, 0}};
     myra_permissions perms = MYRA_AUTO;
-    int opt, verbose = 0, color = 1;
+    int opt, verbose = 0, color = 1, raw = 0;
     const char *no_color = getenv("NO_COLOR"); /* https://no-color.org */
-    if (no_color && *no_color) color = 0;
+    if (no_color && *no_color) color = 0, raw = 1;
     while ((opt = getopt_long(argc, argv, "p:P:m:hV", longopts, NULL)) != -1) {
         if (opt == 'V') {
             printf("myra %s\n", MYRA_VERSION);
@@ -239,6 +251,7 @@ int main(int argc, char **argv) {
         }
         if (opt == 'v') verbose = 1;
         else if (opt == 'C') color = 0;
+        else if (opt == 'R') raw = 1;
         else if (opt == 'W') {
             size_t i = 0;
             while (i < sizeof modes / sizeof *modes && strcmp(optarg, modes[i])) i++;
@@ -255,6 +268,9 @@ int main(int argc, char **argv) {
     }
     if (optind < argc) return usage(argv[0], 2);
     myra_color = color && isatty(STDERR_FILENO);
+    myra_markdown = !raw && isatty(STDOUT_FILENO);
+    myra_escape_out = isatty(STDOUT_FILENO);
+    myra_escape_err = isatty(STDERR_FILENO);
     if (prompt && myra_provider_named(prompt)) { /* -p and -P differ only by case */
         myra_note(MYRA_ERROR, "error: -p takes a prompt; did you mean -P %s?\n", prompt);
         return 2;

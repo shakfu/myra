@@ -5,6 +5,7 @@
 #include <cJSON.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #define MYRA_SHELL_TIMEOUT 120 /* seconds, when the model gives none */
 #define MYRA_SHELL_TIMEOUT_MAX 600
@@ -25,6 +26,42 @@ extern int myra_color;
 typedef enum { MYRA_PLAIN, MYRA_TOOL, MYRA_ERROR, MYRA_WARN, MYRA_DIM, MYRA_BOLD } myra_style;
 /* fprintf to stderr, colored by style when myra_color is set. */
 void myra_note(myra_style style, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+/* Show control characters in caret notation on stdout and stderr, so model and tool
+   output cannot drive the terminal. The CLI sets each when that stream is a terminal.
+   The permission prompt always escapes. */
+extern int myra_escape_out, myra_escape_err;
+
+typedef struct {
+    int cr; /* a held '\r', dropped if '\n' follows */
+} myra_esc;
+/* s with C0 controls, DEL and C1 as ^X, ^? and M-^X; malloc'd. nl: '\n', '\t' and '\r'
+   too. With state e, a trailing '\r' is held for the next call, and s NULL flushes it;
+   with e NULL, s is complete. s must hold whole UTF-8 characters. */
+char *myra_escape(myra_esc *e, const char *s, int nl);
+
+/* Render replies as markdown with ANSI styles. The CLI sets it when stdout is a
+   terminal, unless --raw or NO_COLOR. */
+extern int myra_markdown;
+
+/* Streaming markdown renderer: headings, bold, italic, inline code, fenced code,
+   bullets, quotes and rules. Zero it before first use. */
+typedef struct {
+    char line[256];      /* the start of a line, held until its block kind is known */
+    size_t n;
+    int mid;             /* past the start of the line */
+    int block;           /* the current line's kind */
+    char fence;          /* inside a code block opened by fence_n of this character */
+    size_t fence_n;
+    int em, code;        /* open emphasis (bold, italic) and inline code */
+    char pend, prev;     /* pend: a held '*', '_' or '\\' run; prev: last character */
+    int pend_n;
+    int style;           /* the SGR styles set on out */
+} myra_md;
+/* Render s, holding back what the next characters decide. */
+void myra_md_feed(myra_md *m, const char *s, FILE *out);
+/* Flush what is held, end a started line, and zero m. */
+void myra_md_end(myra_md *m, FILE *out);
 
 /* Token counts and cost, as the server reports them. */
 typedef struct {
@@ -78,6 +115,8 @@ void myra_free(myra_agent *a);
 
 /* Run one user turn. -1 on failure, with history rolled back to before the turn. */
 int myra_ask(myra_agent *a, const char *text);
+/* The text of the last assistant message that has any, or NULL. Points into the history. */
+const char *myra_last_reply(myra_agent *a);
 /* Drop the conversation, keeping the system prompt. */
 void myra_clear(myra_agent *a);
 /* Switch model; it is remembered after the next successful response. */

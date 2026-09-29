@@ -664,6 +664,72 @@ TEST(init_builds_system_message_and_tools) {
     return 0;
 }
 
+/* ---- control characters ---- */
+
+static int escapes(myra_esc *e, const char *in, int nl, const char *want) {
+    char *got = myra_escape(e, in, nl);
+    int ok = !strcmp(got, want);
+    if (!ok) fprintf(stderr, "got %s want %s\n", got, want);
+    free(got);
+    return ok;
+}
+
+TEST(escape_controls) {
+    CHECK(escapes(NULL, "a\033[2Kb\x7f\a\tc\n", 0, "a^[[2Kb^?^G\tc\n"));
+    CHECK(escapes(NULL, "\xc2\x9b" "31m \xc2\xa9 \xc3\xa9", 0, "M-^[31m \xc2\xa9 \xc3\xa9")); /* C1; (c), e-acute */
+    CHECK(escapes(NULL, "x\r\ny\rz\r", 0, "x\ny^Mz^M"));
+    CHECK(escapes(NULL, "rm -rf ~ #\r\033[2Kls\n", 1, "rm -rf ~ #^M^[[2Kls^J")); /* the prompt */
+    myra_esc e = {0};                     /* a CRLF split across chunks */
+    CHECK(escapes(&e, "a\r", 0, "a") && escapes(&e, "\nb\r", 0, "\nb") && escapes(&e, NULL, 0, "^M"));
+    return 0;
+}
+
+/* ---- markdown ---- */
+
+/* Render in as one chunk and byte by byte; both must give want. */
+static int md_renders(const char *in, const char *want) {
+    for (int bytewise = 0; bytewise < 2; bytewise++) {
+        char *got = NULL;
+        size_t n = 0;
+        FILE *out = open_memstream(&got, &n);
+        myra_md m = {0};
+        if (bytewise) {
+            for (const char *p = in; *p; p++) myra_md_feed(&m, (char[]){*p, 0}, out);
+        } else {
+            myra_md_feed(&m, in, out);
+        }
+        myra_md_end(&m, out);
+        fclose(out);
+        int ok = !strcmp(got, want);
+        if (!ok) fprintf(stderr, "in %s\ngot  %s\nwant %s\n", in, got, want);
+        free(got);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+TEST(markdown_inline) {
+    CHECK(md_renders("a **b** *c* `d` ***e***", "a \033[1mb\033[0m \033[3mc\033[0m \033[32md\033[0m \033[1;3me\033[0m\n"));
+    CHECK(md_renders("snake_case a * b 2*3*4", "snake_case a * b 2\033[3m3\033[0m4\n"));
+    CHECK(md_renders("\\*x\\* \\\\ \\a", "*x* \\ \\a\n"));
+    CHECK(md_renders("`a*b*`", "\033[32ma*b*\033[0m\n"));
+    CHECK(md_renders("**open\nnext", "\033[1mopen\033[0m\nnext\n")); /* styles end with the line */
+    CHECK(md_renders("done\n", "done\n"));
+    return 0;
+}
+
+TEST(markdown_blocks) {
+    CHECK(md_renders("# T *i*", "\033[1;4mT \033[0;1;3;4mi\033[0m\n"));
+    CHECK(md_renders("#no", "#no\n"));
+    CHECK(md_renders("- a\n* b\n  + c\n1. d", "- a\n- b\n  - c\n1. d\n"));
+    CHECK(md_renders("> q\n>", "\033[2m| \033[0mq\n\033[2m| \033[0m\n"));
+    CHECK(md_renders("---\n**\n***", "\033[2m---\033[0m\n**\n\033[2m***\033[0m\n"));
+    CHECK(md_renders("```sh\na*b\n  ```x\n\n```\nafter", "\033[32ma*b\033[0m\n\033[32m  ```x\033[0m\n\nafter\n"));
+    CHECK(md_renders("~~~\n```\n~~~~", "\033[32m```\033[0m\n")); /* closed only by its own fence */
+    CHECK(md_renders("```a` b", "\033[32ma\033[0m b\n"));        /* inline code, not a fence */
+    return 0;
+}
+
 /* ---- the loop ---- */
 
 TEST(step_text_reply_finishes) {
@@ -838,6 +904,9 @@ static const struct { const char *name; int (*fn)(void); int needs_agent; } TEST
     T(clear_keeps_only_system_prompt, 1),
     T(stale_context_full_does_not_drop_tool_output, 1),
     T(command_parsing, 0),
+    T(escape_controls, 0),
+    T(markdown_inline, 0),
+    T(markdown_blocks, 0),
 };
 
 int main(int argc, char **argv) {

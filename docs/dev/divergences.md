@@ -27,3 +27,4 @@ These exist in the code. Nobody has chosen them.
 | `shell` cannot start | `pipe failed: ...` or `fork failed: ...` | `cannot run /bin/sh: ...` |
 | One-line `[tool]` log | cut to the terminal width in bytes, on a character boundary | cut in code points |
 | Path completion order | `readdir` order | sorted |
+| Markdown line start held before it counts as plain | 256 bytes | 256 code points |

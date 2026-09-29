@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Replies render as markdown when stdout is a terminal: headings, bold, italic, inline and fenced code, bullets, quotes and rules. Text still streams. Only a line's start and a run of `*`, `_` or `\` are held, until the next character decides them. Rendering whole lines was simpler, but shows a long paragraph at once. Piped stdout, `--raw` and `NO_COLOR` keep the raw text.
+
+- `--raw` turns off rendering and `--no-color` turns off stderr color, so every combination is reachable; `NO_COLOR` turns off both. `/raw` reprints the last reply raw, since the need to copy markdown usually arises after the reply is shown.
+
+- Control characters bound for a terminal are shown in caret notation (`^[`, `M-^[`) instead of being written raw. A model could put `\r` and an erase-line into a `shell` command, and the `--permissions ask` prompt showed only the text after them; OSC 52 in a reply or `--verbose` tool output could write the clipboard. Escaping was chosen over refusing such calls: it shows what arrived and blocks nothing legitimate. Piped output is unchanged, and there is no opt-out, since one would reopen the prompt.
+
+- Rendering, `--raw` and escaping together add 8 KB of code; the Release binary grows 13 KB, to 135 KB.
+
+### Fixed
+
+- In `scripts/agent.py`, `--permissions ask`, and `auto` outside the working directory, refused every call as "no terminal to confirm", even on a terminal. Text mode `open("/dev/tty", "r+")` needs a seekable file and raises `io.UnsupportedOperation`, an `OSError` subclass, which the no-terminal branch caught. The e2e suite checked only the no-terminal case.
+
 ## 0.2.0
 
 ### Changed

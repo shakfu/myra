@@ -1398,6 +1398,121 @@ def test_color_on_a_terminal_only(mock, tmp_path, args, env, colored):
     assert (f"\x1b[1mmyra {VERSION}".encode() in tty.out) == colored
 
 
+
+MARKDOWN = "# T\nsome **b** and `c`\n```\nx*y\n```\n- i"
+RENDERED = (b"\x1b[1;4mT\x1b[0m\r\nsome \x1b[1mb\x1b[0m and \x1b[32mc\x1b[0m\r\n"
+            b"\x1b[32mx*y\x1b[0m\r\n- i\r\n")
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.parametrize("args,env,rendered,colored", [
+    ([], {}, True, True), (["--no-color"], {}, True, False), (["--raw"], {}, False, True),
+    (["--raw", "--no-color"], {}, False, False), ([], {"NO_COLOR": "1"}, False, False)])
+def test_markdown_rendered_on_a_terminal(mock, tmp_path, args, env, rendered, colored):
+    api = Api(mock, "local")  # one character per event, so held-back markers cross events
+    mock.replies.append((200, sse({"role": "assistant"}, *({"content": c} for c in MARKDOWN),
+                                  finish("stop"))))
+    tty = Tty(api, tmp_path, *args, env=env)
+    tty.expect(b"> ")
+    tty.type(b"go\r")
+    tty.expect(RENDERED if rendered else MARKDOWN.replace("\n", "\r\n").encode() + b"\r\n")
+    tty.expect(b"> ")
+    tty.type(b"\x04")
+    assert tty.wait() == 0
+    assert (b"\x1b[1mmyra " in tty.out) == colored  # stderr: independent of rendering
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_raw_command_reprints_the_last_reply(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(MARKDOWN)
+    tty = Tty(api, tmp_path)
+    tty.expect(b"> ")
+    tty.type(b"/raw\r")
+    tty.expect(b"no reply yet")
+    tty.type(b"go\r")
+    tty.expect(RENDERED)
+    tty.expect(b"> ")
+    tty.type(b"/raw\r")
+    tty.expect(MARKDOWN.replace("\n", "\r\n").encode() + b"\r\n")
+    tty.expect(b"> ")
+    tty.type(b"\x04")
+    assert tty.wait() == 0
+
+
+def test_raw_command_skips_tool_call_messages(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("**before**", calls=[("s", "shell", {"command": "true"})])
+    api.reply("", calls=[("t", "shell", {"command": "true"})])
+    api.reply("*final*")
+    p = api.run(tmp_path, stdin="go\n/raw\n")
+    assert p.returncode == 0, p.stderr
+    assert p.stdout == "**before**\n*final*\n*final*\n"
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_markdown_rendered_headless_on_a_terminal(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(MARKDOWN)
+    tty = Tty(api, tmp_path, "-p", "go")
+    assert tty.wait() == 0
+    assert RENDERED in tty.out
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_permission_prompt_shows_control_characters(mock, tmp_path):
+    api = Api(mock, "local")  # \r and erase-line would leave only "ls" on screen
+    api.reply(calls=[("s", "shell", {"command": "touch pwned #\r\x1b[2Kls\nls"})])
+    api.reply("done")
+    tty = Tty(api, tmp_path, "--permissions", "ask", "-p", "go")
+    tty.expect(b"allow shell: touch pwned #^M^[[2Kls^Jls ? [y/N] ")
+    tty.type(b"n\r")
+    assert tty.wait() == 0
+    assert not (tmp_path / "pwned").exists()
+    assert b"[tool] shell touch pwned #^M^[[2Kls ..." in tty.out
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_permission_prompt_approves_on_a_terminal(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[("s", "shell", {"command": "touch ok"})])
+    api.reply("done")
+    tty = Tty(api, tmp_path, "--permissions", "ask", "-p", "go")
+    tty.expect(b"allow shell: touch ok ? [y/N] ")
+    tty.type(b"y\r")
+    assert tty.wait() == 0
+    assert (tmp_path / "ok").exists()
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_control_characters_escaped_on_a_terminal(mock, tmp_path):
+    api = Api(mock, "local")  # OSC 52 writes the clipboard; \x9b is a C1 CSI
+    api.reply(calls=[("s", "shell", {"command": "printf 'x\\033[31my'"})])
+    mock.replies.append((200, sse({"role": "assistant"},
+                                  *({"content": c} for c in "a\x1b]52;c;aGk=\x07b\x9b2Jc\r\nd"),
+                                  finish("stop"))))
+    tty = Tty(api, tmp_path, "--verbose", "--raw", "-p", "go")
+    assert tty.wait() == 0
+    assert b"x^[[31my" in tty.out  # the tool result, on stderr
+    assert b"a^[]52;c;aGk=^GbM-^[2Jc\r\nd\r\n" in tty.out  # CRLF kept as one line break
+    assert b"\x1b]52" not in tty.out and b"\x1b[31my" not in tty.out
+
+
+def test_control_characters_kept_when_piped(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("a\x1b[1mb\x9b")  # no \r: run() reads text, which turns \r\n into \n
+    p = api.run(tmp_path, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert p.stdout == "a\x1b[1mb\x9b\n"
+
+
+def test_markdown_raw_when_piped(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(MARKDOWN)
+    p = api.run(tmp_path, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert p.stdout == MARKDOWN + "\n"
+
 # ---- limits and stream framing ----
 
 def test_tool_calls_per_turn_are_capped(mock, tmp_path):

@@ -47,19 +47,28 @@ static const char *TOOLS_JSON =
     "\"required\":[\"command\"],\"additionalProperties\":false}}}]";
 
 volatile sig_atomic_t myra_interrupted;
-int myra_color;
+int myra_color, myra_escape_out, myra_escape_err;
 
 void myra_note(myra_style style, const char *fmt, ...) {
     static const char *const codes[] = {[MYRA_PLAIN] = "", [MYRA_TOOL] = "\033[36m",
                                         [MYRA_ERROR] = "\033[31m", [MYRA_WARN] = "\033[33m",
                                         [MYRA_DIM] = "\033[2m", [MYRA_BOLD] = "\033[1m"};
     int on = myra_color && style != MYRA_PLAIN;
-    va_list ap;
+    va_list ap, again;
     va_start(ap, fmt);
-    if (on) fputs(codes[style], stderr);
-    vfprintf(stderr, fmt, ap);
-    if (on) fputs("\033[0m", stderr);
+    va_copy(again, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    char *s = malloc(n < 0 ? 1 : (size_t)n + 1);
+    if (!s) { perror("malloc"); exit(1); }
+    vsnprintf(s, n < 0 ? 1 : (size_t)n + 1, fmt, again);
+    va_end(again);
     va_end(ap);
+    char *e = myra_escape_err ? myra_escape(NULL, s, 0) : NULL;
+    if (on) fputs(codes[style], stderr);
+    fputs(e ? e : s, stderr);
+    if (on) fputs("\033[0m", stderr);
+    free(e);
+    free(s);
 }
 
 const myra_provider MYRA_PROVIDERS[] = {
@@ -92,6 +101,37 @@ static void buf_add(buf *b, const char *s, size_t n) {
 #define buf_lit(b, s) buf_add((b), "" s, sizeof(s) - 1)
 
 static char *xstrdup(const char *s) { buf b = {0}; buf_add(&b, s, strlen(s)); return b.p; }
+
+/* ---- control characters ---- */
+
+static void caret(buf *b, const char *prefix, unsigned char c) {
+    char s[2] = {'^', c == 0x7f ? '?' : (char)(c + '@')};
+    buf_add(b, prefix, strlen(prefix));
+    buf_add(b, s, 2);
+}
+
+char *myra_escape(myra_esc *e, const char *s, int nl) {
+    myra_esc local = {0}, *st = e ? e : &local;
+    buf b = {0};
+    buf_add(&b, "", 0);
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        unsigned char c = *p;
+        if (st->cr) {
+            st->cr = 0;
+            if (c == '\n') { buf_lit(&b, "\n"); continue; } /* CRLF */
+            buf_lit(&b, "^M");
+        }
+        if (c == '\r' && !nl) st->cr = 1;
+        else if (c == 0xc2 && p[1] >= 0x80 && p[1] <= 0x9f) caret(&b, "M-", *++p - 0x80); /* C1 */
+        else if ((c < 0x20 && (nl || (c != '\n' && c != '\t'))) || c == 0x7f) caret(&b, "", c);
+        else buf_add(&b, (const char *)p, 1);
+    }
+    if (!e || !s) { /* nothing follows: flush what is held */
+        if (st->cr) buf_lit(&b, "^M");
+        st->cr = 0;
+    }
+    return b.p;
+}
 
 static char *fmt(const char *f, const char *a) {
     size_t n = strlen(f) + strlen(a) + 1;
@@ -534,8 +574,10 @@ static const char *denied(myra_permissions mode, int outside, const char *name,
     if (!tty)
         return mode == MYRA_AUTO ? "denied: outside the working directory; --permissions all allows it"
                                   : "denied: no terminal to confirm; --permissions auto skips asking";
+    char *shown = myra_escape(NULL, detail, 1); /* else \r and ESC could hide the real command */
     fprintf(tty, "allow %s%s: %s ? [y/N] ", name, outside ? " outside the working directory" : "",
-            detail);
+            shown);
+    free(shown);
     fflush(tty);
     char line[16] = {0};
     int ok = fgets(line, sizeof line, tty) && (line[0] == 'y' || line[0] == 'Y');
@@ -554,6 +596,8 @@ static void tool_log(myra_agent *a, const char *name, const char *detail) {
         myra_note(MYRA_TOOL, "[tool] %s %s\n", name, detail);
         return;
     }
+    char *shown = myra_escape_err ? myra_escape(NULL, detail, 0) : NULL; /* measured as shown */
+    if (shown) detail = shown;
     struct winsize ws;
     size_t width = isatty(STDERR_FILENO) && !ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) && ws.ws_col
                        ? ws.ws_col : 100;
@@ -567,6 +611,7 @@ static void tool_log(myra_agent *a, const char *name, const char *detail) {
         cut = 1;
     }
     myra_note(MYRA_TOOL, "[tool] %s %.*s%s\n", name, (int)n, detail, cut ? " ..." : "");
+    free(shown);
 }
 
 char *myra_run_tool(myra_agent *a, const char *name, cJSON *input, int *err) {
@@ -698,6 +743,197 @@ static int is_context_error(const char *body) {
 
 /* ---- streaming (server-sent events) ---- */
 
+/* ---- markdown ---- */
+
+int myra_markdown;
+
+/* Line kinds. A fence or rule is known only at the line's end. */
+enum { MD_PLAIN, MD_UNDECIDED, MD_HEADING, MD_QUOTE, MD_BULLET, MD_FENCE, MD_CLOSE, MD_HR, MD_CODE };
+/* Styles; SGR codes in md_style. */
+enum { MD_H = 1, MD_B = 2, MD_I = 4, MD_C = 8, MD_D = 16 };
+
+/* ASCII only, so the result does not depend on the locale. */
+static int md_space(char c) { return !c || c == ' ' || c == '\t' || c == '\n'; }
+static int md_word(char c) { return (c >= '0' && c <= '9') || ((c | 32) >= 'a' && (c | 32) <= 'z'); }
+
+static void md_style(myra_md *m, int style, FILE *out) {
+    if (style == m->style) return;
+    char s[24] = "\033[", *p = s + 2;
+    if (m->style) p = stpcpy(p, "0;");
+    if (style & (MD_H | MD_B)) p = stpcpy(p, "1;");
+    if (style & MD_D) p = stpcpy(p, "2;");
+    if (style & MD_I) p = stpcpy(p, "3;");
+    if (style & MD_H) p = stpcpy(p, "4;");
+    if (style & MD_C) p = stpcpy(p, "32;");
+    p[-1] = 'm';
+    fputs(s, out);
+    m->style = style;
+}
+
+static void md_put(myra_md *m, char c, int style, FILE *out) {
+    md_style(m, style, out);
+    fputc(c, out);
+    m->prev = c;
+}
+
+static void md_emit(myra_md *m, char c, FILE *out) {
+    md_put(m, c, (m->block == MD_HEADING ? MD_H : 0) | m->em | (m->code ? MD_C : 0), out);
+}
+
+/* A held run of '*' or '_' opens or closes emphasis, by CommonMark's flanking rules
+   less punctuation; else it is literal. next is 0 at the end of the line. */
+static void md_resolve(myra_md *m, char next, FILE *out) {
+    char c = m->pend;
+    int n = m->pend_n;
+    m->pend_n = 0;
+    if (c == '\\') { md_emit(m, c, out); return; }
+    int left = !md_space(next), right = !md_space(m->prev);
+    if (c == '_') { /* not inside a word: snake_case stays */
+        left = left && !md_word(m->prev);
+        right = right && !md_word(next);
+    }
+    int want = (n >= 2 ? MD_B : 0) | (n != 2 ? MD_I : 0), on = m->em & want;
+    if (n <= 3 && ((on == want && right) || (!on && left))) {
+        m->em ^= want;
+        m->prev = c;
+    } else {
+        while (n--) md_emit(m, c, out);
+    }
+}
+
+static void md_inline(myra_md *m, char c, FILE *out) {
+    if (m->pend_n) {
+        if (m->pend == '\\') {
+            m->pend_n = 0;
+            if (c > ' ' && c < 127 && !md_word(c)) { md_emit(m, c, out); return; } /* escaped */
+            md_emit(m, '\\', out);
+        } else if (c == m->pend) {
+            m->pend_n++;
+            return;
+        } else {
+            md_resolve(m, c, out);
+        }
+    }
+    if (m->code) {
+        if (c == '`') m->code = 0, m->prev = c;
+        else md_emit(m, c, out);
+    } else if (c == '\\' || c == '*' || c == '_') {
+        m->pend = c;
+        m->pend_n = 1;
+    } else if (c == '`') {
+        m->code = 1;
+        m->prev = c;
+    } else {
+        md_emit(m, c, out);
+    }
+}
+
+/* The kind of the held line start; *skip is how many bytes of marker to drop. */
+static int md_classify(const myra_md *m, int complete, size_t *skip) {
+    const char *s = m->line;
+    size_t n = m->n, i = 0, k;
+    *skip = 0;
+    while (i < n && s[i] == ' ') i++;
+    if (m->fence) { /* only a closing fence ends the block */
+        for (k = i; k < n && s[k] == m->fence; k++) {}
+        size_t e = k;
+        while (e < n && (s[e] == ' ' || s[e] == '\t')) e++;
+        if (i > 3 || e < n || (e > k && k - i < m->fence_n)) return MD_CODE;
+        return !complete ? MD_UNDECIDED : k - i >= m->fence_n ? MD_CLOSE : MD_CODE;
+    }
+    if (i == n) return complete ? MD_PLAIN : MD_UNDECIDED;
+    const char *r = s + i;
+    size_t rn = n - i;
+    char c = r[0];
+    for (k = 0; k < rn && r[k] == c; k++) {}
+    int all = k == rn; /* so far the line is one run of c */
+    if (c == '#' && i <= 3 && k <= 6) {
+        if (all) return complete ? MD_PLAIN : MD_UNDECIDED;
+        if (r[k] != ' ') return MD_PLAIN;
+        *skip = i + k + 1;
+        return MD_HEADING;
+    }
+    if ((c == '`' || c == '~') && i <= 3 && (k >= 3 || all)) {
+        if (!complete) return MD_UNDECIDED;
+        if (k < 3 || (c == '`' && memchr(r + k, '`', rn - k))) return MD_PLAIN; /* inline code */
+        return MD_FENCE;
+    }
+    if (c == '>') {
+        if (rn == 1 && !complete) return MD_UNDECIDED;
+        *skip = i + 1 + (rn > 1 && r[1] == ' ');
+        return MD_QUOTE;
+    }
+    if ((c == '-' || c == '*' || c == '_') && all) return !complete ? MD_UNDECIDED : k >= 3 ? MD_HR : MD_PLAIN;
+    if (c == '+' && all) return complete ? MD_PLAIN : MD_UNDECIDED;
+    if ((c == '-' || c == '*' || c == '+') && k == 1 && r[1] == ' ') {
+        *skip = i + 2;
+        return MD_BULLET;
+    }
+    return MD_PLAIN;
+}
+
+/* Write the held line start as kind, and render the rest of it. */
+static void md_apply(myra_md *m, int kind, size_t skip, FILE *out) {
+    size_t i = 0, j;
+    m->mid = 1;
+    m->block = kind;
+    while (i < m->n && m->line[i] == ' ') i++;
+    if (kind == MD_FENCE) { /* fence lines are not shown */
+        m->fence = m->line[i];
+        for (m->fence_n = 0; i + m->fence_n < m->n && m->line[i + m->fence_n] == m->fence; m->fence_n++) {}
+    } else if (kind == MD_CLOSE) {
+        m->fence = 0;
+    } else if (kind == MD_HR || kind == MD_CODE) {
+        for (j = 0; j < m->n; j++) md_put(m, m->line[j], kind == MD_HR ? MD_D : MD_C, out);
+    } else {
+        if (kind == MD_QUOTE) {
+            md_put(m, '|', MD_D, out);
+            md_put(m, ' ', MD_D, out);
+        } else if (kind == MD_BULLET) {
+            for (j = 0; j < i; j++) md_put(m, ' ', 0, out);
+            md_put(m, '-', 0, out);
+            md_put(m, ' ', 0, out);
+        }
+        m->prev = 0;
+        for (j = skip; j < m->n; j++) md_inline(m, m->line[j], out);
+    }
+    m->n = 0;
+}
+
+static void md_eol(myra_md *m, FILE *out) {
+    if (!m->mid) {
+        size_t skip;
+        int kind = md_classify(m, 1, &skip);
+        md_apply(m, kind, skip, out);
+    }
+    if (m->pend_n) md_resolve(m, 0, out);
+    md_style(m, 0, out);
+    if (m->block != MD_FENCE && m->block != MD_CLOSE) fputc('\n', out);
+    m->mid = m->block = m->em = m->code = 0;
+    m->prev = 0;
+}
+
+void myra_md_feed(myra_md *m, const char *s, FILE *out) {
+    for (; *s; s++) {
+        if (*s == '\n') {
+            md_eol(m, out);
+        } else if (m->mid) {
+            if (m->block == MD_CODE) md_put(m, *s, MD_C, out);
+            else md_inline(m, *s, out);
+        } else {
+            size_t skip = 0;
+            m->line[m->n++] = *s;
+            int kind = m->n < sizeof m->line ? md_classify(m, 0, &skip) : m->fence ? MD_CODE : MD_PLAIN;
+            if (kind != MD_UNDECIDED) md_apply(m, kind, skip, out);
+        }
+    }
+}
+
+void myra_md_end(myra_md *m, FILE *out) {
+    if (m->mid || m->n) myra_md_feed(m, "\n", out);
+    *m = (myra_md){0};
+}
+
 typedef struct {
     char key[24];
     buf val;
@@ -718,6 +954,8 @@ typedef struct {
     int events, printed, done; /* done: the server sent [DONE] */
     size_t received;
     int oversize; /* received passed MYRA_MAX_RESPONSE; the transfer was aborted */
+    myra_esc esc;
+    myra_md md;
 } stream;
 
 /* Count len more bytes; 0 once over the cap, which curl takes as an abort. */
@@ -811,6 +1049,15 @@ static void merge_details(stream *st, cJSON *deltas) {
     }
 }
 
+/* Write reply text to stdout, escaped and rendered as set; s NULL flushes what is held. */
+static void show(myra_esc *e, myra_md *m, const char *s) {
+    char *v = myra_escape_out ? myra_escape(e, s, 0) : NULL;
+    const char *text = v ? v : s ? s : "";
+    if (myra_markdown) myra_md_feed(m, text, stdout);
+    else fputs(text, stdout);
+    free(v);
+}
+
 static void stream_event(stream *st, const char *data) {
     cJSON *chunk = cJSON_Parse(data), *f;
     if (!chunk) return;
@@ -830,7 +1077,7 @@ static void stream_event(stream *st, const char *data) {
     if (finish) snprintf(st->finish, sizeof st->finish, "%s", finish);
     cJSON_ArrayForEach(f, cJSON_GetObjectItem(choice, "delta")) {
         if (!strcmp(f->string, "content") && cJSON_IsString(f) && *f->valuestring) {
-            fputs(f->valuestring, stdout);
+            show(&st->esc, &st->md, f->valuestring);
             fflush(stdout);
             st->printed = 1;
             buf_add(&st->content, f->valuestring, strlen(f->valuestring));
@@ -950,7 +1197,12 @@ static cJSON *request(myra_agent *a, const char *path, const char *body, int str
         long status = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
         curl_easy_cleanup(c);
-        if (st.printed) putchar('\n'), fflush(stdout); /* end the streamed line */
+        if (st.printed) { /* end the streamed line */
+            show(&st.esc, &st.md, NULL);
+            if (myra_markdown) myra_md_end(&st.md, stdout);
+            else putchar('\n');
+            fflush(stdout);
+        }
         a->streamed = st.printed;
         const char *out = st.raw.p ? st.raw.p : "";
         /* No finish_reason and no [DONE]: the stream was cut off, so the reply is partial. */
@@ -1054,7 +1306,11 @@ void myra_free_model_ids(char **ids) {
 void myra_list_models(myra_agent *a, const char *filter) {
     char **ids = myra_model_ids(a);
     for (char **p = ids; p && *p; p++)
-        if (contains_ci(*p, filter)) printf("%s %s\n", strcmp(*p, a->model) ? " " : "*", *p);
+        if (contains_ci(*p, filter)) {
+            char *id = myra_escape_out ? myra_escape(NULL, *p, 1) : NULL; /* from the server */
+            printf("%s %s\n", strcmp(*p, a->model) ? " " : "*", id ? id : *p);
+            free(id);
+        }
     fflush(stdout);
     myra_free_model_ids(ids);
 }
@@ -1063,7 +1319,12 @@ void myra_list_models(myra_agent *a, const char *filter) {
 
 static void print_text(const char *s) {
     if (!s || !*s) return;
-    printf("%s\n", s);
+    myra_esc e = {0};
+    myra_md m = {0};
+    show(&e, &m, s);
+    show(&e, &m, NULL);
+    if (myra_markdown) myra_md_end(&m, stdout);
+    else putchar('\n');
     fflush(stdout);
 }
 
@@ -1283,6 +1544,15 @@ void myra_free(myra_agent *a) {
     cJSON_Delete(a->tools);
     free(a->model);
     memset(a, 0, sizeof *a);
+}
+
+const char *myra_last_reply(myra_agent *a) {
+    for (int i = cJSON_GetArraySize(a->messages) - 1; i > 0; i--) {
+        cJSON *m = cJSON_GetArrayItem(a->messages, i);
+        const char *text = get_str(m, "content"), *role = get_str(m, "role");
+        if (role && !strcmp(role, "assistant") && text && *text) return text;
+    }
+    return NULL;
 }
 
 void myra_clear(myra_agent *a) {

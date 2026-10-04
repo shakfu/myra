@@ -4,21 +4,21 @@
 
 ## High
 
-- Check whether context-full recovery breaks on Fable 5.1 and Opus 5.5 via OpenRouter. `drop_old_tool_output` edits earlier tool results; those models reject edited history for accounts created on or after 2026-08-31 if thinking blocks are forwarded. Unverified.
+- Confirm on OpenRouter that context-full recovery works on Fable 5.1 and Opus 5.5. Recovery now strips `reasoning_details` when it blanks tool output, since Anthropic rejects thinking blocks after an edited turn for accounts created on or after 2026-08-31. Unverified: whether OpenRouter forwards the signatures, and whose account the check applies to (OpenRouter's, or a BYOK key's). Test: force a context-full retry mid tool loop with each model.
 
 ## Medium
 
 - Verify the `reasoning_details` round-trip on OpenRouter. Run a multi-step tool task with a GPT-5.x and a Claude model; confirm replayed reasoning is accepted and used. A failure is a trigger in `docs/dev/native-providers.md`.
 
-- `test_terminal_line_editing_history_and_ctrl_c` flakes against `scripts/agent.py` under CPU load. The Ctrl-C after `abc` produces no output for 10 s. Failure counts on 2026-09-24, Python 3.12.3, 40 `yes` processes on 32 cores:
+- Run the suite and the load probe on Linux. Three fixes were verified on macOS (libedit, 8 cores) only, and each depends on terminal or signal behaviour that may differ:
+  - `agent.py` Ctrl-C: SIGALRM must break `select()` with `EINTR` even with `SA_RESTART` set. signal(7) says Linux never restarts `select()`.
+  - `myra` type-ahead: `poll()` must report only finished lines in canonical mode, and `TCSADRAIN` must keep an unfinished line readable once `ICANON` is off. Both are from memory.
+  - The original Ctrl-C flake was seen on Linux with GNU readline (Python 3.12.3, 32 cores, 40 `yes` processes). Rerun under that load.
 
-  | Agent | Loaded | Idle |
-  |-|-|-|
-  | `agent.py` | 10/40 | 0/60 |
-  | `myra` | 0/40 | not run |
-
-  Hypothesis: CPython's `readline` loses the SIGINT. `readline_until_enter_or_signal` (`Modules/readline.c`) blocks in `select()` with no timeout unless `PyOS_InputHook` is set. It checks signals only when `select()` fails with `EINTR`. A SIGINT that arrives while `rl_callback_read_char` runs sets the flag, but the next `select()` still blocks until a key arrives. If so, a user sees Ctrl-C take effect only on the next keypress. Unverified; the `readline.c` behaviour is from memory.
-
-  Test: under the same load, send `\x03`. If nothing arrives within 3 s, send any key and expect the interrupt's `\r\n`. A first attempt timed out in the harness for an unknown reason, so it confirmed nothing. If the hypothesis holds, `signal.set_wakeup_fd` will not help, because `readline` does not `select()` on that fd. A candidate fix sets `PyOS_InputHook` with `ctypes`, which is stdlib. With a hook set, `select()` wakes every 0.1 s. Check first that it does not break the libedit build on macOS.
+  The probe: with `Tty` from `tests/test_agent.py`, in one agent, repeat 300 times: type `q`, wait for its echo, send `\x03`, and count it lost if `\r\n` does not follow within 1 s. On macOS it lost 3 of 900 before the fix and 0 of 1500 after.
 
 ## Low
+
+- Arrow keys and other escape sequences typed during a turn reach the model as raw bytes in `myra`; `agent.py`'s libedit acts on them. A fix would hand a type-ahead line that contains ESC to linenoise instead of submitting it. Rare; wait for a report.
+
+- An opt-in `make test-live`, skipped without `OPENROUTER_API_KEY`, would turn the two OpenRouter checks above into regression tests. It costs tokens per run.

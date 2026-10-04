@@ -886,6 +886,26 @@ def test_context_full_drops_old_tool_output_and_retries(mock, tmp_path, body):
     assert msgs[3]["tool_call_id"] == "c1"  # the call/result pairing is kept
 
 
+def test_context_full_strips_reasoning_details(mock, tmp_path):
+    # A signed thinking block covers every message before it; blanking a tool result
+    # invalidates the later ones, and Anthropic rejects the edited history.
+    (tmp_path / "f").write_text("data")
+    api = Api(mock, "local")
+    details = [{"type": "reasoning.encrypted", "data": "xyz", "index": 0}]
+    api.reply(calls=[("c1", "read", {"path": "f"})])
+    api.reply("ok")
+    for _, r in mock.replies:
+        r["choices"][0]["message"]["reasoning_details"] = details
+    mock.replies.append((400, CONTEXT_ERRORS[0]))
+    api.reply("fine")
+    p = api.run(tmp_path, stdin="one\ntwo\n")
+    assert p.returncode == 0, p.stderr
+    assert mock.requests[2]["body"]["messages"][4]["reasoning_details"] == details
+    msgs = mock.requests[3]["body"]["messages"]
+    assert msgs[3]["content"] == "[output dropped to fit the context]"
+    assert not any("reasoning_details" in m for m in msgs)
+
+
 def test_context_full_keeps_newest_batch_then_hints(mock, tmp_path):
     (tmp_path / "f").write_text("data")
     api = Api(mock, "local")
@@ -1118,6 +1138,31 @@ def test_terminal_line_editing_history_and_ctrl_c(mock, tmp_path):
     assert [r["body"]["messages"][-1]["content"] for r in mock.requests] == ["hello", "hello", "café"]
     hist = tmp_path / ".state/myra/history"
     assert hist.stat().st_mode & 0o777 == 0o600 and "hello" in hist.read_text(errors="replace")
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_terminal_keeps_input_typed_during_a_turn(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[("s", "shell", {"command": "touch started; sleep 1"})])
+    api.reply("one")
+    api.reply("two")
+    api.reply("three")
+    tty = Tty(api, tmp_path)
+    tty.expect(b"> ")
+    tty.type(b"first\r")
+    tty.expect(b"[tool] shell")  # leaving raw mode waits for the output to be read
+    wait_for(lambda: (tmp_path / "started").exists())
+    tty.type(b"second\rpar")  # a whole line, then the start of the next
+    tty.expect(b"two")
+    tty.expect(b"> ")
+    tty.type(b"tial\r")
+    tty.expect(b"three")
+    tty.expect(b"> ")
+    tty.type(b"\x04")
+    assert tty.wait() == 0
+    users = [r["body"]["messages"][-1]["content"] for r in mock.requests
+             if r["body"]["messages"][-1]["role"] == "user"]
+    assert users == ["first", "second", "partial"]
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -1430,6 +1475,7 @@ def test_raw_command_reprints_the_last_reply(mock, tmp_path):
     tty.expect(b"> ")
     tty.type(b"/raw\r")
     tty.expect(b"no reply yet")
+    tty.expect(b"> ")  # linenoise discards input typed before it re-enters raw mode
     tty.type(b"go\r")
     tty.expect(RENDERED)
     tty.expect(b"> ")

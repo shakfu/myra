@@ -552,8 +552,8 @@ static int enable_raw_mode(linenoise_context_t *ctx, int fd) {
      * We want read to return every single byte, without timeout. */
     raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0; /* 1 byte, no timer */
 
-    /* put terminal in raw mode after flushing */
-    if (tcsetattr(fd,TCSAFLUSH,&raw) < 0) goto fatal;
+    /* put terminal in raw mode; myra: TCSADRAIN, not upstream's TCSAFLUSH, keeps type-ahead */
+    if (tcsetattr(fd,TCSADRAIN,&raw) < 0) goto fatal;
     ctx->rawmode = 1;
     ctx->raw_fd = fd;
     raw_ctx = ctx;
@@ -570,8 +570,8 @@ static void disable_raw_mode(linenoise_context_t *ctx) {
         ctx->rawmode = 0;
         return;
     }
-    /* Don't even check the return value as it's too late. */
-    if (ctx->rawmode && tcsetattr(ctx->raw_fd,TCSAFLUSH,&ctx->orig_termios) != -1)
+    /* Don't even check the return value as it's too late. myra: TCSADRAIN, as above. */
+    if (ctx->rawmode && tcsetattr(ctx->raw_fd,TCSADRAIN,&ctx->orig_termios) != -1)
         ctx->rawmode = 0;
     if (raw_ctx == ctx) raw_ctx = NULL;
 }

@@ -16,6 +16,14 @@
 
 - In `scripts/agent.py`, `--permissions ask`, and `auto` outside the working directory, refused every call as "no terminal to confirm", even on a terminal. Text mode `open("/dev/tty", "r+")` needs a seekable file and raises `io.UnsupportedOperation`, an `OSError` subclass, which the no-terminal branch caught. The e2e suite checked only the no-terminal case.
 
+- In `scripts/agent.py`, Ctrl-C at the prompt could take effect only at the next Enter, and then drop the line typed after it. CPython's `input()` checks signals only when its `select()` fails with `EINTR`. A SIGINT that arrived while it handled a key set the flag, and `select()` then blocked with no timeout. A SIGALRM every 0.1 s now breaks that `select()`. `PyOS_InputHook` via `ctypes` was the other candidate. It shortens the `select()` timeout, but a timeout never reaches the signal check. Under 24 busy processes on 8 cores, 3 of 900 Ctrl-Cs were lost before the fix and 0 of 1500 after.
+
+- Context-full recovery also drops replayed `reasoning_details`. A signed thinking block covers every message before it, so blanking an old tool result invalidated the later blocks; Fable 5.1 and Opus 5.5 reject such history for accounts created on or after 2026-08-31. Stripping only the invalidated blocks would keep at most the first one, so all are stripped.
+
+- `myra` kept nothing typed while a turn ran: linenoise flushed pending input on entering raw mode. A finished line is now submitted at the next prompt and an unfinished one starts the next line, as in `scripts/agent.py`. The vendored linenoise uses `TCSADRAIN` instead of `TCSAFLUSH` (`vendor/linenoise/src/linenoise.c`, two lines, marked `myra:`). A finished line is read before raw mode, because linenoise would take its newline for a pasted one. Escape sequences typed during a turn, such as arrow keys, reach the line unprocessed.
+
+- A `shell` command ran with the terminal as stdin if `/dev/null` could not be opened. It now runs with stdin closed.
+
 ## 0.2.0
 
 ### Changed

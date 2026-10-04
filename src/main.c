@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +62,25 @@ static void on_sigint(int sig) {
     myra_interrupted = 1;
 }
 
+/* A line typed during the last turn, read into *line; its length, 0 at Ctrl-D, -1 if
+   none. It waits in the terminal's line buffer, and in raw mode linenoise would take
+   its newline for a pasted one. poll() reports only complete lines, and read() returns one. */
+static ssize_t typed_ahead(char **line, size_t *cap) {
+    struct pollfd p = {.fd = STDIN_FILENO, .events = POLLIN};
+    char buf[4096]; /* at least a terminal's longest line: 1024 on macOS, 4096 on Linux */
+    ssize_t n;
+    if (poll(&p, 1, 0) != 1 || (n = read(STDIN_FILENO, buf, sizeof buf - 1)) < 0) return -1;
+    if (*cap < (size_t)n + 1) {
+        char *grown = realloc(*line, (size_t)n + 1);
+        if (!grown) { perror("realloc"); exit(1); }
+        *line = grown;
+        *cap = (size_t)n + 1;
+    }
+    memcpy(*line, buf, (size_t)n);
+    (*line)[n] = 0;
+    return n;
+}
+
 /* The next input line in *line, trailing whitespace trimmed; NULL at EOF, or at
    Ctrl-C with *interrupted set. ctx is NULL when input is piped: no prompt, no editing.
    linenoise owns the returned string, but its default allocator is malloc, so *line
@@ -68,7 +88,12 @@ static void on_sigint(int sig) {
 static char *next_line(linenoise_context_t *ctx, char **line, size_t *cap, int *interrupted) {
     ssize_t n;
     *interrupted = 0;
-    if (ctx) {
+    if (ctx && (n = typed_ahead(line, cap)) >= 0) {
+        if (!n) return NULL; /* Ctrl-D on an empty line */
+        while (n && strchr(" \t\r\n", (*line)[n - 1])) (*line)[--n] = 0;
+        myra_note(MYRA_PLAIN, "> %s\n", *line);
+        if (**line) linenoise_history_add(ctx, *line);
+    } else if (ctx) {
         /* The editing loop is ours, so Ctrl-C needs no signal: linenoise clears ISIG
            and reports the keystroke. The prompt goes to stderr, like the other chatter. */
         linenoise_state_t st;

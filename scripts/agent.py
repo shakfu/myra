@@ -1188,6 +1188,9 @@ class Agent:
             if m.get("role") == "tool" and isinstance(m.get("content"), str) and m["content"] != dropped:
                 m["content"] = dropped
                 count += 1
+        if count:  # the edit invalidates later signed reasoning, which Anthropic then rejects
+            for m in self.messages:
+                m.pop("reasoning_details", None)
         return count
 
     def ask(self, text: str) -> int:
@@ -1292,6 +1295,10 @@ class Completer:
 def setup_readline(agent: Agent, hist: Path | None) -> None:
     readline.set_completer(Completer(agent))
     readline.set_completer_delims(" \t")
+    # input() checks signals only when select() fails with EINTR, so a SIGINT that lands
+    # while it handles a key waits for Enter. read_line's SIGALRM ticks break select().
+    signal.signal(signal.SIGALRM, lambda sig, frame: None)
+    signal.siginterrupt(signal.SIGALRM, False)  # SA_RESTART: only select() sees EINTR
     if "libedit" in (readline.__doc__ or ""):
         readline.parse_and_bind("bind ^I rl_complete")
     else:
@@ -1319,10 +1326,13 @@ def read_line(editing: bool, tty: bool) -> str | None:
     """The next input line, trailing whitespace trimmed; None at EOF. Ctrl-C raises."""
     with interruptible():
         if editing:
+            signal.setitimer(signal.ITIMER_REAL, 0.1, 0.1)
             try:
                 line = input("> ")
             except EOFError:
                 return None
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
         else:
             if tty:
                 note("> ")

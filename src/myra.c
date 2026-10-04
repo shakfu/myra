@@ -289,7 +289,10 @@ static int slurp(const char *path, buf *b) {
     if (!f) return -1;
     char chunk[65536];
     size_t n;
-    while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) buf_add(b, chunk, n);
+    do { /* a short read means EOF or an error; reading on is undefined after an error */
+        n = fread(chunk, 1, sizeof chunk, f);
+        buf_add(b, chunk, n);
+    } while (n == sizeof chunk);
     int err = ferror(f);
     fclose(f);
     if (!b->p) buf_lit(b, "");
@@ -483,12 +486,12 @@ static char *tool_shell(const char *cmd, int timeout, size_t cap, int *err) {
     if (pid == 0) {
         setpgid(0, 0);
         int nul = open("/dev/null", O_RDONLY);
-        dup2(nul, 0);
+        if (nul < 0 || dup2(nul, 0) < 0) close(0); /* never the terminal: it would read keystrokes */
         dup2(fds[1], 1);
         dup2(fds[1], 2);
         close(fds[0]);
         close(fds[1]);
-        close(nul);
+        if (nul >= 0) close(nul);
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
@@ -1424,6 +1427,9 @@ static int drop_old_tool_output(myra_agent *a) {
         cJSON_ReplaceItemInObject(m, "content", cJSON_CreateString(dropped));
         count++;
     }
+    if (count) /* the edit invalidates later signed reasoning, which Anthropic then rejects */
+        for (int i = 0; i < n; i++)
+            cJSON_DeleteItemFromObject(cJSON_GetArrayItem(a->messages, i), "reasoning_details");
     return count;
 }
 

@@ -118,10 +118,7 @@ REPL commands:
 | `/help`            | list these commands                                     |
 | `/exit`            | quit; so does Ctrl-D                                    |
 
-On a terminal, the REPL has line editing, history and UTF-8 input (linenoise, vendored). Tab completes a
-REPL command at the start of the line, a model id after `/model `, and otherwise a path in the working
-directory; repeated tabs cycle the matches. Completing a model id costs one `/models` request, made once
-per session and only if you ask for it. Piped input is read line by line, without a prompt.
+On a terminal, the REPL has line editing, history and UTF-8 input (linenoise, vendored). Tab completes a REPL command at the start of the line, a model id after `/model `, and otherwise a path in the working directory; repeated tabs cycle the matches. Completing a model id costs one `/models` request, made once per session and only if you ask for it. Piped input is read line by line, without a prompt.
 
 `--permissions` sets when `write`, `edit` and `shell` run without asking:
 

@@ -1239,8 +1239,10 @@ static cJSON *request(myra_agent *a, const char *path, const char *body, int str
                         !st.printed && !a->context_full; /* retrying cannot shrink the context */
         const char *again = retryable && attempt < RETRIES ? ", retrying" : "";
         if (st.error || truncated) myra_note(MYRA_ERROR, "stream error%s: %s\n", again, out);
-        else myra_note(MYRA_ERROR, "api error (%s, http %ld)%s: %s\n", curl_easy_strerror(rc),
-                        status, again, out);
+        else if (rc != CURLE_OK)
+            myra_note(MYRA_ERROR, "api error (%s, http %ld)%s: %s\n", curl_easy_strerror(rc),
+                       status, again, out);
+        else myra_note(MYRA_ERROR, "api error (http %ld)%s: %s\n", status, again, out);
         free(err);
         stream_free(&st);
         if (!retryable) break;

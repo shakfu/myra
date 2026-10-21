@@ -879,6 +879,7 @@ def test_context_full_drops_old_tool_output_and_retries(mock, tmp_path, body):
     p = api.run(tmp_path, stdin="one\ntwo\n")
     assert p.returncode == 0, p.stderr
     assert p.stdout == "ok\nfine\n"
+    assert "api error (http 400): " in p.stderr  # no curl text when the transfer succeeded
     assert "context full: dropped 1 old tool output, retrying" in p.stderr
     msgs = mock.requests[3]["body"]["messages"]
     assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool", "assistant", "user"]

@@ -14,6 +14,8 @@
 
 ### Fixed
 
+- An HTTP error read `api error (No error, http 400)`: the curl message was printed even when the transfer succeeded. It now reads `api error (http 400)`, as in `scripts/agent.py`.
+
 - In `scripts/agent.py`, `--permissions ask`, and `auto` outside the working directory, refused every call as "no terminal to confirm", even on a terminal. Text mode `open("/dev/tty", "r+")` needs a seekable file and raises `io.UnsupportedOperation`, an `OSError` subclass, which the no-terminal branch caught. The e2e suite checked only the no-terminal case.
 
 - In `scripts/agent.py`, Ctrl-C at the prompt could take effect only at the next Enter, and then drop the line typed after it. CPython's `input()` checks signals only when its `select()` fails with `EINTR`. A SIGINT that arrived while it handled a key set the flag, and `select()` then blocked with no timeout. A SIGALRM every 0.1 s now breaks that `select()`. `PyOS_InputHook` via `ctypes` was the other candidate. It shortens the `select()` timeout, but a timeout never reaches the signal check. Under 24 busy processes on 8 cores, 3 of 900 Ctrl-Cs were lost before the fix and 0 of 1500 after.

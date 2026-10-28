@@ -52,15 +52,15 @@ if(MYRA_WERROR)
   list(APPEND WARNINGS -Werror) # our targets only: vendored code keeps its warnings
 endif()
 
-add_library(myralib STATIC src/myra.c)
+add_library(myralib STATIC src/myra.c src/mcp.c)
 target_include_directories(myralib PUBLIC src)
-target_compile_definitions(myralib PUBLIC _DEFAULT_SOURCE _DARWIN_C_SOURCE)
+target_compile_definitions(myralib PUBLIC _DEFAULT_SOURCE _DARWIN_C_SOURCE
+                           MYRA_VERSION="${PROJECT_VERSION}")
 target_compile_options(myralib PRIVATE ${WARNINGS})
 target_link_libraries(myralib PUBLIC cjson CURL::libcurl)
 
 add_executable(myra src/main.c src/acp.c)
 target_compile_options(myra PRIVATE ${WARNINGS})
-target_compile_definitions(myra PRIVATE MYRA_VERSION="${PROJECT_VERSION}")
 target_link_libraries(myra PRIVATE myralib linenoise)
 
 install(TARGETS myra RUNTIME DESTINATION bin)

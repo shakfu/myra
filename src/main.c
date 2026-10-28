@@ -1,6 +1,7 @@
 /* main.c - the agent CLI: options, provider choice, headless mode and the REPL. */
 #include "myra.h"
 #include "acp.h"
+#include "mcp.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -44,6 +45,9 @@ static int usage(const char *argv0, int rc) {
             "  -m  model id; remembered per provider\n"
             "  -p  run one prompt headless and exit (default: REPL)\n"
             "  --acp       serve the Agent Client Protocol on stdin and stdout, for an editor\n"
+            "  --mcp-config FILE\n"
+            "      start the stdio MCP servers in FILE, {\"mcpServers\": {...}}; their tools\n"
+            "      are offered as mcp__<server>__<tool>\n"
             "  -V  print the version\n"
             "  -h, --help  print this help\n"
             "  --verbose   show each tool call's full arguments and result, not one line\n"
@@ -266,10 +270,12 @@ int main(int argc, char **argv) {
                                              {"no-color", no_argument, NULL, 'C'},
                                              {"raw", no_argument, NULL, 'R'},
                                              {"acp", no_argument, NULL, 'A'},
+                                             {"mcp-config", required_argument, NULL, 'M'},
                                              {"help", no_argument, NULL, 'h'},
                                              {NULL, 0, NULL, 0}};
     myra_permissions perms = MYRA_AUTO;
     int opt, verbose = 0, color = 1, raw = 0, acp = 0;
+    const char *mcp_config = NULL;
     const char *no_color = getenv("NO_COLOR"); /* https://no-color.org */
     if (no_color && *no_color) color = 0, raw = 1;
     while ((opt = getopt_long(argc, argv, "p:P:m:hV", longopts, NULL)) != -1) {
@@ -279,6 +285,7 @@ int main(int argc, char **argv) {
         }
         if (opt == 'v') verbose = 1;
         else if (opt == 'A') acp = 1;
+        else if (opt == 'M') mcp_config = optarg;
         else if (opt == 'C') color = 0;
         else if (opt == 'R') raw = 1;
         else if (opt == 'W') {
@@ -325,8 +332,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    cJSON *servers = NULL;
+    if (mcp_config && !(servers = myra_mcp_load(mcp_config))) return 2;
     myra_agent a;
-    if (myra_init(&a, p, model, perms) < 0) return 1;
+    if (myra_init(&a, p, model, perms) < 0) { cJSON_Delete(servers); return 1; }
     a.verbose = verbose;
     a.save_provider = pname != NULL;
     /* No SA_RESTART: blocking reads return EINTR, so Ctrl-C takes effect at once. */
@@ -337,14 +346,20 @@ int main(int argc, char **argv) {
 
     int rc = 0;
     if (acp) {
-        rc = myra_acp(&a);
-    } else if (prompt) {
-        rc = myra_ask(&a, prompt) < 0;
-        if (myra_interrupted) rc = 130; /* 128 + SIGINT, as a shell would report */
+        rc = myra_acp(&a, servers); /* started with each session, in its cwd */
     } else {
-        repl(&a);
-        myra_report_session(&a);
+        myra_mcp_start_list(&a, servers);
+        if (myra_interrupted) {
+            rc = 130; /* Ctrl-C while servers start: exit, as at any other point of a run */
+        } else if (prompt) {
+            rc = myra_ask(&a, prompt) < 0;
+            if (myra_interrupted) rc = 130; /* 128 + SIGINT, as a shell would report */
+        } else {
+            repl(&a);
+            myra_report_session(&a);
+        }
     }
     myra_free(&a);
+    cJSON_Delete(servers);
     return rc;
 }

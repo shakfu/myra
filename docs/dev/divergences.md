@@ -28,6 +28,8 @@ These exist in the code. Nobody has chosen them.
 | `read` of a pipe or device longer than the cap | NUL anywhere in the bytes read makes it `is binary` | only NUL in the kept head and tail does |
 | Network error line | `api error (<curl error>, http 0)[, retrying]: <body>` | `api error (<reason>)[, retrying]` |
 | `shell` cannot start | `pipe failed: ...` or `fork failed: ...` | `cannot run /bin/sh: ...` |
+| MCP server command cannot run | the child reports `cannot run <command>`; then `initialize: the server has exited` | `cannot run <command>: <reason>` only |
+| MCP result with only `structuredContent` | printed by cJSON: numbers in `%g`-style form | printed by `json.dumps` |
 | One-line `[tool]` log | cut to the terminal width in bytes, on a character boundary | cut in code points |
 | Path completion order | `readdir` order | sorted |
 | Markdown line start held before it counts as plain | 256 bytes | 256 code points |

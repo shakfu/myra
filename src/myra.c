@@ -1,5 +1,7 @@
 /* myra.c - myralib: providers, the four tools, and the chat-completions tool loop. */
 #include "myra.h"
+#include "mcp.h"
+#include "util.h"
 
 #include <curl/curl.h>
 #include <errno.h>
@@ -81,27 +83,6 @@ const myra_provider MYRA_PROVIDERS[] = {
      16 * 1024},
 };
 const size_t MYRA_NPROVIDERS = sizeof MYRA_PROVIDERS / sizeof *MYRA_PROVIDERS;
-
-/* ---- growable buffer ---- */
-
-typedef struct { char *p; size_t n, cap; } buf;
-
-static void buf_add(buf *b, const char *s, size_t n) {
-    if (n >= SIZE_MAX / 2 - b->n) { fputs("buf_add: size overflow\n", stderr); exit(1); }
-    if (b->n + n + 1 > b->cap) {
-        b->cap = (b->n + n + 1) * 2;
-        b->p = realloc(b->p, b->cap);
-        if (!b->p) { perror("realloc"); exit(1); }
-    }
-    memcpy(b->p + b->n, s, n);
-    b->n += n;
-    b->p[b->n] = 0;
-}
-
-/* Appends a string literal; "" rejects a pointer, whose sizeof is not its length. */
-#define buf_lit(b, s) buf_add((b), "" s, sizeof(s) - 1)
-
-static char *xstrdup(const char *s) { buf b = {0}; buf_add(&b, s, strlen(s)); return b.p; }
 
 /* ---- control characters ---- */
 
@@ -309,31 +290,6 @@ static char *sink_take(sink *s) {
     return out.p ? out.p : xstrdup("");
 }
 
-static int slurp(const char *path, buf *b) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    char chunk[65536];
-    size_t n;
-    do { /* a short read means EOF or an error; reading on is undefined after an error */
-        n = fread(chunk, 1, sizeof chunk, f);
-        buf_add(b, chunk, n);
-    } while (n == sizeof chunk);
-    int err = ferror(f);
-    fclose(f);
-    if (!b->p) buf_lit(b, "");
-    return err ? -1 : 0;
-}
-
-static int write_all(int fd, const char *s, size_t n) {
-    while (n) {
-        ssize_t k = write(fd, s, n);
-        if (k < 0 && errno == EINTR) continue;
-        if (k <= 0) return -1;
-        s += k, n -= (size_t)k;
-    }
-    return 0;
-}
-
 /* A symlink whose target does not exist. Writing would replace the link itself, since
    realpath fails on it and the path then looks like a new file. */
 static int dangling_symlink(const char *path) {
@@ -494,12 +450,6 @@ static char *tool_edit(const myra_io *io, const char *path, const char *old, con
     return fmt("edited %s", path);
 }
 
-static double now(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec / 1e9;
-}
-
 static void reap(pid_t pid, int *st) {
     while (waitpid(pid, st, 0) < 0 && errno == EINTR) {}
 }
@@ -610,12 +560,17 @@ static int outside_cwd(const char *path) {
     return strncmp(real, cwd, n) || (real[n] && real[n] != '/');
 }
 
+/* Whether a mutating call must be confirmed before it runs. */
+static int asks(myra_permissions mode, int outside) {
+    return mode == MYRA_ASK || (mode == MYRA_AUTO && outside);
+}
+
 /* Ask on the controlling terminal so it works in headless mode and the REPL alike.
    Returns NULL if allowed, else why not, for the model to relay. */
 static const char *denied(myra_agent *a, int outside, const char *name, const char *detail) {
     myra_permissions mode = a->permissions;
     if (mode == MYRA_READ_ONLY) return "denied: the agent runs with --permissions read-only";
-    if (mode == MYRA_ALL || (mode == MYRA_AUTO && !outside)) return NULL;
+    if (!asks(mode, outside)) return NULL;
     if (a->io.allow) return a->io.allow(a->io.ud, name, detail, outside) ? NULL : "denied by user";
     FILE *tty = fopen("/dev/tty", "r+");
     if (!tty)
@@ -662,26 +617,32 @@ static void tool_log(myra_agent *a, const char *name, const char *detail) {
 }
 
 /* Log the call, and tell the front end. */
-static void tool_start(myra_agent *a, const char *name, const char *detail) {
+static void tool_start(myra_agent *a, const char *name, const char *detail, int outside) {
     tool_log(a, name, detail);
-    if (a->io.tool) a->io.tool(a->io.ud, name, detail);
+    a->announced = 1;
+    int pending = strcmp(name, "read") && asks(a->permissions, outside);
+    if (a->io.tool) a->io.tool(a->io.ud, name, detail, pending);
 }
 
-/* read through the front end, capped like a local read. NULL if it refused: the
-   path lies outside what it serves, and the disk is read instead. */
-static char *served_read(myra_agent *a, const char *path, int *err) {
-    char *abs = absolute(path), *why = NULL, *text = a->io.read(a->io.ud, abs, &why);
-    free(abs);
-    free(why);
-    if (!text) return NULL;
+/* text, freed, cut to the tool result cap as a local read would be. */
+static char *capped(myra_agent *a, char *text) {
     sink s;
     sink_init(&s, a->max_output);
     sink_add(&s, text, strlen(text));
     free(text);
     char *out = sink_take(&s);
     sink_free(&s);
-    *err = 0;
     return out;
+}
+
+/* read through the front end, capped like a local read. NULL if it refused, with
+   *why its reason, malloc'd. */
+static char *served_read(myra_agent *a, const char *path, int *err, char **why) {
+    char *abs = absolute(path), *text = a->io.read(a->io.ud, abs, why);
+    free(abs);
+    if (!text) return NULL;
+    *err = 0;
+    return capped(a, text);
 }
 
 char *myra_run_tool(myra_agent *a, const char *name, cJSON *input, int *err) {
@@ -692,15 +653,20 @@ char *myra_run_tool(myra_agent *a, const char *name, cJSON *input, int *err) {
     *err = 1;
     int served = a->io.read && a->io.write; /* the front end owns the files */
     if (!strcmp(name, "read") && path) {
-        tool_start(a, "read", path);
-        char *out = a->io.read ? served_read(a, path, err) : NULL;
+        tool_start(a, "read", path, 0);
+        char *why_not = NULL, *out = a->io.read ? served_read(a, path, err, &why_not) : NULL;
         if (out) return out;
+        /* Inside the cwd a refusal likely means a binary file, which a disk read reports
+           better. Outside, only --permissions all reads disk, as its shell could. */
+        if (a->io.read && outside_cwd(path) && a->permissions != MYRA_ALL) return with_why(fmt("cannot read %s", path), why_not);
+        free(why_not);
         *err = 0;
         return tool_read(path, a->max_output, err);
     }
     if (!strcmp(name, "write") && path && content) {
-        tool_start(a, "write", path);
-        if ((why = denied(a, outside_cwd(path), "write", path))) return xstrdup(why);
+        int outside = outside_cwd(path);
+        tool_start(a, "write", path, outside);
+        if ((why = denied(a, outside, "write", path))) return xstrdup(why);
         if (served) {
             char *abs = absolute(path), *failed = a->io.write(a->io.ud, abs, content);
             free(abs);
@@ -712,12 +678,13 @@ char *myra_run_tool(myra_agent *a, const char *name, cJSON *input, int *err) {
         return tool_write(path, content, err);
     }
     if (!strcmp(name, "edit") && path && old && new) {
-        tool_start(a, "edit", path);
-        if ((why = denied(a, outside_cwd(path), "edit", path))) return xstrdup(why);
+        int outside = outside_cwd(path);
+        tool_start(a, "edit", path, outside);
+        if ((why = denied(a, outside, "edit", path))) return xstrdup(why);
         return tool_edit(served ? &a->io : NULL, path, old, new, err);
     }
     if (!strcmp(name, "shell") && cmd) {
-        tool_start(a, "shell", cmd);
+        tool_start(a, "shell", cmd, 0);
         if ((why = denied(a, 0, "shell", cmd))) return xstrdup(why); /* unconfinable */
         cJSON *t = cJSON_GetObjectItemCaseSensitive(input, "timeout");
         double want = cJSON_IsNumber(t) ? t->valuedouble : MYRA_SHELL_TIMEOUT;
@@ -725,6 +692,14 @@ char *myra_run_tool(myra_agent *a, const char *name, cJSON *input, int *err) {
         int secs = !(want >= 1) ? 1 : want > MYRA_SHELL_TIMEOUT_MAX ? MYRA_SHELL_TIMEOUT_MAX
                                                                     : (int)want;
         return tool_shell(cmd, secs, a->max_output, err);
+    }
+    if (myra_mcp_has(a, name)) {
+        char *args = cJSON_PrintUnformatted(input);
+        tool_start(a, name, args ? args : "", 0);
+        why = denied(a, 0, name, args ? args : ""); /* unconfinable, like shell */
+        free(args);
+        if (why) return xstrdup(why);
+        return capped(a, myra_mcp_call(a, name, input, err));
     }
     return fmt("unknown tool or missing arguments: %s", name);
 }
@@ -1463,6 +1438,7 @@ int myra_step(myra_agent *a, cJSON *resp) {
         const char *name = get_str(fn, "name"), *args = get_str(fn, "arguments");
         cJSON *input = cJSON_Parse(args ? args : "");
         int err = 1;
+        a->announced = 0;
         /* Every call still gets a result, so the history stays valid. */
         char *out;
         if (myra_interrupted) out = xstrdup("skipped: interrupted by user");
@@ -1470,6 +1446,7 @@ int myra_step(myra_agent *a, cJSON *resp) {
         else if (cJSON_IsObject(input)) out = myra_run_tool(a, name ? name : "", input, &err);
         else out = fmt("invalid JSON arguments for %s", name ? name : "?");
         cJSON_Delete(input);
+        if (a->announced && a->io.done) a->io.done(a->io.ud, err, out);
         /* Chat completions has no is_error field, so mark failures in the text. */
         char *content = err ? fmt("error: %s", out) : fmt("%s", out);
         if (a->verbose) myra_note(MYRA_DIM, "%s\n", content);
@@ -1634,6 +1611,7 @@ void myra_set_cwd(myra_agent *a) {
 }
 
 void myra_free(myra_agent *a) {
+    myra_mcp_stop(a);
     if (a->messages) curl_global_cleanup(); /* paired with a successful myra_init */
     cJSON_Delete(a->messages);
     cJSON_Delete(a->tools);

@@ -535,7 +535,8 @@ class Io:
     """Hooks that replace the terminal and the local filesystem, for a front end that owns
     both (ACP mode). None keeps the default behaviour."""
     text: Callable[[str], None] | None = None  # reply text, as it streams
-    tool: Callable[[str, str], None] | None = None  # a tool call starts: name, detail
+    tool: Callable[[str, str, bool], None] | None = None  # a call starts: name, detail, pending
+    done: Callable[[bool, str], None] | None = None  # the announced call ended: err, result
     read: Callable[[str], str] | None = None  # the file at an absolute path; raises ClientError
     write: Callable[[str, str], None] | None = None  # path, content; raises ClientError
     allow: Callable[[str, str, bool], bool] | None = None  # asked where --permissions would ask
@@ -708,13 +709,18 @@ def outside_cwd(path: str) -> bool:
     return cwd != "/" and os.path.commonpath([cwd, real]) != cwd
 
 
+def asks(mode: Permissions, outside: bool) -> bool:
+    """Whether a mutating call must be confirmed before it runs."""
+    return mode is Permissions.ASK or (mode is Permissions.AUTO and outside)
+
+
 def denied(mode: Permissions, outside: bool, name: str, detail: str,
            allow: Callable[[str, str, bool], bool] | None = None) -> str | None:
     """None if allowed, else why not, for the model to relay. Asks allow, if given, else
     the controlling terminal, so it works in headless mode and the REPL alike."""
     if mode is Permissions.READ_ONLY:
         return "denied: the agent runs with --permissions read-only"
-    if mode is Permissions.ALL or (mode is Permissions.AUTO and not outside):
+    if not asks(mode, outside):
         return None
     if allow:
         return None if allow(name, detail, outside) else "denied by user"
@@ -939,6 +945,267 @@ def retry_delay() -> float:
 
 # ---- the agent ----
 
+# ---- MCP: stdio servers whose tools the model can call ----
+
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_START_TIMEOUT = 60  # seconds for initialize and tools/list: npx may download first
+# What a server inherits of our environment, besides its own env: the MCP SDKs' POSIX
+# default, so the provider key and other secrets do not reach it.
+MCP_INHERITED_ENV = ("HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER")
+MCP_SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+class McpError(Exception):
+    pass
+
+
+def mcp_safe(s: str) -> str:
+    """Each byte outside [A-Za-z0-9_-] as '_', as OpenAI function names require."""
+    return "".join(chr(b) if chr(b) in MCP_SAFE else "_" for b in s.encode())
+
+
+def mcp_result_text(r: dict) -> str:
+    """The text of a tools/call result's content, one item per line."""
+    out = ""
+    for c in r.get("content") if isinstance(r.get("content"), list) else ():
+        c, res = obj(c), obj(obj(c).get("resource"))
+        text = c.get("text") if isinstance(c.get("text"), str) else res.get("text")
+        uri = c.get("uri") if isinstance(c.get("uri"), str) else res.get("uri")
+        uri = uri if isinstance(uri, str) else None
+        if out:
+            out += "\n"
+        if isinstance(text, str):
+            out += text
+        else:  # images, audio, links: named, since the model gets text only
+            kind = c.get("type") if isinstance(c.get("type"), str) else "content"
+            out += f"[{kind} {uri}]" if uri else f"[{kind}]"
+    if not out and "structuredContent" in r:  # no content: the structured result
+        out = json.dumps(r["structuredContent"], separators=(",", ":"), ensure_ascii=False)
+    return out
+
+
+def mcp_inherited_env() -> dict[str, str]:
+    """MCP_INHERITED_ENV's variables that are set, less any shell function exported as one."""
+    return {k: v for k in MCP_INHERITED_ENV
+            if (v := os.environ.get(k)) is not None and not v.startswith("()")}
+
+
+def mcp_load(path: str) -> list | None:
+    """The servers of a config file, {"mcpServers": {name: {command, args, env: {K: V}}}},
+    as a list for Agent.mcp_start; None with the reason on stderr."""
+    try:
+        with open(path, "rb") as f:
+            text = f.read()
+    except OSError as e:
+        note(f"error: cannot read {path}: {e.strerror}\n", Style.ERROR)
+        return None
+    try:
+        servers = obj(json.loads(text)).get("mcpServers")
+    except ValueError:
+        servers = None
+    if not isinstance(servers, dict):
+        note(f'error: {path}: expected {{"mcpServers": {{...}}}}\n', Style.ERROR)
+        return None
+    out = []
+    for name, srv in servers.items():  # {name: {command, args, env: {K: V}}}
+        srv = dict(obj(srv))
+        env = obj(srv.get("env"))
+        srv["env"] = [{"name": k, "value": v} for k, v in env.items() if isinstance(v, str)]
+        out.append({**srv, "name": name})
+    return out
+
+
+class McpServer:
+    """A Model Context Protocol server over stdio (https://modelcontextprotocol.io).
+    Mirrors src/mcp.c. JSON-RPC, one message per line; its stderr is left as ours."""
+
+    def __init__(self, name: str, proc: subprocess.Popen):
+        self.name, self.proc = name, proc
+        self.buf = b""  # bytes of an incomplete line
+        self.next_id = 0
+        self.tools: dict[str, str] = {}  # exposed name -> the server's own name
+        self.alive = True
+
+    @classmethod
+    def start(cls, name: str, command: str, args: list[str], env: dict[str, str],
+              tools: list[dict]) -> McpServer | None:
+        """Start a server and add its tools to tools; None if it fails, with the reason
+        on stderr."""
+        try:  # its own process group: the terminal's Ctrl-C reaches only the agent
+            proc = subprocess.Popen([command, *args], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, env={**mcp_inherited_env(), **env},
+                                    process_group=0)
+        except OSError as e:
+            note(f"error: mcp {name}: cannot run {command}: {e.strerror}\n", Style.ERROR)
+            return None
+        os.set_blocking(proc.stdin.fileno(), False)  # so send can give up on a server not reading
+        s, step = cls(name, proc), "initialize"
+        try:
+            s.rpc("initialize", {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+                                 "clientInfo": {"name": "myra", "version": VERSION}},
+                  MCP_START_TIMEOUT)
+            s.notify("notifications/initialized", None, time.monotonic() + MCP_START_TIMEOUT)
+            step = "tools/list"
+            s.list_tools(tools)
+        except McpError as e:
+            note(f"error: mcp {name}: {step}: {e}\n", Style.ERROR)
+            s.reap()
+            tools[:] = [t for t in tools if t["function"]["name"] not in s.tools]  # earlier pages'
+            return None
+        return s
+
+    @staticmethod
+    def reap_all(servers: list[McpServer]) -> None:
+        """Stop servers together. Closing stdin asks each to exit; then SIGTERM, then
+        SIGKILL, as the spec's shutdown."""
+        for s in servers:
+            for f in (s.proc.stdin, s.proc.stdout):
+                with suppress(OSError):
+                    f.close()
+            s.alive = False
+        for sig in (None, signal.SIGTERM, signal.SIGKILL):
+            left = [s for s in servers if s.proc.poll() is None]
+            for s in left if sig else ():
+                with suppress(OSError):
+                    os.killpg(s.proc.pid, sig)
+            end = time.monotonic() + 1
+            while any(s.proc.poll() is None for s in left):
+                if time.monotonic() >= end:
+                    break
+                time.sleep(0.01)
+            else:
+                return
+
+    def reap(self) -> None:
+        McpServer.reap_all([self])
+
+    def send(self, msg: dict, deadline: float) -> None:
+        """Write one message; raises McpError if the server has exited, has not read it by
+        deadline, or Ctrl-C came first. A message cut short would corrupt the next, so
+        the server's stdin is then closed."""
+        msg["jsonrpc"] = "2.0"
+        data = memoryview(json.dumps(msg, separators=(",", ":")).encode() + b"\n")
+        if self.proc.stdin.closed:
+            raise McpError("the server has exited")
+        fd, off = self.proc.stdin.fileno(), 0
+        while off < len(data):
+            try:
+                off += os.write(fd, data[off:])
+                continue
+            except BlockingIOError:
+                pass
+            except OSError as e:
+                raise McpError("the server has exited") from e
+            if interrupted or time.monotonic() >= deadline:
+                if off:
+                    self.proc.stdin.close()
+                raise McpError("interrupted by user" if interrupted else "timed out")
+            select.select([], [fd], [], 0.2)
+
+    def post(self, msg: dict, deadline: float) -> None:
+        """send, for messages that need no reply: a dead server is found by the next rpc."""
+        with suppress(McpError):
+            self.send(msg, deadline)
+
+    def notify(self, method: str, params: dict | None, deadline: float) -> None:
+        self.post({"method": method, **({"params": params} if params else {})}, deadline)
+
+    def serve(self, req: dict, deadline: float) -> None:
+        """Answer a request from the server: ping is the only one a client must serve."""
+        if req.get("method") == "ping":
+            self.post({"id": req["id"], "result": {}}, deadline)
+        else:
+            self.post({"id": req["id"], "error": {"code": -32601, "message": "method not found"}},
+                      deadline)
+
+    def take(self, deadline: float) -> dict:
+        """The next whole message from the server; raises McpError."""
+        while True:
+            line, nl, rest = self.buf.partition(b"\n")
+            if nl:
+                self.buf = rest
+                try:
+                    m = json.loads(line)
+                except ValueError:
+                    continue  # not JSON: a server's stray output, skipped
+                if isinstance(m, dict):
+                    return m
+                continue
+            if not self.alive:
+                raise McpError("the server has exited")
+            if interrupted:
+                raise McpError("interrupted by user")
+            if (left := deadline - time.monotonic()) <= 0:
+                raise McpError("timed out")
+            fd = self.proc.stdout.fileno()
+            if select.select([fd], [], [], min(left, 0.2))[0]:  # the tick rechecks interrupted
+                if not (chunk := os.read(fd, 65536)):
+                    self.reap()
+                    continue
+                if len(self.buf) + len(chunk) > MAX_RAW:
+                    self.reap()
+                    raise McpError("the server's reply is too large")
+                self.buf += chunk
+
+    def rpc(self, method: str, params: dict, timeout: float) -> dict:
+        """Send a request and return its result; raises McpError."""
+        self.next_id += 1
+        rid = self.next_id
+        deadline = time.monotonic() + timeout
+        self.send({"id": rid, "method": method, "params": params}, deadline)
+        while True:
+            try:
+                m = self.take(deadline)
+            except McpError as e:
+                # still running: tell it to stop; initialize is the one it must not be sent
+                if self.alive and method != "initialize":
+                    self.notify("notifications/cancelled", {"requestId": rid, "reason": str(e)},
+                                deadline)
+                raise
+            mid = m.get("id")
+            if "method" in m:
+                if mid is not None:
+                    self.serve(m, deadline)  # else a notification: ignored
+            elif isinstance(mid, int) and not isinstance(mid, bool) and mid == rid:
+                if "error" in m:
+                    msg = obj(m["error"]).get("message")
+                    raise McpError(msg if isinstance(msg, str) else "error")
+                if "result" not in m:
+                    raise McpError("no result in the server's reply")
+                return obj(m["result"])
+            # else a late response to a cancelled request
+
+    def list_tools(self, tools: list[dict]) -> None:
+        """Add the server's tools to tools as mcp__<server>__<tool>."""
+        cursor = None
+        while True:
+            r = self.rpc("tools/list", {"cursor": cursor} if cursor else {}, MCP_START_TIMEOUT)
+            for t in r.get("tools") if isinstance(r.get("tools"), list) else ():
+                if not isinstance(name := obj(t).get("name"), str):
+                    continue
+                exposed = f"mcp__{mcp_safe(self.name)}__{mcp_safe(name)}"[:64]
+                if any(x["function"]["name"] == exposed for x in tools):
+                    note(f"warning: mcp {self.name}: skipped {name}: {exposed} is taken\n",
+                         Style.WARN)
+                    continue
+                schema, desc = t.get("inputSchema"), t.get("description")
+                tools.append({"type": "function", "function": {
+                    "name": exposed, "description": desc if isinstance(desc, str) else "",
+                    "parameters": schema if isinstance(schema, dict) else {"type": "object"}}})
+                self.tools[exposed] = name
+            cursor = r.get("nextCursor")
+            if not (isinstance(cursor, str) and cursor):
+                return
+
+    def call(self, exposed: str, args: dict) -> tuple[str, bool]:
+        try:
+            r = self.rpc("tools/call", {"name": self.tools[exposed], "arguments": args},
+                         SHELL_TIMEOUT_MAX)
+        except McpError as e:
+            return str(e), True
+        return mcp_result_text(r), r.get("isError") is True
+
+
 @dataclass
 class Agent:
     prov: Provider
@@ -952,9 +1219,12 @@ class Agent:
     context_full: bool = False  # the last request failed as too long for the model's context
     streamed: bool = False  # the last reply's text was printed while it streamed
     turn_calls: int = 0
+    announced: bool = False  # io.tool was told of the current call, so io.done follows
     session: Usage = field(default_factory=Usage)
     io: Io = field(default_factory=Io)
     messages: list[dict] = field(default_factory=list)
+    tools: list[dict] = field(default_factory=lambda: list(TOOLS))
+    mcp: list[McpServer] = field(default_factory=list)  # running MCP servers
 
     @classmethod
     def create(cls, p: Provider, model: str | None, perms: Permissions) -> Agent | None:
@@ -997,6 +1267,36 @@ class Agent:
     def clear(self) -> None:
         """Drop the conversation, keeping the system prompt."""
         del self.messages[1:]
+
+    def mcp_start(self, servers: Any) -> None:
+        """Start each server of a list in ACP's shape, [{name, command, args, env:
+        [{name, value}], type}]. One that fails is reported on stderr and left out.
+        Ctrl-C skips the rest."""
+        for srv in servers if isinstance(servers, list) else ():
+            if interrupted:
+                break
+            srv = obj(srv)
+            name, cmd, kind = srv.get("name"), srv.get("command"), srv.get("type")
+            shown = name if isinstance(name, str) else "?"
+            if kind is not None and kind != "stdio":
+                note(f"warning: mcp {shown}: only stdio servers are supported\n", Style.WARN)
+                continue
+            if not isinstance(name, str) or not isinstance(cmd, str):
+                note(f"warning: mcp {shown}: no command\n", Style.WARN)
+                continue
+            args = srv.get("args")
+            args = [a for a in args if isinstance(a, str)] if isinstance(args, list) else []
+            env = srv.get("env")
+            env = {e["name"]: e["value"] for e in map(obj, env if isinstance(env, list) else ())
+                   if isinstance(e.get("name"), str) and isinstance(e.get("value"), str)}
+            if s := McpServer.start(name, cmd, args, env, self.tools):
+                self.mcp.append(s)
+
+    def mcp_stop(self) -> None:
+        """Stop every MCP server and drop its tools."""
+        McpServer.reap_all(self.mcp)  # together: one slow server at a time would add up
+        self.mcp = []
+        self.tools = [t for t in self.tools if not t["function"]["name"].startswith("mcp__")]
 
     def set_model(self, model: str) -> None:
         """Switch model; it is remembered after the next successful response."""
@@ -1089,7 +1389,7 @@ class Agent:
         return None
 
     def call_api(self) -> Any:
-        body = {"model": self.model, "tools": TOOLS, "messages": self.messages, "stream": True,
+        body = {"model": self.model, "tools": self.tools, "messages": self.messages, "stream": True,
                 "stream_options": {"include_usage": True}}
         # Turns on prompt caching for Anthropic models, where it is opt-in. Providers
         # that cache automatically or lack support ignore unknown fields.
@@ -1141,19 +1441,17 @@ class Agent:
         cut = bool(nl) or len(line) > room
         note(f"[tool] {name} {line[:room]}{' ...' if cut else ''}\n", Style.TOOL)
 
-    def tool_start(self, name: str, detail: str) -> None:
+    def tool_start(self, name: str, detail: str, outside: bool = False) -> None:
         """Log the call, and tell the front end."""
         self.tool_log(name, detail)
+        self.announced = True
         if self.io.tool:
-            self.io.tool(name, detail)
+            self.io.tool(name, detail, name != "read" and asks(self.permissions, outside))
 
-    def served_read(self, path: str) -> str | None:
-        """read through the front end, capped like a local read. None if it refused: the
-        path lies outside what it serves, and the disk is read instead."""
-        try:
-            text = self.io.read(absolute(path))
-        except ClientError:
-            return None
+    def served_read(self, path: str) -> str:
+        """read through the front end, capped like a local read. Raises ClientError if
+        it refused."""
+        text = self.io.read(absolute(path))
         sink = Sink(self.max_output)
         sink.add(text.encode())
         return sink.take()
@@ -1163,12 +1461,18 @@ class Agent:
         match name, args:
             case "read", {"path": str(path)}:
                 self.tool_start(name, path)
-                if self.io.read and (out := self.served_read(path)) is not None:
-                    return out, False
+                if self.io.read:
+                    try:
+                        return self.served_read(path), False
+                    except ClientError as e:
+                        # Inside the cwd a refusal likely means a binary file, which a disk read
+                        # reports better. Outside, only --permissions all reads disk, as its shell could.
+                        if outside_cwd(path) and self.permissions != Permissions.ALL:
+                            return with_why(f"cannot read {path}", str(e)), True
                 return tool_read(path, self.max_output)
             case "write", {"path": str(path), "content": str(content)}:
-                self.tool_start(name, path)
-                if why := denied(self.permissions, outside_cwd(path), name, path, self.io.allow):
+                self.tool_start(name, path, outside := outside_cwd(path))
+                if why := denied(self.permissions, outside, name, path, self.io.allow):
                     return why, True
                 if served:
                     try:
@@ -1178,8 +1482,8 @@ class Agent:
                     return f"wrote {path}", False
                 return tool_write(path, content)
             case "edit", {"path": str(path), "old_string": str(old), "new_string": str(new)}:
-                self.tool_start(name, path)
-                if why := denied(self.permissions, outside_cwd(path), name, path, self.io.allow):
+                self.tool_start(name, path, outside := outside_cwd(path))
+                if why := denied(self.permissions, outside, name, path, self.io.allow):
                     return why, True
                 return tool_edit(path, old, new, self.io if served else None)
             case "shell", {"command": str(cmd)}:
@@ -1191,6 +1495,15 @@ class Agent:
                     want = SHELL_TIMEOUT
                 secs = 1 if not want >= 1 else min(want, SHELL_TIMEOUT_MAX)  # NaN: 1
                 return tool_shell(cmd, int(secs), self.max_output)
+        if srv := next((s for s in self.mcp if name in s.tools), None):
+            detail = json.dumps(args, separators=(",", ":"), ensure_ascii=False)
+            self.tool_start(name, detail)
+            if why := denied(self.permissions, False, name, detail, self.io.allow):  # unconfinable
+                return why, True
+            out, err = srv.call(name, args)
+            sink = Sink(self.max_output)
+            sink.add(out.encode(errors="replace"))
+            return sink.take(), err
         return f"unknown tool or missing arguments: {name}", True
 
     def step(self, resp: Any) -> int:
@@ -1238,6 +1551,7 @@ class Agent:
                 args = json.loads(raw)
             except ValueError:
                 args = None
+            self.announced = False
             # Every call still gets a result, so the history stays valid.
             if interrupted:
                 out, err = "skipped: interrupted by user", True
@@ -1251,6 +1565,8 @@ class Agent:
                     out, err = self.run_tool(name or "", args)
                 except (UnicodeError, ValueError) as e:  # e.g. a lone surrogate or NUL in a path
                     out, err = f"bad arguments for {name}: {e}", True
+            if self.announced and self.io.done:
+                self.io.done(err, out)
             # Chat completions has no is_error field, so mark failures in the text.
             result = f"error: {out}" if err else out
             if self.verbose:
@@ -1490,6 +1806,8 @@ def obj(v: Any) -> dict:
 
 
 def tool_kind(name: str) -> str:
+    if name.startswith("mcp__"):
+        return "other"
     return "read" if name == "read" else "execute" if name == "shell" else "edit"
 
 
@@ -1522,8 +1840,10 @@ class AcpServer:
     queues each message, except session/cancel, which it turns into a SIGINT to the main
     thread: a model request or shell command then stops as on Ctrl-C."""
 
-    def __init__(self, agent: Agent):
+    def __init__(self, agent: Agent, config: list | None = None):
         self.agent = agent
+        self.config = config or []  # --mcp-config servers, started with each session
+        self.prompting = False  # a session/prompt is running: session/cancel applies
         self.queue: list[dict] = []  # parsed messages not yet handled
         self.eof = False
         self.cond = threading.Condition()  # guards queue and eof
@@ -1532,6 +1852,7 @@ class AcpServer:
         self.waiting = 0  # id of the outstanding call() to the client, or 0; under cond
         self.initialized = False
         self.calls = 0  # tool calls this session, for toolCallId
+        self.open = 0  # the announced call not yet reported done, or 0
         self.session = ""
 
     def send(self, msg: dict) -> None:
@@ -1578,8 +1899,9 @@ class AcpServer:
             if not isinstance(m, dict):
                 continue  # acp.c queues it, but nothing ever takes it
             if m.get("method") == "session/cancel":
-                interrupted = True
-                signal.pthread_kill(main, signal.SIGINT)  # cuts a blocking read short
+                if self.prompting:  # else nothing to cancel
+                    interrupted = True
+                    signal.pthread_kill(main, signal.SIGINT)  # cuts a blocking read short
                 continue
             with self.cond:
                 self.queue.append(m)
@@ -1590,9 +1912,12 @@ class AcpServer:
 
     def next(self, id_: int | None = None) -> dict | None:
         """The next queued response to id_, or request or notification if id_ is None;
-        None at EOF."""
+        None at EOF. With id_ None no call is outstanding, so a queued response is stale
+        (one a failed call gave up on) and is dropped."""
         with self.cond:
             while True:
+                if id_ is None:
+                    self.queue = [m for m in self.queue if "method" in m]
                 for i, m in enumerate(self.queue):
                     mid, response = m.get("id"), "method" not in m
                     match_id = (isinstance(mid, int | float) and not isinstance(mid, bool)
@@ -1633,11 +1958,21 @@ class AcpServer:
     def on_text(self, s: str) -> None:
         self.update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": s}})
 
-    def on_tool(self, name: str, detail: str) -> None:
+    def call_update(self, status: str, **extra: Any) -> None:
+        self.update({"sessionUpdate": "tool_call_update", "toolCallId": f"call_{self.open}",
+                     "status": status, **extra})
+
+    def on_tool(self, name: str, detail: str, pending: bool) -> None:
         self.calls += 1
+        self.open = self.calls
         self.update({"sessionUpdate": "tool_call", "toolCallId": f"call_{self.calls}",
                      "title": tool_title(name, detail), "kind": tool_kind(name),
-                     "status": "in_progress"})
+                     "status": "pending" if pending else "in_progress"})
+
+    def on_done(self, err: bool, result: str) -> None:
+        self.call_update("failed" if err else "completed",
+                         content=[{"type": "content", "content": {"type": "text", "text": result}}])
+        self.open = 0
 
     def on_read(self, path: str) -> str:
         resp = self.call("fs/read_text_file", {"sessionId": self.session, "path": path})
@@ -1664,20 +1999,25 @@ class AcpServer:
             "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"},
                         {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]})
         outcome = obj(obj(obj(resp).get("result")).get("outcome"))
-        return outcome.get("outcome") == "selected" and outcome.get("optionId") == "allow"
+        ok = outcome.get("outcome") == "selected" and outcome.get("optionId") == "allow"
+        if ok:
+            self.call_update("in_progress")
+        return ok
 
     # ---- requests ----
 
     def initialize(self, req: dict, params: dict) -> None:
         fs = obj(obj(params.get("clientCapabilities")).get("fs"))
-        io = Io(text=self.on_text, tool=self.on_tool, allow=self.on_allow)
+        io = Io(text=self.on_text, tool=self.on_tool, done=self.on_done, allow=self.on_allow)
         # Files go through the client only if it serves both: edit reads, then writes.
         if fs.get("readTextFile") is True and fs.get("writeTextFile") is True:
             io.read, io.write = self.on_read, self.on_write
         self.agent.io = io
         self.respond(req, "result", {
             "protocolVersion": ACP_PROTOCOL_VERSION,
-            "agentCapabilities": {"loadSession": False, "promptCapabilities": {}},
+            "agentCapabilities": {"loadSession": False, "promptCapabilities": {},
+                                  # stdio only, which every agent must support
+                                  "mcpCapabilities": {"http": False, "sse": False}},
             "agentInfo": {"name": "myra", "version": VERSION}, "authMethods": []})
 
     def new_session(self, req: dict, params: dict) -> None:
@@ -1690,13 +2030,26 @@ class AcpServer:
                 return
         self.agent.set_cwd()
         self.agent.clear()
-        self.calls = 0
+        self.start_servers(params.get("mcpServers"))
+        self.calls = self.open = 0
         self.session = str(int(self.session or 0) + 1)
         self.respond(req, "result", {"sessionId": self.session})
 
+    def start_servers(self, servers: Any) -> None:
+        """The session's MCP servers: the --mcp-config ones, then the client's."""
+        global interrupted
+        self.agent.mcp_stop()
+        interrupted = False  # a cancel that raced the end of the last prompt
+        self.agent.mcp_start(self.config)
+        self.agent.mcp_start(servers)
+
     def prompt(self, req: dict, params: dict) -> None:
         global interrupted
-        rc = self.agent.ask(prompt_text(params.get("prompt")))  # clears interrupted first
+        self.prompting = True
+        try:
+            rc = self.agent.ask(prompt_text(params.get("prompt")))  # clears interrupted first
+        finally:
+            self.prompting = False
         if interrupted:
             self.respond(req, "result", {"stopReason": "cancelled"})
         elif rc < 0:
@@ -1726,6 +2079,7 @@ class AcpServer:
                     self.prompt(m, params)
             else:
                 self.error(m, -32601, "method not found")
+        self.agent.mcp_stop()
         return 0
 
 
@@ -1757,6 +2111,9 @@ def parser() -> argparse.ArgumentParser:
                     help="run one prompt headless and exit (default: REPL)")
     ap.add_argument("--acp", action="store_true",
                     help="serve the Agent Client Protocol on stdin and stdout, for an editor")
+    ap.add_argument("--mcp-config", metavar="FILE",
+                    help='start the stdio MCP servers in FILE, {"mcpServers": {...}}; their '
+                         "tools are offered as mcp__<server>__<tool>")
     ap.add_argument("-V", action="version", version=f"myra {VERSION}", help="print the version")
     ap.add_argument("--verbose", action="store_true",
                     help="show each tool call's full arguments and result, not one line")
@@ -1794,6 +2151,9 @@ def main(argv: list[str] | None = None) -> int:
         keys = "".join(f" {q.key_env}" for q in PROVIDERS.values() if not q.key_optional)
         note(f"error: no provider: set{keys} or pass -P local\n", Style.ERROR)
         return 1
+    servers = None
+    if args.mcp_config is not None and (servers := mcp_load(args.mcp_config)) is None:
+        return 2
     if not (agent := Agent.create(p, args.model, args.permissions)):
         return 1
     agent.verbose = args.verbose
@@ -1801,13 +2161,19 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, on_sigint)
 
     if args.acp:
-        return AcpServer(agent).serve()
-    if args.prompt is None:
-        repl(agent)
-        agent.session.report("[session]")
-        return 0
-    rc = 1 if agent.ask(args.prompt) < 0 else 0
-    return 130 if interrupted else rc  # 128 + SIGINT, as a shell would report
+        return AcpServer(agent, servers).serve()  # started with each session, in its cwd
+    agent.mcp_start(servers)
+    try:
+        if interrupted:  # Ctrl-C while servers start: exit, as at any other point of a run
+            return 130
+        if args.prompt is None:
+            repl(agent)
+            agent.session.report("[session]")
+            return 0
+        rc = 1 if agent.ask(args.prompt) < 0 else 0
+        return 130 if interrupted else rc  # 128 + SIGINT, as a shell would report
+    finally:
+        agent.mcp_stop()
 
 
 if __name__ == "__main__":

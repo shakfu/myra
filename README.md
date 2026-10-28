@@ -49,7 +49,9 @@ Layout:
 | Path                  | Contains                                                         |
 |-----------------------|------------------------------------------------------------------|
 | `src/myra.{h,c}`      | `myralib`: providers, tools, remembered state, streaming, the tool loop |
+| `src/mcp.{h,c}`       | `myralib`: stdio MCP client                                      |
 | `src/main.c`          | the CLI: options, provider choice, headless mode, REPL, completion |
+| `src/acp.{h,c}`       | `--acp`: the Agent Client Protocol server                        |
 | `tests/unit.c`        | `myralib` unit tests; each `TEST(name)` is a ctest `unit.<name>` |
 | `tests/test_agent.py` | end-to-end tests against a mock server; ctest `e2e`, needs `uv`  |
 | `scripts/agent.py`    | myra in Python 3.11+, stdlib only; same options and state. ctest `e2e-py` runs the suite against it |
@@ -89,6 +91,7 @@ Requests to `openrouter` carry a top-level `"cache_control": {"type": "ephemeral
     ./myra -m openai/gpt-5.5 -p "..."   # any OpenRouter model id; remembered
     ./myra -P local                     # llama-server on :8080; remembered
     ./myra --permissions ask            # approve each write, edit and shell
+    ./myra --mcp-config mcp.json        # add MCP servers' tools
     ./myra --verbose                    # full tool arguments and results
     ./myra --no-color                   # plain stderr
     ./myra --raw                        # raw markdown on stdout
@@ -149,20 +152,32 @@ Ctrl-C:
 
 When a request exceeds the model's context, older tool outputs are replaced by a placeholder and the request is retried once. If nothing is left to drop, the agent suggests `/clear`. If the turn fails anyway, the outputs are restored.
 
+### MCP servers: `--mcp-config`
+
+`--mcp-config FILE` starts the [MCP](https://modelcontextprotocol.io) servers listed in FILE, in the format other MCP clients use:
+
+    {"mcpServers": {"git": {"command": "uvx", "args": ["mcp-server-git"], "env": {"K": "v"}}}}
+
+Their tools join the four built-ins as `mcp__<server>__<tool>`. Only stdio servers are supported. A server inherits only `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM` and `USER` from myra's environment, plus its own `env`, as the MCP SDKs do; API keys stay out. A server that fails to start is reported on stderr and left out; Ctrl-C while servers start exits with status 130. `--permissions` treats MCP tools like `shell`: `read-only` denies them and `ask` asks for each call. A call is stopped by Ctrl-C and after 600 s. The servers stop when myra exits.
+
+A project `.mcp.json` is not read unless named: a cloned repository could otherwise make myra run its commands.
+
 ### Editors: `--acp`
 
 `myra --acp` serves the [Agent Client Protocol](https://agentclientprotocol.com) on stdin and stdout, so an editor can run it, for example loki's `:agent`. Provider, model and `--permissions` work as in the REPL.
 
 If the editor serves files (`fs.readTextFile` and `fs.writeTextFile`):
-- `read` goes through the editor, so it sees unsaved buffers. If the editor refuses a path, for example one outside its project, `read` falls back to the disk.
+- `read` goes through the editor, so it sees unsaved buffers. If the editor refuses a path inside the working directory, for example a binary file, `read` falls back to the disk. Outside it, the refusal and its reason go to the model, except under `--permissions all`, which reads the disk.
 - `write` and `edit` go through the editor, and its refusal is an error.
 - `shell` always runs locally.
 
 A call that `--permissions` would ask about on the terminal is asked in the editor instead, as `session/request_permission`. So `--permissions ask` works there.
 
-`session/cancel` acts like Ctrl-C: it kills a running `shell` command or stops the model request, and the turn ends with `stopReason` `cancelled`. Reply text and each tool call stream as `session/update` messages. stdout carries only protocol messages; notes go to stderr as usual.
+`session/cancel` acts like Ctrl-C: it kills a running `shell` command or stops the model request, and the turn ends with `stopReason` `cancelled`. Reply text and each tool call stream as `session/update` messages. A tool call is reported `completed` or `failed` with its result; one waiting for approval is `pending` until allowed. stdout carries only protocol messages; notes go to stderr as usual.
 
-There is one session at a time. `session/new` changes to the session's `cwd` and starts a new conversation. MCP servers offered in `session/new` are ignored: myra has only its four tools.
+There is one session at a time. `session/new` changes to the session's `cwd` and starts a new conversation.
+
+Each session starts the `--mcp-config` servers, then those listed in `session/new`, in the session's `cwd`. They work as described under `--mcp-config`, with `session/cancel` in place of Ctrl-C. myra declares no `http` or `sse` MCP capability. A new session stops the previous servers.
 
 ## Saved state
 

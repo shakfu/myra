@@ -100,6 +100,8 @@ Axis: **input**. Piped input already works; add `--`-separated prompts or a `--s
 ## 6. Extensibility and integration
 
 ### 6.1 MCP client
+Status: done. `src/mcp.c`; servers come from `--mcp-config FILE` and, under `--acp`, from the editor.
+
 Axis: **extensibility**. Speak the Model Context Protocol over stdio to configured servers, exposing their tools to the loop as extra entries in the existing `tools` array. This is the single highest-leverage feature for adopting myra alongside other tools, and it is additive: the four built-ins keep working, the tool loop is unchanged in shape. Config lives in a small JSON file under the state dir.
 
 ### 6.2 Hooks

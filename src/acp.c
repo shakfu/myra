@@ -6,6 +6,7 @@
    One thread: while a turn runs, myra_poll drains stdin, so session/cancel is seen
    during a model request or shell command; other messages wait in a queue. */
 #include "acp.h"
+#include "mcp.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -22,9 +23,12 @@ static struct {
     int eof;
     int next_id;
     int calls;    /* tool calls this session, for toolCallId */
+    int open;     /* the announced call not yet reported done, or 0 */
     int waiting;  /* id of the outstanding call() to the client, or 0 */
+    int prompting; /* a session/prompt is running: session/cancel applies */
     int initialized;
     char session[16]; /* empty until session/new */
+    cJSON *config;    /* --mcp-config servers, started with each session */
 } in;
 
 static void send_msg(cJSON *msg) {
@@ -75,7 +79,10 @@ static void take_lines(void) {
                                     "unparseable reply from the client");
             cJSON_AddItemToArray(in.queue, m);
         } else if (!m) reply_error(NULL, -32700, "parse error");
-        else if (is_method(m, "session/cancel")) myra_interrupted = 1, cJSON_Delete(m);
+        else if (is_method(m, "session/cancel")) {
+            if (in.prompting) myra_interrupted = 1; /* else nothing to cancel */
+            cJSON_Delete(m);
+        }
         else cJSON_AddItemToArray(in.queue, m);
         start = nl + 1;
     }
@@ -103,17 +110,18 @@ static void fill(int block) {
 static void poll_stdin(void) { fill(0); }
 
 /* The next queued message that is a response to id (id >= 0) or a request or
-   notification (id < 0); NULL at EOF. */
+   notification (id < 0); NULL at EOF. With id < 0 no call is outstanding, so a
+   queued response is stale (one a failed call gave up on) and is dropped. */
 static cJSON *next(int id) {
     for (;;) {
-        cJSON *m;
-        int i = 0;
-        cJSON_ArrayForEach(m, in.queue) {
-            cJSON *mid = cJSON_GetObjectItem(m, "id");
+        cJSON *m = in.queue->child;
+        for (int i = 0; m; i++) {
+            cJSON *after = m->next, *mid = cJSON_GetObjectItem(m, "id");
             int is_response = !cJSON_GetObjectItem(m, "method");
             if (id < 0 ? !is_response : is_response && cJSON_IsNumber(mid) && mid->valueint == id)
                 return cJSON_DetachItemFromArray(in.queue, i);
-            i++;
+            if (id < 0) cJSON_DeleteItemFromArray(in.queue, i--);
+            m = after;
         }
         if (in.eof) return NULL;
         fill(1);
@@ -161,7 +169,10 @@ static void on_text(void *ud, const char *s) {
 }
 
 static const char *tool_kind(const char *name) {
-    return !strcmp(name, "read") ? "read" : !strcmp(name, "shell") ? "execute" : "edit";
+    return !strcmp(name, "read")              ? "read"
+           : !strcmp(name, "shell")           ? "execute"
+           : MYRA_STARTS_WITH(name, "mcp__") ? "other"
+                                              : "edit";
 }
 
 /* "name detail", detail cut at its first line. */
@@ -169,22 +180,47 @@ static char *tool_title(const char *name, const char *detail) {
     size_t n = strcspn(detail, "\n");
     char *t = malloc(strlen(name) + n + 2);
     if (!t) { perror("malloc"); exit(1); }
-    sprintf(t, "%s %.*s", name, (int)n, detail);
+    snprintf(t, strlen(name) + n + 2, "%s %.*s", name, (int)n, detail);
     return t;
 }
 
-static void on_tool(void *ud, const char *name, const char *detail) {
+/* A tool_call_update for the open call, with status set. */
+static cJSON *call_update(const char *status) {
+    char id[32];
+    snprintf(id, sizeof id, "call_%d", in.open);
+    cJSON *u = cJSON_CreateObject();
+    cJSON_AddStringToObject(u, "sessionUpdate", "tool_call_update");
+    cJSON_AddStringToObject(u, "toolCallId", id);
+    cJSON_AddStringToObject(u, "status", status);
+    return u;
+}
+
+static void on_tool(void *ud, const char *name, const char *detail, int pending) {
     (void)ud;
     char id[32], *title = tool_title(name, detail);
-    snprintf(id, sizeof id, "call_%d", ++in.calls);
+    snprintf(id, sizeof id, "call_%d", in.open = ++in.calls);
     cJSON *u = cJSON_CreateObject();
     cJSON_AddStringToObject(u, "sessionUpdate", "tool_call");
     cJSON_AddStringToObject(u, "toolCallId", id);
     cJSON_AddStringToObject(u, "title", title);
     cJSON_AddStringToObject(u, "kind", tool_kind(name));
-    cJSON_AddStringToObject(u, "status", "in_progress");
+    cJSON_AddStringToObject(u, "status", pending ? "pending" : "in_progress");
     update(u);
     free(title);
+}
+
+static void on_done(void *ud, int err, const char *result) {
+    (void)ud;
+    cJSON *u = call_update(err ? "failed" : "completed");
+    cJSON *items = cJSON_CreateArray(), *item = cJSON_CreateObject(), *c = cJSON_CreateObject();
+    cJSON_AddStringToObject(c, "type", "text");
+    cJSON_AddStringToObject(c, "text", result);
+    cJSON_AddStringToObject(item, "type", "content");
+    cJSON_AddItemToObject(item, "content", c);
+    cJSON_AddItemToArray(items, item);
+    cJSON_AddItemToObject(u, "content", items);
+    update(u);
+    in.open = 0;
 }
 
 /* The error message of a response, malloc'd, or NULL if it succeeded. */
@@ -237,9 +273,10 @@ static int on_allow(void *ud, const char *name, const char *detail, int outside)
     cJSON *p = session_params(), *tc = cJSON_CreateObject(), *opts = cJSON_CreateArray();
     cJSON_AddStringToObject(tc, "toolCallId", id);
     if (outside) {
-        char *t = malloc(strlen(title) + 40);
+        size_t n = strlen(title) + 40;
+        char *t = malloc(n);
         if (!t) { perror("malloc"); exit(1); }
-        sprintf(t, "%s (outside the working directory)", title);
+        snprintf(t, n, "%s (outside the working directory)", title);
         free(title);
         title = t;
     }
@@ -256,6 +293,7 @@ static int on_allow(void *ud, const char *name, const char *detail, int outside)
     const char *chosen = cJSON_GetStringValue(cJSON_GetObjectItem(outcome, "optionId"));
     int ok = kind && !strcmp(kind, "selected") && chosen && !strcmp(chosen, "allow");
     cJSON_Delete(resp);
+    if (ok) update(call_update("in_progress"));
     return ok;
 }
 
@@ -263,7 +301,7 @@ static int on_allow(void *ud, const char *name, const char *detail, int outside)
 
 static void initialize(myra_agent *a, cJSON *id, cJSON *params) {
     cJSON *fs = cJSON_GetObjectItem(cJSON_GetObjectItem(params, "clientCapabilities"), "fs");
-    a->io = (myra_io){.text = on_text, .tool = on_tool, .allow = on_allow};
+    a->io = (myra_io){.text = on_text, .tool = on_tool, .done = on_done, .allow = on_allow};
     /* Files go through the client only if it serves both: edit reads, then writes. */
     if (cJSON_IsTrue(cJSON_GetObjectItem(fs, "readTextFile")) &&
         cJSON_IsTrue(cJSON_GetObjectItem(fs, "writeTextFile")))
@@ -272,12 +310,23 @@ static void initialize(myra_agent *a, cJSON *id, cJSON *params) {
     cJSON_AddNumberToObject(r, "protocolVersion", PROTOCOL_VERSION);
     cJSON_AddFalseToObject(caps, "loadSession");
     cJSON_AddItemToObject(caps, "promptCapabilities", cJSON_CreateObject());
+    cJSON *mcp = cJSON_CreateObject(); /* stdio only, which every agent must support */
+    cJSON_AddFalseToObject(mcp, "http");
+    cJSON_AddFalseToObject(mcp, "sse");
+    cJSON_AddItemToObject(caps, "mcpCapabilities", mcp);
     cJSON_AddItemToObject(r, "agentCapabilities", caps);
     cJSON_AddStringToObject(info, "name", "myra");
     cJSON_AddStringToObject(info, "version", MYRA_VERSION);
     cJSON_AddItemToObject(r, "agentInfo", info);
     cJSON_AddItemToObject(r, "authMethods", cJSON_CreateArray());
     reply(id, r);
+}
+
+/* The session's MCP servers: the --mcp-config ones, then the client's. */
+static void start_servers(myra_agent *a, cJSON *config, cJSON *servers) {
+    myra_mcp_stop(a);
+    myra_mcp_start_list(a, config);
+    myra_mcp_start_list(a, servers);
 }
 
 /* One session at a time: a new one starts a fresh conversation in cwd. */
@@ -289,7 +338,8 @@ static void new_session(myra_agent *a, cJSON *id, cJSON *params) {
     }
     myra_set_cwd(a);
     myra_clear(a);
-    in.calls = 0;
+    start_servers(a, in.config, cJSON_GetObjectItem(params, "mcpServers"));
+    in.calls = in.open = 0;
     snprintf(in.session, sizeof in.session, "%d", atoi(in.session) + 1);
     cJSON *r = cJSON_CreateObject();
     cJSON_AddStringToObject(r, "sessionId", in.session);
@@ -323,7 +373,9 @@ static char *prompt_text(cJSON *blocks) {
 
 static void prompt(myra_agent *a, cJSON *id, cJSON *params) {
     char *text = prompt_text(cJSON_GetObjectItem(params, "prompt"));
+    in.prompting = 1;
     int rc = myra_ask(a, text); /* clears myra_interrupted first */
+    in.prompting = 0;
     free(text);
     if (myra_interrupted) {
         cJSON *r = cJSON_CreateObject();
@@ -339,7 +391,8 @@ static void prompt(myra_agent *a, cJSON *id, cJSON *params) {
     myra_interrupted = 0;
 }
 
-int myra_acp(myra_agent *a) {
+int myra_acp(myra_agent *a, cJSON *config) {
+    in.config = config;
     in.queue = cJSON_CreateArray();
     myra_poll = poll_stdin;
     cJSON *m;

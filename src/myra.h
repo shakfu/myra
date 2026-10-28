@@ -97,7 +97,10 @@ extern const size_t MYRA_NPROVIDERS;
 typedef struct {
     void *ud;
     void (*text)(void *ud, const char *s); /* reply text, as it streams */
-    void (*tool)(void *ud, const char *name, const char *detail); /* a tool call starts */
+    /* A tool call starts; pending: it waits for allow before it runs. */
+    void (*tool)(void *ud, const char *name, const char *detail, int pending);
+    /* The call tool announced has finished: its result, err set if it failed. */
+    void (*done)(void *ud, int err, const char *result);
     /* The file at absolute path, malloc'd; NULL on failure, with *why malloc'd. */
     char *(*read)(void *ud, const char *path, char **why);
     /* Write content to absolute path: NULL on success, else why, malloc'd. */
@@ -105,6 +108,8 @@ typedef struct {
     /* Whether a mutating tool may run, asked where --permissions would ask. 1 allows. */
     int (*allow)(void *ud, const char *name, const char *detail, int outside);
 } myra_io;
+
+typedef struct myra_mcp myra_mcp; /* mcp.h */
 
 typedef struct {
     const myra_provider *prov;
@@ -118,8 +123,10 @@ typedef struct {
     int streamed;        /* the last reply's text was printed while it streamed */
     int verbose;         /* full tool arguments and results on stderr, not one line per call */
     int turn_calls;      /* tool calls run in this turn */
+    int announced;       /* io.tool was told of the current call, so io.done follows */
     myra_usage session; /* totals over every turn */
     myra_io io;
+    myra_mcp *mcp;       /* running MCP servers, newest first */
     cJSON *tools, *messages;
 } myra_agent;
 

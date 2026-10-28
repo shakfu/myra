@@ -1725,12 +1725,12 @@ class Acp:
             elif msg.get("id") == rid:
                 return msg
 
-    def start(self, cwd):
+    def start(self, cwd, mcp=()):
         r = self.request("initialize", {"protocolVersion": 1, "clientCapabilities": {
             "fs": {"readTextFile": self.fs, "writeTextFile": self.fs}, "terminal": False},
             "clientInfo": {"name": "test", "version": "1"}})
         self.init = r["result"]
-        self.sid = self.request("session/new", {"cwd": str(cwd), "mcpServers": []})["result"]["sessionId"]
+        self.sid = self.request("session/new", {"cwd": str(cwd), "mcpServers": list(mcp)})["result"]["sessionId"]
         return self
 
     def prompt(self, text, until=None, extra=()):
@@ -1782,7 +1782,32 @@ def test_acp_files_go_through_the_client(api, tmp_path):
     acp.close()
 
 
-def test_acp_read_falls_back_to_disk_when_client_refuses(api, tmp_path):
+def statuses(updates):
+    """Each tool call's status changes, in order, by toolCallId."""
+    out = {}
+    for u in updates:
+        if u["sessionUpdate"] in ("tool_call", "tool_call_update"):
+            out.setdefault(u["toolCallId"], []).append(u["status"])
+    return out
+
+
+def test_acp_reports_each_tool_call_done(api, tmp_path):
+    (tmp_path / "a.txt").write_text("text")
+    api.reply(calls=[("r", "read", {"path": "a.txt"}),
+                     ("e", "edit", {"path": "a.txt", "old_string": "nope", "new_string": "x"}),
+                     ("u", "nosuch", {})])
+    api.reply("ok")
+    acp = Acp(api, tmp_path, fs=False).start(tmp_path)
+    acp.prompt("go")
+    assert statuses(acp.updates) == {"call_1": ["in_progress", "completed"],
+                                     "call_2": ["in_progress", "failed"]}  # nosuch: never announced
+    done = [u for u in acp.updates if u["sessionUpdate"] == "tool_call_update"]
+    assert done[0]["content"] == [{"type": "content", "content": {"type": "text", "text": "text"}}]
+    assert done[1]["content"][0]["content"]["text"] == "old_string not found in a.txt"
+    acp.close()
+
+
+def test_acp_read_inside_cwd_falls_back_to_disk_when_client_refuses(api, tmp_path):
     (tmp_path / "x.txt").write_text("disk text")
     api.reply(calls=[("r", "read", {"path": "x.txt"})])
     api.reply("ok")
@@ -1790,6 +1815,30 @@ def test_acp_read_falls_back_to_disk_when_client_refuses(api, tmp_path):
     acp.prompt("go")
     assert api.results(api.mock.requests[1])["r"] == ("disk text", False)
     assert acp.reads == [str(tmp_path / "x.txt")]
+    acp.close()
+
+
+def test_acp_read_outside_cwd_reports_the_client_refusal(api, tmp_path):
+    (tmp_path / "work").mkdir()
+    (tmp_path / "secret.txt").write_text("disk text")
+    api.reply(calls=[("r", "read", {"path": "../secret.txt"})])
+    api.reply("ok")
+    acp = Acp(api, tmp_path, files={}).start(tmp_path / "work")
+    acp.prompt("go")
+    assert api.results(api.mock.requests[1])["r"] == ("cannot read ../secret.txt: outside", True)
+    assert statuses(acp.updates) == {"call_1": ["in_progress", "failed"]}
+    acp.close()
+
+
+def test_acp_read_outside_cwd_falls_back_to_disk_under_permissions_all(api, tmp_path):
+    (tmp_path / "work").mkdir()
+    (tmp_path / "other.txt").write_text("disk text")
+    api.reply(calls=[("r", "read", {"path": "../other.txt"})])
+    api.reply("ok")
+    acp = Acp(api, tmp_path, "--permissions", "all", files={}).start(tmp_path / "work")
+    acp.prompt("go")
+    assert api.results(api.mock.requests[1])["r"] == ("disk text", False)
+    assert acp.reads == [str(tmp_path / "work" / ".." / "other.txt")]  # the editor first
     acp.close()
 
 
@@ -1826,6 +1875,9 @@ def test_acp_permission_asked_in_the_client(api, tmp_path, answer, result):
     assert (tmp_path / "d.txt").exists() == (answer == "allow")
     (perm,) = acp.perms
     assert perm["toolCall"]["title"] == "shell touch d.txt"
+    # Announced as waiting for approval; it runs only once allowed.
+    want = ["pending", "in_progress", "completed"] if answer == "allow" else ["pending", "failed"]
+    assert statuses(acp.updates) == {"call_1": want}
     assert [o["kind"] for o in perm["options"]] == ["allow_once", "reject_once"]
     acp.close()
 
@@ -1837,6 +1889,7 @@ def test_acp_cancel_stops_a_running_shell(api, tmp_path):
     r, _ = acp.prompt("go", until=lambda u: u.get("sessionUpdate") == "tool_call")
     assert r["result"] == {"stopReason": "cancelled"}
     assert time.monotonic() - t < 10
+    assert statuses(acp.updates) == {"call_1": ["in_progress", "failed"]}
     assert len(api.mock.requests) == 1  # the model is not asked again
     acp.close()
 
@@ -1870,3 +1923,251 @@ def test_acp_empty_session_id_before_session_new(api, tmp_path):
 def test_acp_and_p_conflict(api, tmp_path):
     p = api.run(tmp_path, "--acp", "-p", "x")
     assert p.returncode == 2 and "--acp" in p.stderr
+
+
+# ---- MCP servers given by the ACP client ----
+
+MCP_SERVER = Path(__file__).resolve().parent / "mcp_server.py"
+
+
+def fake_mcp(tmp_path, name="fake", **env):
+    log = tmp_path / f"{name}.log"
+    env = {"MCP_LOG": str(log), **env}
+    return {"name": name, "command": sys.executable, "args": [str(MCP_SERVER)],
+            "env": [{"name": k, "value": v} for k, v in env.items()]}, log
+
+
+def logged(log):
+    return [json.loads(line) for line in log.read_text().splitlines()]
+
+
+def tool_names(request):
+    return [t["function"]["name"] for t in request["body"]["tools"]]
+
+
+def test_acp_mcp_tools_reach_the_model_and_run(mock, tmp_path):
+    api = Api(mock, "local")
+    srv, log = fake_mcp(tmp_path, MCP_GREETING="hi")
+    api.reply(calls=[("e", "mcp__fake__echo", {"text": "ping"}), ("f", "mcp__fake__fail", {}),
+                     ("i", "mcp__fake__image", {})])
+    api.reply("ok")
+    acp = Acp(api, tmp_path).start(tmp_path, mcp=[srv])
+    assert acp.init["agentCapabilities"]["mcpCapabilities"] == {"http": False, "sse": False}
+    r, _ = acp.prompt("go")
+    assert r["result"]["stopReason"] == "end_turn"
+    # Both pages, after the four built-ins; a name outside [A-Za-z0-9_-] is made safe.
+    assert tool_names(mock.requests[0])[4:] == ["mcp__fake__echo", "mcp__fake__fail",
+                                                "mcp__fake__image", "mcp__fake__slow",
+                                                "mcp__fake__bad_name_"]
+    echo = mock.requests[0]["body"]["tools"][4]["function"]
+    assert echo["description"] == "Echo text." and echo["parameters"]["properties"]["text"]
+    assert api.results(mock.requests[1]) == {"e": ("ping hi", False),  # env reached the server
+                                             "f": ("it broke", True),
+                                             "i": ("[image]\n[resource_link file:///x]", False)}
+    methods = [m.get("method") for m in logged(log)]
+    assert methods[:4] == ["initialize", "notifications/initialized", "tools/list", "tools/list"]
+    assert logged(log)[0]["params"]["clientInfo"]["name"] == "myra"
+    kinds = {u["kind"] for u in acp.updates if u["sessionUpdate"] == "tool_call"}
+    assert kinds == {"other"}
+    assert statuses(acp.updates)["call_2"] == ["in_progress", "failed"]
+    acp.close()
+
+
+def test_acp_mcp_cancel_reaches_the_server(mock, tmp_path):
+    api = Api(mock, "local")
+    srv, log = fake_mcp(tmp_path)
+    api.reply(calls=[("s", "mcp__fake__slow", {})])
+    acp = Acp(api, tmp_path).start(tmp_path, mcp=[srv])
+    t = time.monotonic()
+    r, _ = acp.prompt("go", until=lambda u: u.get("sessionUpdate") == "tool_call")
+    assert r["result"] == {"stopReason": "cancelled"} and time.monotonic() - t < 10
+    wait_for(lambda: logged(log)[-1].get("method") == "notifications/cancelled")
+    call = next(m for m in logged(log) if m.get("method") == "tools/call")
+    assert logged(log)[-1]["params"]["requestId"] == call["id"]
+    acp.close()
+
+
+def test_acp_mcp_tools_are_denied_read_only(mock, tmp_path):
+    api = Api(mock, "local")
+    srv, log = fake_mcp(tmp_path)
+    api.reply(calls=[("e", "mcp__fake__echo", {"text": "x"})])
+    api.reply("ok")
+    acp = Acp(api, tmp_path, "--permissions", "read-only").start(tmp_path, mcp=[srv])
+    acp.prompt("go")
+    assert api.results(mock.requests[1])["e"][1] is True
+    assert "tools/call" not in [m.get("method") for m in logged(log)]
+    acp.close()
+
+
+def test_acp_mcp_new_session_replaces_servers(mock, tmp_path):
+    api = Api(mock, "local")
+    one, log1 = fake_mcp(tmp_path, "one")
+    two, log2 = fake_mcp(tmp_path, "two")
+    bad = {"name": "bad", "command": str(tmp_path / "missing"), "args": [], "env": []}
+    web = {"type": "http", "name": "web", "url": "http://127.0.0.1:1/", "headers": []}
+    api.reply("a")
+    api.reply("b")
+    acp = Acp(api, tmp_path).start(tmp_path, mcp=[one])
+    acp.prompt("go")
+    sid = acp.request("session/new", {"cwd": str(tmp_path), "mcpServers": [bad, web, two]})
+    acp.sid = sid["result"]["sessionId"]  # a server that fails is left out, not fatal
+    acp.prompt("go")
+    for req, server in ((mock.requests[0], "one"), (mock.requests[1], "two")):
+        names = [n for n in tool_names(req) if n.startswith("mcp__")]
+        assert names and all(n.startswith(f"mcp__{server}__") for n in names)
+    err = acp.close()
+    assert "mcp bad" in err and "mcp web: only stdio" in err
+    assert log1.exists() and log2.exists()
+
+
+def test_acp_mcp_server_sees_eof_despite_background_children(mock, tmp_path):
+    # A process the shell tool leaves running must not hold the server's stdin open.
+    api = Api(mock, "local")
+    srv, log = fake_mcp(tmp_path)
+    api.reply(calls=[("s", "shell", {"command": "sleep 5 >/dev/null 2>&1 &"})])
+    api.reply("ok")
+    acp = Acp(api, tmp_path).start(tmp_path, mcp=[srv])
+    acp.prompt("go")
+    acp.request("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+    assert logged(log)[-1] == {"eof": True}
+    acp.close()
+
+
+# ---- --mcp-config: MCP servers from a file ----
+
+def test_acp_mcp_cancel_stops_a_write_the_server_does_not_read(mock, tmp_path):
+    api = Api(mock, "local")
+    srv, _ = fake_mcp(tmp_path, MCP_DEAF="1")
+    api.reply(calls=[("s", "mcp__fake__slow", {})])
+    api.reply(calls=[("e", "mcp__fake__echo", {"text": "x" * (256 << 10)})])  # > a pipe buffer
+    acp = Acp(api, tmp_path).start(tmp_path, mcp=[srv])
+    r, _ = acp.prompt("first", until=lambda u: u["sessionUpdate"] == "tool_call")
+    assert r["result"]["stopReason"] == "cancelled"  # the server now reads nothing
+    r, _ = acp.prompt("second", until=lambda u: u["sessionUpdate"] == "tool_call")
+    assert r["result"]["stopReason"] == "cancelled"
+    assert statuses(acp.updates)["call_2"] == ["in_progress", "failed"]
+    acp.close()
+
+
+def test_acp_cancel_outside_a_prompt_keeps_servers_starting(mock, tmp_path):
+    api = Api(mock, "local")
+    gate = tmp_path / "gate"
+    slow, log = fake_mcp(tmp_path, "slow", MCP_WAIT=str(gate))
+    later, _ = fake_mcp(tmp_path, "later")
+    api.reply("done")
+    acp = Acp(api, tmp_path)
+    acp.request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+    acp.send({"id": 99, "method": "session/new",
+              "params": {"cwd": str(tmp_path), "mcpServers": [slow, later]}})
+    wait_for(lambda: log.exists() and "initialize" in log.read_text())
+    acp.send({"method": "session/cancel", "params": {"sessionId": "none"}})
+    time.sleep(0.5)  # past one 200 ms poll tick, so the cancel is read before the reply
+    gate.touch()
+    while (r := acp.recv()).get("id") != 99:
+        pass
+    acp.sid = r["result"]["sessionId"]
+    r, _ = acp.prompt("go")
+    assert r["result"]["stopReason"] == "end_turn"
+    names = tool_names(mock.requests[0])
+    assert "mcp__slow__echo" in names and "mcp__later__echo" in names
+    acp.close()
+
+
+def mcp_config(tmp_path, *servers):
+    """A config file in the common {"mcpServers": {name: {command, args, env}}} shape."""
+    cfg = tmp_path / "mcp.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        s["name"]: {"command": s["command"], "args": s["args"],
+                    "env": {e["name"]: e["value"] for e in s["env"]}} for s in servers}}))
+    return str(cfg)
+
+
+def test_mcp_config_tools_run_headless(mock, tmp_path):
+    api = Api(mock, "local")
+    srv, log = fake_mcp(tmp_path, MCP_GREETING="from config")
+    api.reply(calls=[("e", "mcp__fake__echo", {"text": "hi"})])
+    api.reply("done")
+    p = api.run(tmp_path, "--mcp-config", mcp_config(tmp_path, srv), "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert "mcp__fake__echo" in tool_names(mock.requests[0])
+    assert api.results(mock.requests[1]) == {"e": ("hi from config", False)}
+    assert logged(log)[-1] == {"eof": True}  # stopped at exit by closing its stdin
+
+
+def test_mcp_tools_list_failure_drops_earlier_pages(mock, tmp_path):
+    api = Api(mock, "local")
+    srv, _ = fake_mcp(tmp_path, MCP_LIST_FAIL="1")
+    api.reply("done")
+    p = api.run(tmp_path, "--mcp-config", mcp_config(tmp_path, srv), "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert "mcp fake: tools/list:" in p.stderr
+    assert not [n for n in tool_names(mock.requests[0]) if n.startswith("mcp__")]
+
+
+def test_mcp_servers_inherit_only_the_safe_environment(mock, tmp_path):
+    api = Api(mock, "local")
+    env_log = tmp_path / "env.json"
+    srv, _ = fake_mcp(tmp_path, MCP_ENV_LOG=str(env_log), MCP_GREETING="mine")
+    api.reply("done")
+    p = api.run(tmp_path, "--mcp-config", mcp_config(tmp_path, srv), "-p", "go",
+                env={"SECRET_TOKEN": "s3cret"})
+    assert p.returncode == 0, p.stderr
+    env = json.loads(env_log.read_text())
+    assert "SECRET_TOKEN" not in env and "LOCAL_API_KEY" not in env
+    assert env["PATH"] == "/usr/bin:/bin" and env["MCP_GREETING"] == "mine"
+
+
+def test_mcp_servers_stop_together(mock, tmp_path):
+    api = Api(mock, "local")
+    servers = [fake_mcp(tmp_path, f"s{i}", MCP_STUBBORN="1") for i in range(3)]
+    api.reply("done")
+    cfg = mcp_config(tmp_path, *(s for s, _ in servers))
+    t = time.monotonic()
+    p = api.run(tmp_path, "--mcp-config", cfg, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    # Each takes 2 s to stop (1 s after EOF, 1 s after SIGTERM): 6 s one at a time.
+    assert time.monotonic() - t < 4.5
+    for _, log in servers:
+        assert logged(log)[-1] == {"eof": True}
+
+
+@pytest.mark.parametrize("content,msg", [(None, "cannot read"), ("{", "expected"),
+                                         ('{"servers": {}}', "expected")])
+def test_mcp_config_errors(mock, tmp_path, content, msg):
+    api = Api(mock, "local")
+    cfg = tmp_path / "mcp.json"
+    if content is not None:
+        cfg.write_text(content)
+    p = api.run(tmp_path, "--mcp-config", str(cfg), "-p", "go")
+    assert p.returncode == 2 and msg in p.stderr
+    assert not mock.requests
+
+
+def test_mcp_config_joins_the_editors_servers(mock, tmp_path):
+    api = Api(mock, "local")
+    mine, _ = fake_mcp(tmp_path, "mine")
+    theirs, _ = fake_mcp(tmp_path, "theirs")
+    api.reply("ok")
+    acp = Acp(api, tmp_path, "--mcp-config", mcp_config(tmp_path, mine)).start(tmp_path, mcp=[theirs])
+    acp.prompt("go")
+    servers = [n.split("__")[1] for n in tool_names(mock.requests[0]) if n.startswith("mcp__")]
+    assert servers == ["mine"] * 5 + ["theirs"] * 5
+    acp.close()
+
+
+@pytest.mark.parametrize("mode", [("-p", "go"), ()], ids=["prompt", "repl"])
+def test_mcp_config_ctrl_c_at_startup_exits(mock, tmp_path, mode):
+    api = Api(mock, "local")
+    hung, log = fake_mcp(tmp_path, "hung", MCP_HANG="1")
+    later, later_log = fake_mcp(tmp_path, "later")
+    api.reply("done")
+    p = start(api, tmp_path, "--mcp-config", mcp_config(tmp_path, hung, later), *mode)
+    wait_for(lambda: log.exists() and "initialize" in log.read_text())
+    p.send_signal(signal.SIGINT)
+    out, err = p.communicate(timeout=20)
+    assert p.returncode == 130, err
+    assert out == ""
+    assert "mcp hung: initialize: interrupted by user" in err
+    assert not later_log.exists()  # the rest are skipped
+    assert not mock.requests
+    assert json.loads(log.read_text().splitlines()[-1]) == {"eof": True}  # stopped at exit

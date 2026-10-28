@@ -1,5 +1,6 @@
 /* main.c - the agent CLI: options, provider choice, headless mode and the REPL. */
 #include "myra.h"
+#include "acp.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -42,6 +43,7 @@ static int usage(const char *argv0, int rc) {
             "      else the first cloud provider whose key is set\n"
             "  -m  model id; remembered per provider\n"
             "  -p  run one prompt headless and exit (default: REPL)\n"
+            "  --acp       serve the Agent Client Protocol on stdin and stdout, for an editor\n"
             "  -V  print the version\n"
             "  -h, --help  print this help\n"
             "  --verbose   show each tool call's full arguments and result, not one line\n"
@@ -263,10 +265,11 @@ int main(int argc, char **argv) {
                                              {"verbose", no_argument, NULL, 'v'},
                                              {"no-color", no_argument, NULL, 'C'},
                                              {"raw", no_argument, NULL, 'R'},
+                                             {"acp", no_argument, NULL, 'A'},
                                              {"help", no_argument, NULL, 'h'},
                                              {NULL, 0, NULL, 0}};
     myra_permissions perms = MYRA_AUTO;
-    int opt, verbose = 0, color = 1, raw = 0;
+    int opt, verbose = 0, color = 1, raw = 0, acp = 0;
     const char *no_color = getenv("NO_COLOR"); /* https://no-color.org */
     if (no_color && *no_color) color = 0, raw = 1;
     while ((opt = getopt_long(argc, argv, "p:P:m:hV", longopts, NULL)) != -1) {
@@ -275,6 +278,7 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (opt == 'v') verbose = 1;
+        else if (opt == 'A') acp = 1;
         else if (opt == 'C') color = 0;
         else if (opt == 'R') raw = 1;
         else if (opt == 'W') {
@@ -292,6 +296,10 @@ int main(int argc, char **argv) {
         else return usage(argv[0], opt == 'h' ? 0 : 2);
     }
     if (optind < argc) return usage(argv[0], 2);
+    if (acp && prompt) {
+        myra_note(MYRA_ERROR, "error: --acp takes prompts from the client, not -p\n");
+        return 2;
+    }
     myra_color = color && isatty(STDERR_FILENO);
     myra_markdown = !raw && isatty(STDOUT_FILENO);
     myra_escape_out = isatty(STDOUT_FILENO);
@@ -328,7 +336,9 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
 
     int rc = 0;
-    if (prompt) {
+    if (acp) {
+        rc = myra_acp(&a);
+    } else if (prompt) {
         rc = myra_ask(&a, prompt) < 0;
         if (myra_interrupted) rc = 130; /* 128 + SIGINT, as a shell would report */
     } else {

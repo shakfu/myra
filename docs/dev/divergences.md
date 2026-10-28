@@ -12,6 +12,7 @@ Checked against commit `b0a3adb`.
 | Prompt | stderr | stdout | `input()` writes it there |
 | Lone completion | no trailing space | trailing space | `readline` default |
 | Request timeout | 600 s for the whole transfer (`CURLOPT_TIMEOUT`) | 600 s per socket read (`urlopen(timeout=)`) | `urllib` has no whole-request timeout |
+| `--acp` input | stdin is drained from curl's progress callback and the shell loop: `session/cancel` stops a model request within about 1 s; a parse error is answered when stdin is next drained | a reader thread takes stdin: `session/cancel` sends the main thread SIGINT, which stops a request at once; a parse error is answered at once | `urllib` has no progress callback |
 
 ## Undecided
 
@@ -20,8 +21,10 @@ These exist in the code. Nobody has chosen them.
 | Area | C | Python |
 |-|-|-|
 | A `tool_calls` entry that is not an object | kept in history and answered with `invalid JSON arguments for ?` | removed from the message; gets no result |
-| NUL (`\u0000`) in a string argument | cJSON keeps it, so the C string ends there: `{"path":"a\u0000b"}` acts on `a` | `bad arguments for <tool>: embedded null byte` |
+| NUL (`\u0000`) in a string argument | cJSON keeps it, so the C string ends there: `{"path":"a\u0000b"}` acts on `a` | `bad arguments for <tool>: embedded null byte`; under `--acp` with client files, sent to the client whole |
 | Lone UTF-16 surrogate in arguments | cJSON rejects the JSON: `invalid JSON arguments for <tool>` | parses; encoding fails: `bad arguments for <tool>: ...` |
+| Lone UTF-16 surrogate in an `--acp` message | unparseable: a pending call to the client fails with `unparseable reply from the client`, else `-32700` | parses; in file text from the client it becomes `?` |
+| Keys of an `--acp` message | `cJSON_GetObjectItem`: case-insensitive, the first duplicate wins | exact, the last duplicate wins |
 | `read` of a pipe or device longer than the cap | NUL anywhere in the bytes read makes it `is binary` | only NUL in the kept head and tail does |
 | Network error line | `api error (<curl error>, http 0)[, retrying]: <body>` | `api error (<reason>)[, retrying]` |
 | `shell` cannot start | `pipe failed: ...` or `fork failed: ...` | `cannot run /bin/sh: ...` |

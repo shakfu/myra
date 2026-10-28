@@ -21,6 +21,10 @@
    myra_ask clears it on entry. */
 extern volatile sig_atomic_t myra_interrupted;
 
+/* Called often while a model request or shell command runs, so a front end can
+   read its input and set myra_interrupted. NULL: none. */
+extern void (*myra_poll)(void);
+
 /* Color stderr messages with ANSI codes. The CLI sets it for a terminal. */
 extern int myra_color;
 typedef enum { MYRA_PLAIN, MYRA_TOOL, MYRA_ERROR, MYRA_WARN, MYRA_DIM, MYRA_BOLD } myra_style;
@@ -88,6 +92,20 @@ typedef struct {
 extern const myra_provider MYRA_PROVIDERS[];
 extern const size_t MYRA_NPROVIDERS;
 
+/* Hooks that replace the terminal and the local filesystem, for a front end that
+   owns both (ACP mode). A NULL member keeps the default behaviour. */
+typedef struct {
+    void *ud;
+    void (*text)(void *ud, const char *s); /* reply text, as it streams */
+    void (*tool)(void *ud, const char *name, const char *detail); /* a tool call starts */
+    /* The file at absolute path, malloc'd; NULL on failure, with *why malloc'd. */
+    char *(*read)(void *ud, const char *path, char **why);
+    /* Write content to absolute path: NULL on success, else why, malloc'd. */
+    char *(*write)(void *ud, const char *path, const char *content);
+    /* Whether a mutating tool may run, asked where --permissions would ask. 1 allows. */
+    int (*allow)(void *ud, const char *name, const char *detail, int outside);
+} myra_io;
+
 typedef struct {
     const myra_provider *prov;
     char *model;         /* owned */
@@ -101,6 +119,7 @@ typedef struct {
     int verbose;         /* full tool arguments and results on stderr, not one line per call */
     int turn_calls;      /* tool calls run in this turn */
     myra_usage session; /* totals over every turn */
+    myra_io io;
     cJSON *tools, *messages;
 } myra_agent;
 
@@ -129,6 +148,9 @@ void myra_list_models(myra_agent *a, const char *filter);
 /* The provider's model ids, NULL-terminated; NULL if the request failed. Fetches. */
 char **myra_model_ids(myra_agent *a);
 void myra_free_model_ids(char **ids);
+
+/* Rebuild the system prompt for the current working directory. */
+void myra_set_cwd(myra_agent *a);
 
 /* Lower-level pieces, exposed for tests. */
 

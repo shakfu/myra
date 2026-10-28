@@ -4,6 +4,8 @@
 
 ### Added
 
+- `--acp` serves the Agent Client Protocol on stdin and stdout, so an editor can drive myra (README, "Editors"). File reads and writes go through the editor when it serves them, so `read` sees unsaved buffers. Permission questions appear in the editor's UI, and `session/cancel` works like Ctrl-C. myralib gets `myra_io` hooks for text, tool calls, file access and permission, plus a `myra_poll` hook. The CLI keeps the defaults. One thread polls stdin from curl's progress callback and the `shell` wait loop, so a cancel is seen mid-request without a reader thread and locking.
+
 - Replies render as markdown when stdout is a terminal: headings, bold, italic, inline and fenced code, bullets, quotes and rules. Text still streams. Only a line's start and a run of `*`, `_` or `\` are held, until the next character decides them. Rendering whole lines was simpler, but shows a long paragraph at once. Piped stdout, `--raw` and `NO_COLOR` keep the raw text.
 
 - `--raw` turns off rendering and `--no-color` turns off stderr color, so every combination is reachable; `NO_COLOR` turns off both. `/raw` reprints the last reply raw, since the need to copy markdown usually arises after the reply is shown.

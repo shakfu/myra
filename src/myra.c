@@ -47,6 +47,7 @@ static const char *TOOLS_JSON =
     "\"required\":[\"command\"],\"additionalProperties\":false}}}]";
 
 volatile sig_atomic_t myra_interrupted;
+void (*myra_poll)(void);
 int myra_color, myra_escape_out, myra_escape_err;
 
 void myra_note(myra_style style, const char *fmt, ...) {
@@ -139,6 +140,30 @@ static char *fmt(const char *f, const char *a) {
     if (!s) { perror("malloc"); exit(1); }
     snprintf(s, n, f, a);
     return s;
+}
+
+/* msg + ": " + why; frees both. */
+static char *with_why(char *msg, char *why) {
+    buf b = {0};
+    buf_add(&b, msg, strlen(msg));
+    if (why && *why) {
+        buf_lit(&b, ": ");
+        buf_add(&b, why, strlen(why));
+    }
+    free(msg);
+    free(why);
+    return b.p;
+}
+
+/* path made absolute against the working directory, malloc'd; ACP requires absolute paths. */
+static char *absolute(const char *path) {
+    char cwd[PATH_MAX];
+    if (*path == '/' || !getcwd(cwd, sizeof cwd)) return xstrdup(path);
+    buf b = {0};
+    buf_add(&b, cwd, strlen(cwd));
+    buf_lit(&b, "/");
+    buf_add(&b, path, strlen(path));
+    return b.p;
 }
 
 static const char *get_str(cJSON *o, const char *key) {
@@ -419,36 +444,52 @@ static char *tool_write(const char *path, const char *content, int *err) {
     return fmt("wrote %s", path);
 }
 
-static char *tool_edit(const char *path, const char *old, const char *new, int *err) {
+/* io: the front end's file hooks, or NULL for the disk. */
+static char *tool_edit(const myra_io *io, const char *path, const char *old, const char *new,
+                       int *err) {
     *err = 1;
     if (!*old) return xstrdup("old_string is empty");
-    if (dangling_symlink(path)) return fmt("%s is a symlink to a missing file", path);
-    struct stat st;
-    if (!stat(path, &st) && st.st_size > MYRA_MAX_RAW) /* edit holds the whole file */
-        return fmt("%s is too large to edit; use shell (sed, awk)", path);
     buf b = {0};
-    if (slurp(path, &b) < 0) { free(b.p); return fmt("cannot read %s", path); }
+    char *abs = NULL;
+    if (io) {
+        char *why = NULL, *text = io->read(io->ud, abs = absolute(path), &why);
+        if (!text) { free(abs); return with_why(fmt("cannot read %s", path), why); }
+        buf_add(&b, text, strlen(text));
+        free(text);
+    } else {
+        if (dangling_symlink(path)) return fmt("%s is a symlink to a missing file", path);
+        struct stat st;
+        if (!stat(path, &st) && st.st_size > MYRA_MAX_RAW) /* edit holds the whole file */
+            return fmt("%s is too large to edit; use shell (sed, awk)", path);
+        if (slurp(path, &b) < 0) { free(b.p); return fmt("cannot read %s", path); }
+    }
     /* The searches below are strstr: a NUL hides any match past it, including a second
        one, so the unique-match guarantee would not hold. read refuses these files too. */
-    if (memchr(b.p, 0, b.n)) { free(b.p); return fmt("%s is binary", path); }
+    if (memchr(b.p, 0, b.n)) { free(b.p); free(abs); return fmt("%s is binary", path); }
     char *hit = strstr(b.p, old);
     if (!hit && strstr(old, "\xEF\xBF\xBD") && !valid_utf8(&b)) { /* U+FFFD from read */
         free(b.p);
+        free(abs);
         return fmt("old_string not found in %s: the file is not valid UTF-8, and read showed "
                    "its invalid bytes as U+FFFD, which edit cannot match. Use shell (sed, iconv).",
                    path);
     }
-    if (!hit) { free(b.p); return fmt("old_string not found in %s", path); }
-    if (strstr(hit + 1, old)) { free(b.p); return fmt("old_string occurs more than once in %s", path); }
+    if (!hit || strstr(hit + 1, old)) {
+        free(b.p);
+        free(abs);
+        return fmt(hit ? "old_string occurs more than once in %s" : "old_string not found in %s", path);
+    }
     buf out = {0};
     size_t pre = hit - b.p, olen = strlen(old);
     buf_add(&out, b.p, pre);
     buf_add(&out, new, strlen(new));
     buf_add(&out, hit + olen, b.n - pre - olen);
-    int rc = spit(path, out.p, out.n);
+    char *why = NULL;
+    int rc = abs ? ((why = io->write(io->ud, abs, out.p)) ? -1 : 0) : spit(path, out.p, out.n);
     free(b.p);
     free(out.p);
-    if (rc < 0) return fmt("cannot write %s", path);
+    free(abs);
+    if (rc < 0) return with_why(fmt("cannot write %s", path), why);
     *err = 0;
     return fmt("edited %s", path);
 }
@@ -504,6 +545,7 @@ static char *tool_shell(const char *cmd, int timeout, size_t cap, int *err) {
     const char *stopped = NULL;
     double deadline = now() + timeout;
     for (;;) {
+        if (myra_poll) myra_poll();
         if (myra_interrupted) { stopped = "interrupted by user"; break; }
         if (s.total > MYRA_MAX_RAW) { stopped = "output limit"; break; }
         double left = deadline - now();
@@ -521,6 +563,7 @@ static char *tool_shell(const char *cmd, int timeout, size_t cap, int *err) {
     while (!stopped) { /* EOF: sh may have closed its output and kept running */
         pid_t w = waitpid(pid, &st, WNOHANG);
         if (w == pid || (w < 0 && errno != EINTR)) break;
+        if (myra_poll) myra_poll();
         if (myra_interrupted) stopped = "interrupted by user";
         else if (now() >= deadline) stopped = "timed out";
         else usleep(10000);
@@ -569,10 +612,11 @@ static int outside_cwd(const char *path) {
 
 /* Ask on the controlling terminal so it works in headless mode and the REPL alike.
    Returns NULL if allowed, else why not, for the model to relay. */
-static const char *denied(myra_permissions mode, int outside, const char *name,
-                          const char *detail) {
+static const char *denied(myra_agent *a, int outside, const char *name, const char *detail) {
+    myra_permissions mode = a->permissions;
     if (mode == MYRA_READ_ONLY) return "denied: the agent runs with --permissions read-only";
     if (mode == MYRA_ALL || (mode == MYRA_AUTO && !outside)) return NULL;
+    if (a->io.allow) return a->io.allow(a->io.ud, name, detail, outside) ? NULL : "denied by user";
     FILE *tty = fopen("/dev/tty", "r+");
     if (!tty)
         return mode == MYRA_AUTO ? "denied: outside the working directory; --permissions all allows it"
@@ -617,31 +661,64 @@ static void tool_log(myra_agent *a, const char *name, const char *detail) {
     free(shown);
 }
 
+/* Log the call, and tell the front end. */
+static void tool_start(myra_agent *a, const char *name, const char *detail) {
+    tool_log(a, name, detail);
+    if (a->io.tool) a->io.tool(a->io.ud, name, detail);
+}
+
+/* read through the front end, capped like a local read. NULL if it refused: the
+   path lies outside what it serves, and the disk is read instead. */
+static char *served_read(myra_agent *a, const char *path, int *err) {
+    char *abs = absolute(path), *why = NULL, *text = a->io.read(a->io.ud, abs, &why);
+    free(abs);
+    free(why);
+    if (!text) return NULL;
+    sink s;
+    sink_init(&s, a->max_output);
+    sink_add(&s, text, strlen(text));
+    free(text);
+    char *out = sink_take(&s);
+    sink_free(&s);
+    *err = 0;
+    return out;
+}
+
 char *myra_run_tool(myra_agent *a, const char *name, cJSON *input, int *err) {
     const char *path = str_arg(input, "path");
     const char *content = str_arg(input, "content");
     const char *old = str_arg(input, "old_string"), *new = str_arg(input, "new_string");
     const char *cmd = str_arg(input, "command"), *why;
     *err = 1;
+    int served = a->io.read && a->io.write; /* the front end owns the files */
     if (!strcmp(name, "read") && path) {
-        tool_log(a, "read", path);
+        tool_start(a, "read", path);
+        char *out = a->io.read ? served_read(a, path, err) : NULL;
+        if (out) return out;
         *err = 0;
         return tool_read(path, a->max_output, err);
     }
     if (!strcmp(name, "write") && path && content) {
-        tool_log(a, "write", path);
-        if ((why = denied(a->permissions, outside_cwd(path), "write", path))) return xstrdup(why);
+        tool_start(a, "write", path);
+        if ((why = denied(a, outside_cwd(path), "write", path))) return xstrdup(why);
+        if (served) {
+            char *abs = absolute(path), *failed = a->io.write(a->io.ud, abs, content);
+            free(abs);
+            if (failed) return with_why(fmt("cannot write %s", path), failed);
+            *err = 0;
+            return fmt("wrote %s", path);
+        }
         *err = 0;
         return tool_write(path, content, err);
     }
     if (!strcmp(name, "edit") && path && old && new) {
-        tool_log(a, "edit", path);
-        if ((why = denied(a->permissions, outside_cwd(path), "edit", path))) return xstrdup(why);
-        return tool_edit(path, old, new, err);
+        tool_start(a, "edit", path);
+        if ((why = denied(a, outside_cwd(path), "edit", path))) return xstrdup(why);
+        return tool_edit(served ? &a->io : NULL, path, old, new, err);
     }
     if (!strcmp(name, "shell") && cmd) {
-        tool_log(a, "shell", cmd);
-        if ((why = denied(a->permissions, 0, "shell", cmd))) return xstrdup(why); /* unconfinable */
+        tool_start(a, "shell", cmd);
+        if ((why = denied(a, 0, "shell", cmd))) return xstrdup(why); /* unconfinable */
         cJSON *t = cJSON_GetObjectItemCaseSensitive(input, "timeout");
         double want = cJSON_IsNumber(t) ? t->valuedouble : MYRA_SHELL_TIMEOUT;
         /* Clamp before the cast: an out-of-range double to int is undefined. */
@@ -716,6 +793,7 @@ const myra_provider *myra_provider_default(void) {
 /* curl calls this about once a second, and sooner on activity; nonzero aborts. */
 static int on_progress(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut, curl_off_t un) {
     (void)ud, (void)dt, (void)dn, (void)ut, (void)un;
+    if (myra_poll) myra_poll();
     return myra_interrupted;
 }
 
@@ -959,6 +1037,7 @@ typedef struct {
     int oversize; /* received passed MYRA_MAX_RESPONSE; the transfer was aborted */
     myra_esc esc;
     myra_md md;
+    const myra_io *io; /* io->text, when set, takes the reply text */
 } stream;
 
 /* Count len more bytes; 0 once over the cap, which curl takes as an abort. */
@@ -1080,8 +1159,8 @@ static void stream_event(stream *st, const char *data) {
     if (finish) snprintf(st->finish, sizeof st->finish, "%s", finish);
     cJSON_ArrayForEach(f, cJSON_GetObjectItem(choice, "delta")) {
         if (!strcmp(f->string, "content") && cJSON_IsString(f) && *f->valuestring) {
-            show(&st->esc, &st->md, f->valuestring);
-            fflush(stdout);
+            if (st->io->text) st->io->text(st->io->ud, f->valuestring);
+            else show(&st->esc, &st->md, f->valuestring), fflush(stdout);
             st->printed = 1;
             buf_add(&st->content, f->valuestring, strlen(f->valuestring));
         } else if (!strcmp(f->string, "tool_calls") && cJSON_IsArray(f)) {
@@ -1185,7 +1264,7 @@ static cJSON *request(myra_agent *a, const char *path, const char *body, int str
             nanosleep(&ts, NULL);
         }
         if (myra_interrupted) break;
-        stream st = {0};
+        stream st = {.io = &a->io};
         CURL *c = st.c = curl_easy_init();
         curl_easy_setopt(c, CURLOPT_URL, url.p);
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
@@ -1200,7 +1279,7 @@ static cJSON *request(myra_agent *a, const char *path, const char *body, int str
         long status = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
         curl_easy_cleanup(c);
-        if (st.printed) { /* end the streamed line */
+        if (st.printed && !a->io.text) { /* end the streamed line */
             show(&st.esc, &st.md, NULL);
             if (myra_markdown) myra_md_end(&st.md, stdout);
             else putchar('\n');
@@ -1356,7 +1435,10 @@ int myra_step(myra_agent *a, cJSON *resp) {
         myra_note(MYRA_WARN, "warning: reply hit the length limit\n");
         cJSON_DeleteItemFromObject(msg, "tool_calls");
     }
-    if (!a->streamed) print_text(get_str(msg, "content")); /* else already shown */
+    const char *text = get_str(msg, "content");
+    if (a->streamed) {} /* already shown */
+    else if (a->io.text) { if (text && *text) a->io.text(a->io.ud, text); }
+    else print_text(text);
     cJSON *calls = cJSON_GetObjectItem(msg, "tool_calls");
     int ncalls = cJSON_GetArraySize(calls);
     if (!ncalls && !get_str(msg, "content")) { /* null content is only valid with tool_calls */
@@ -1530,20 +1612,25 @@ int myra_init(myra_agent *a, const myra_provider *p, const char *model, myra_per
     a->model = xstrdup(model ? model : remembered ? remembered : p->model);
     free(remembered);
 
+    a->tools = cJSON_Parse(TOOLS_JSON);
+    a->messages = cJSON_CreateArray();
+    cJSON *sys = cJSON_CreateObject(); /* rollback in myra_ask never reaches index 0 */
+    cJSON_AddStringToObject(sys, "role", "system");
+    cJSON_AddStringToObject(sys, "content", "");
+    cJSON_AddItemToArray(a->messages, sys);
+    myra_set_cwd(a);
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    return 0;
+}
+
+void myra_set_cwd(myra_agent *a) {
     char cwd[4096];
     if (!getcwd(cwd, sizeof cwd)) strcpy(cwd, ".");
     char *prompt = fmt("You are a coding agent. The working directory is %s. Use the read, write, "
                        "edit and shell tools to inspect and change code. Verify changes where you "
                        "can. Be concise.", cwd);
-    a->tools = cJSON_Parse(TOOLS_JSON);
-    a->messages = cJSON_CreateArray();
-    cJSON *sys = cJSON_CreateObject(); /* rollback in myra_ask never reaches index 0 */
-    cJSON_AddStringToObject(sys, "role", "system");
-    cJSON_AddStringToObject(sys, "content", prompt);
-    cJSON_AddItemToArray(a->messages, sys);
+    cJSON_ReplaceItemInObject(cJSON_GetArrayItem(a->messages, 0), "content", cJSON_CreateString(prompt));
     free(prompt);
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    return 0;
 }
 
 void myra_free(myra_agent *a) {

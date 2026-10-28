@@ -1652,3 +1652,221 @@ def test_bad_retry_delay_falls_back_to_default(mock, tmp_path, value):
     t = time.monotonic()
     p = api.run(tmp_path, "-p", "go", env={"MYRA_RETRY_DELAY_MS": value})
     assert p.returncode == 0 and 0.9 < time.monotonic() - t < 3  # the 1 s default
+
+
+# ---- ACP mode: myra as an agent behind an editor ----
+
+class Acp:
+    """Drives `myra --acp` as an editor would. files maps absolute paths to buffer
+    text the client serves; a path not in it gets an error. permission answers
+    session/request_permission: "allow", "reject", or None to leave it pending."""
+
+    def __init__(self, api, cwd, *args, files=None, permission="allow", fs=True):
+        self.p = subprocess.Popen([str(AGENT), "-P", api.provider, "--acp", *args], cwd=cwd,
+                                  env=api.env(cwd), stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  start_new_session=True)
+        self.files, self.permission, self.fs = dict(files or {}), permission, fs
+        self.reads, self.writes, self.perms, self.updates = [], [], [], []
+        self.buf, self.next_id = b"", 0
+
+    def send(self, msg):
+        msg["jsonrpc"] = "2.0"
+        self.p.stdin.write((json.dumps(msg) + "\n").encode())
+        self.p.stdin.flush()
+
+    def recv(self, timeout=20):
+        end = time.monotonic() + timeout
+        while b"\n" not in self.buf:
+            left = end - time.monotonic()
+            assert left > 0, "no message from the agent"
+            if select.select([self.p.stdout], [], [], left)[0]:
+                chunk = os.read(self.p.stdout.fileno(), 65536)
+                assert chunk, "agent closed stdout: " + self.p.stderr.read().decode()
+                self.buf += chunk
+        line, _, self.buf = self.buf.partition(b"\n")
+        return json.loads(line)  # stdout carries only protocol messages
+
+    def serve(self, msg):
+        m, p = msg["method"], msg.get("params", {})
+        if m == "session/update":
+            self.updates.append(p["update"])
+            return
+        if m == "fs/read_text_file":
+            self.reads.append(p["path"])
+            if p["path"] in self.files:
+                return self.send({"id": msg["id"], "result": {"content": self.files[p["path"]]}})
+            return self.send({"id": msg["id"], "error": {"code": -32602, "message": "outside"}})
+        if m == "fs/write_text_file":
+            self.writes.append((p["path"], p["content"]))
+            self.files[p["path"]] = p["content"]
+            return self.send({"id": msg["id"], "result": {}})
+        if m == "session/request_permission":
+            self.perms.append(p)
+            if self.permission is None:
+                self.pending = msg["id"]
+                return
+            return self.send({"id": msg["id"], "result": {"outcome": {
+                "outcome": "selected", "optionId": self.permission}}})
+
+    def request(self, method, params, until=None):
+        """Send a request, serve the agent's requests, return the response.
+        until(update) -> True sends session/cancel once."""
+        self.next_id += 1
+        rid = self.next_id
+        self.send({"id": rid, "method": method, "params": params})
+        while True:
+            msg = self.recv()
+            if "method" in msg:
+                self.serve(msg)
+                if until and self.updates and until(self.updates[-1]):
+                    until = None
+                    self.send({"method": "session/cancel", "params": {"sessionId": self.sid}})
+            elif msg.get("id") == rid:
+                return msg
+
+    def start(self, cwd):
+        r = self.request("initialize", {"protocolVersion": 1, "clientCapabilities": {
+            "fs": {"readTextFile": self.fs, "writeTextFile": self.fs}, "terminal": False},
+            "clientInfo": {"name": "test", "version": "1"}})
+        self.init = r["result"]
+        self.sid = self.request("session/new", {"cwd": str(cwd), "mcpServers": []})["result"]["sessionId"]
+        return self
+
+    def prompt(self, text, until=None, extra=()):
+        self.updates = []
+        r = self.request("session/prompt", {"sessionId": self.sid, "prompt": [
+            {"type": "text", "text": text}, *extra]}, until)
+        chunks = "".join(u["content"]["text"] for u in self.updates
+                         if u["sessionUpdate"] == "agent_message_chunk")
+        return r, chunks
+
+    def close(self):
+        self.p.stdin.close()
+        assert self.p.wait(timeout=10) == 0
+        return self.p.stderr.read().decode()
+
+
+def test_acp_streams_reply_in_session_cwd(api, tmp_path):
+    (tmp_path / "sub").mkdir()
+    api.reply("hello there")
+    acp = Acp(api, tmp_path).start(tmp_path / "sub")
+    assert acp.init["protocolVersion"] == 1 and acp.init["agentInfo"]["name"] == "myra"
+    r, chunks = acp.prompt("hi", extra=[{"type": "resource_link", "name": "a.c",
+                                         "uri": "file:///w/a.c"}])
+    assert r["result"] == {"stopReason": "end_turn"} and chunks == "hello there"
+    msgs = api.mock.requests[0]["body"]["messages"]
+    assert str((tmp_path / "sub").resolve()) in msgs[0]["content"]
+    assert msgs[1]["content"] == "hi\n\nContext: the user's open file /w/a.c"
+    acp.close()
+
+
+def test_acp_files_go_through_the_client(api, tmp_path):
+    a, b = str(tmp_path / "a.txt"), str(tmp_path / "b.txt")
+    (tmp_path / "a.txt").write_text("on disk\n")
+    api.reply(calls=[("r", "read", {"path": "a.txt"}),
+                     ("w", "write", {"path": "b.txt", "content": "new\n"}),
+                     ("e", "edit", {"path": "a.txt", "old_string": "unsaved", "new_string": "saved"})])
+    api.reply("ok")
+    acp = Acp(api, tmp_path, files={a: "unsaved buffer\n"}).start(tmp_path)
+    r, _ = acp.prompt("go")
+    assert r["result"]["stopReason"] == "end_turn"
+    res = api.results(api.mock.requests[1])
+    assert res["r"] == ("unsaved buffer\n", False)  # the client's text, not the disk's
+    assert not res["w"][1] and not res["e"][1]
+    assert acp.writes == [(b, "new\n"), (a, "saved buffer\n")]
+    assert acp.reads == [a, a]
+    assert (tmp_path / "a.txt").read_text() == "on disk\n" and not (tmp_path / "b.txt").exists()
+    kinds = [(u["kind"], u["title"]) for u in acp.updates if u["sessionUpdate"] == "tool_call"]
+    assert kinds == [("read", "read a.txt"), ("edit", "write b.txt"), ("edit", "edit a.txt")]
+    acp.close()
+
+
+def test_acp_read_falls_back_to_disk_when_client_refuses(api, tmp_path):
+    (tmp_path / "x.txt").write_text("disk text")
+    api.reply(calls=[("r", "read", {"path": "x.txt"})])
+    api.reply("ok")
+    acp = Acp(api, tmp_path, files={}).start(tmp_path)
+    acp.prompt("go")
+    assert api.results(api.mock.requests[1])["r"] == ("disk text", False)
+    assert acp.reads == [str(tmp_path / "x.txt")]
+    acp.close()
+
+
+def test_acp_write_refused_by_client_is_an_error(api, tmp_path):
+    api.reply(calls=[("e", "edit", {"path": "y.txt", "old_string": "a", "new_string": "b"})])
+    api.reply("ok")
+    acp = Acp(api, tmp_path, files={}).start(tmp_path)
+    acp.prompt("go")
+    assert api.results(api.mock.requests[1])["e"] == ("cannot read y.txt: outside", True)
+    acp.close()
+
+
+def test_acp_without_fs_capability_uses_the_disk(api, tmp_path):
+    (tmp_path / "z.txt").write_text("disk")
+    api.reply(calls=[("r", "read", {"path": "z.txt"}),
+                     ("w", "write", {"path": "z.txt", "content": "changed"})])
+    api.reply("ok")
+    acp = Acp(api, tmp_path, fs=False).start(tmp_path)
+    acp.prompt("go")
+    assert api.results(api.mock.requests[1])["r"] == ("disk", False)
+    assert acp.reads == [] and acp.writes == []
+    assert (tmp_path / "z.txt").read_text() == "changed"
+    acp.close()
+
+
+@pytest.mark.parametrize("answer,result", [("reject", ("denied by user", True)),
+                                           ("allow", ("[exit 0]", False))])
+def test_acp_permission_asked_in_the_client(api, tmp_path, answer, result):
+    api.reply(calls=[("s", "shell", {"command": "touch d.txt"})])
+    api.reply("ok")
+    acp = Acp(api, tmp_path, "--permissions", "ask", permission=answer).start(tmp_path)
+    acp.prompt("go")
+    assert api.results(api.mock.requests[1])["s"] == result
+    assert (tmp_path / "d.txt").exists() == (answer == "allow")
+    (perm,) = acp.perms
+    assert perm["toolCall"]["title"] == "shell touch d.txt"
+    assert [o["kind"] for o in perm["options"]] == ["allow_once", "reject_once"]
+    acp.close()
+
+
+def test_acp_cancel_stops_a_running_shell(api, tmp_path):
+    api.reply(calls=[("s", "shell", {"command": "sleep 30"})])
+    acp = Acp(api, tmp_path, "--permissions", "all").start(tmp_path)
+    t = time.monotonic()
+    r, _ = acp.prompt("go", until=lambda u: u.get("sessionUpdate") == "tool_call")
+    assert r["result"] == {"stopReason": "cancelled"}
+    assert time.monotonic() - t < 10
+    assert len(api.mock.requests) == 1  # the model is not asked again
+    acp.close()
+
+
+def test_acp_protocol_errors(api, tmp_path):
+    acp = Acp(api, tmp_path).start(tmp_path)
+    assert acp.request("session/prompt", {"sessionId": "nope", "prompt": []})["error"]["code"] == -32602
+    assert acp.request("no/such", {})["error"]["code"] == -32601
+    acp.close()
+
+
+def test_acp_order_and_notifications(api, tmp_path):
+    acp = Acp(api, tmp_path)
+    # Before initialize: refused, so no reply text can reach stdout raw.
+    assert acp.request("session/prompt", {"sessionId": "", "prompt": []})["error"]["code"] == -32600
+    acp.start(tmp_path)
+    # A request sent without an id is a notification: no reply at all.
+    acp.send({"method": "session/new", "params": {"cwd": str(tmp_path), "mcpServers": []}})
+    acp.send({"method": "initialize", "params": {"protocolVersion": 1}})
+    assert acp.request("no/such", {})["error"]["code"] == -32601  # the next message is this
+    acp.close()
+
+
+def test_acp_empty_session_id_before_session_new(api, tmp_path):
+    acp = Acp(api, tmp_path)
+    acp.request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+    assert acp.request("session/prompt", {"sessionId": "", "prompt": []})["error"]["code"] == -32602
+    acp.close()
+
+
+def test_acp_and_p_conflict(api, tmp_path):
+    p = api.run(tmp_path, "--acp", "-p", "x")
+    assert p.returncode == 2 and "--acp" in p.stderr

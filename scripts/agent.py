@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""agent.py - myra in Python 3.11+, stdlib only: providers, the four tools, the tool loop and the REPL.
+"""agent.py - myra in Python 3.11+, stdlib only: providers, the four tools, the tool loop, the REPL
+and ACP mode.
 
 Behaves as ./myra does and shares its saved state; tests/test_agent.py runs against either.
 See README.md for the user-facing behaviour, and docs/dev/divergences.md for where the two differ.
@@ -19,9 +20,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -523,6 +526,33 @@ class Sink:
         return f"{clean(head)}\n[... {dropped} bytes omitted ...]\n{clean(tail)}"
 
 
+class ClientError(Exception):
+    """A front end's file hook failed; the message says why."""
+
+
+@dataclass
+class Io:
+    """Hooks that replace the terminal and the local filesystem, for a front end that owns
+    both (ACP mode). None keeps the default behaviour."""
+    text: Callable[[str], None] | None = None  # reply text, as it streams
+    tool: Callable[[str, str], None] | None = None  # a tool call starts: name, detail
+    read: Callable[[str], str] | None = None  # the file at an absolute path; raises ClientError
+    write: Callable[[str, str], None] | None = None  # path, content; raises ClientError
+    allow: Callable[[str, str, bool], bool] | None = None  # asked where --permissions would ask
+
+
+def absolute(path: str) -> str:
+    """path made absolute against the working directory; ACP requires absolute paths."""
+    try:
+        return path if path.startswith("/") else f"{os.getcwd()}/{path}"
+    except OSError:
+        return path
+
+
+def with_why(msg: str, why: str) -> str:
+    return f"{msg}: {why}" if why else msg
+
+
 # ---- tools: each returns (result, is_error) ----
 
 def tool_read(path: str, cap: int) -> tuple[str, bool]:
@@ -560,18 +590,25 @@ def tool_write(path: str, content: str) -> tuple[str, bool]:
     return f"wrote {path}", False
 
 
-def tool_edit(path: str, old: str, new: str) -> tuple[str, bool]:
+def tool_edit(path: str, old: str, new: str, io: Io | None = None) -> tuple[str, bool]:
+    """io: the front end's file hooks, or None for the disk."""
     if not old:
         return "old_string is empty", True
-    if dangling_symlink(path):
-        return f"{path} is a symlink to a missing file", True
-    with suppress(OSError):
-        if os.stat(path).st_size > MAX_RAW:  # edit holds the whole file
-            return f"{path} is too large to edit; use shell (sed, awk)", True
-    try:
-        data = Path(path).read_bytes()
-    except OSError:
-        return f"cannot read {path}", True
+    if io:
+        try:
+            data = io.read(absolute(path)).encode()
+        except ClientError as e:
+            return with_why(f"cannot read {path}", str(e)), True
+    else:
+        if dangling_symlink(path):
+            return f"{path} is a symlink to a missing file", True
+        with suppress(OSError):
+            if os.stat(path).st_size > MAX_RAW:  # edit holds the whole file
+                return f"{path} is too large to edit; use shell (sed, awk)", True
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            return f"cannot read {path}", True
     if b"\0" in data:  # read refuses these; myra cannot search them safely (strstr)
         return f"{path} is binary", True
     old_b = old.encode()
@@ -587,8 +624,14 @@ def tool_edit(path: str, old: str, new: str) -> tuple[str, bool]:
         return f"old_string not found in {path}", True
     if data.find(old_b, hit + 1) >= 0:
         return f"old_string occurs more than once in {path}", True
+    out = data[:hit] + new.encode() + data[hit + len(old_b):]
     try:
-        spit(path, data[:hit] + new.encode() + data[hit + len(old_b):])
+        if io:
+            io.write(absolute(path), out.decode())  # valid: the match lies on character boundaries
+        else:
+            spit(path, out)
+    except ClientError as e:
+        return with_why(f"cannot write {path}", str(e)), True
     except OSError:
         return f"cannot write {path}", True
     return f"edited {path}", False
@@ -665,13 +708,16 @@ def outside_cwd(path: str) -> bool:
     return cwd != "/" and os.path.commonpath([cwd, real]) != cwd
 
 
-def denied(mode: Permissions, outside: bool, name: str, detail: str) -> str | None:
-    """None if allowed, else why not, for the model to relay. Asks on the controlling
-    terminal so it works in headless mode and the REPL alike."""
+def denied(mode: Permissions, outside: bool, name: str, detail: str,
+           allow: Callable[[str, str, bool], bool] | None = None) -> str | None:
+    """None if allowed, else why not, for the model to relay. Asks allow, if given, else
+    the controlling terminal, so it works in headless mode and the REPL alike."""
     if mode is Permissions.READ_ONLY:
         return "denied: the agent runs with --permissions read-only"
     if mode is Permissions.ALL or (mode is Permissions.AUTO and not outside):
         return None
+    if allow:
+        return None if allow(name, detail, outside) else "denied by user"
     with ExitStack() as tty:
         # Two handles: text mode "r+" needs a seekable file, which a terminal is not.
         try:
@@ -767,7 +813,8 @@ def show(esc: Escape, md: Markdown, s: str | None) -> None:
 class Stream:
     """One streamed reply, rebuilt into the shape of a non-streamed one."""
 
-    def __init__(self):
+    def __init__(self, text: Callable[[str], None] | None = None):
+        self.text = text  # takes the reply text instead of stdout, when set
         self.raw = bytearray()  # the body before any event: servers that ignore "stream"
         self.content: list[str] = []
         self.extra: dict[str, list[str]] = {}  # other text deltas: reasoning, refusal
@@ -813,8 +860,11 @@ class Stream:
         for k, v in (delta.items() if isinstance(delta, dict) else ()):
             match k, v:
                 case "content", str() if v:
-                    show(self.esc, self.md, v)
-                    sys.stdout.flush()
+                    if self.text:
+                        self.text(v)
+                    else:
+                        show(self.esc, self.md, v)
+                        sys.stdout.flush()
                     self.printed = True
                     self.content.append(v)
                 case "tool_calls", list():
@@ -903,6 +953,7 @@ class Agent:
     streamed: bool = False  # the last reply's text was printed while it streamed
     turn_calls: int = 0
     session: Usage = field(default_factory=Usage)
+    io: Io = field(default_factory=Io)
     messages: list[dict] = field(default_factory=list)
 
     @classmethod
@@ -921,11 +972,20 @@ class Agent:
                 # read takes the whole-file path for a file up to the cap, which stops at MAX_RAW
                 min(cap if cap >= 1024 else p.max_output, MAX_RAW),
                 save_model=model is not None and model != remembered)
-        a.messages.append({"role": "system", "content": (
-            f"You are a coding agent. The working directory is {os.getcwd()}. Use the read, "
-            "write, edit and shell tools to inspect and change code. Verify changes where you "
-            "can. Be concise.")})
+        a.messages.append({"role": "system", "content": ""})
+        a.set_cwd()
         return a
+
+    def set_cwd(self) -> None:
+        """Rebuild the system prompt for the current working directory."""
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = "."
+        self.messages[0]["content"] = (
+            f"You are a coding agent. The working directory is {cwd}. Use the read, "
+            "write, edit and shell tools to inspect and change code. Verify changes where you "
+            "can. Be concise.")
 
     def last_reply(self) -> str | None:
         """The text of the last assistant message that has any."""
@@ -956,7 +1016,7 @@ class Agent:
         delay = retry_delay()
         self.streamed = self.context_full = False
         for attempt in range(RETRIES + 1):
-            st, status, neterr = Stream(), 0, None
+            st, status, neterr = Stream(self.io.text), 0, None
             try:
                 with interruptible():
                     if attempt:
@@ -993,7 +1053,7 @@ class Agent:
                 note("interrupted\n", Style.WARN)
                 return None
             finally:
-                if st.printed:  # end the streamed line
+                if st.printed and not self.io.text:  # end the streamed line
                     show(st.esc, st.md, None)
                     sys.stdout.write(st.md.end() if markdown else "\n")
                     sys.stdout.flush()
@@ -1081,24 +1141,50 @@ class Agent:
         cut = bool(nl) or len(line) > room
         note(f"[tool] {name} {line[:room]}{' ...' if cut else ''}\n", Style.TOOL)
 
+    def tool_start(self, name: str, detail: str) -> None:
+        """Log the call, and tell the front end."""
+        self.tool_log(name, detail)
+        if self.io.tool:
+            self.io.tool(name, detail)
+
+    def served_read(self, path: str) -> str | None:
+        """read through the front end, capped like a local read. None if it refused: the
+        path lies outside what it serves, and the disk is read instead."""
+        try:
+            text = self.io.read(absolute(path))
+        except ClientError:
+            return None
+        sink = Sink(self.max_output)
+        sink.add(text.encode())
+        return sink.take()
+
     def run_tool(self, name: str, args: dict) -> tuple[str, bool]:
+        served = self.io.read is not None and self.io.write is not None  # the front end owns the files
         match name, args:
             case "read", {"path": str(path)}:
-                self.tool_log(name, path)
+                self.tool_start(name, path)
+                if self.io.read and (out := self.served_read(path)) is not None:
+                    return out, False
                 return tool_read(path, self.max_output)
             case "write", {"path": str(path), "content": str(content)}:
-                self.tool_log(name, path)
-                if why := denied(self.permissions, outside_cwd(path), name, path):
+                self.tool_start(name, path)
+                if why := denied(self.permissions, outside_cwd(path), name, path, self.io.allow):
                     return why, True
+                if served:
+                    try:
+                        self.io.write(absolute(path), content)
+                    except ClientError as e:
+                        return with_why(f"cannot write {path}", str(e)), True
+                    return f"wrote {path}", False
                 return tool_write(path, content)
             case "edit", {"path": str(path), "old_string": str(old), "new_string": str(new)}:
-                self.tool_log(name, path)
-                if why := denied(self.permissions, outside_cwd(path), name, path):
+                self.tool_start(name, path)
+                if why := denied(self.permissions, outside_cwd(path), name, path, self.io.allow):
                     return why, True
-                return tool_edit(path, old, new)
+                return tool_edit(path, old, new, self.io if served else None)
             case "shell", {"command": str(cmd)}:
-                self.tool_log(name, cmd)
-                if why := denied(self.permissions, False, name, cmd):  # unconfinable
+                self.tool_start(name, cmd)
+                if why := denied(self.permissions, False, name, cmd, self.io.allow):  # unconfinable
                     return why, True
                 want = args.get("timeout", SHELL_TIMEOUT)
                 if not isinstance(want, int | float) or isinstance(want, bool):
@@ -1124,7 +1210,9 @@ class Agent:
             note("warning: reply hit the length limit\n", Style.WARN)
             msg.pop("tool_calls", None)
         content = msg.get("content")
-        if not self.streamed and isinstance(content, str) and content:  # else already shown
+        if not self.streamed and isinstance(content, str) and content and self.io.text:
+            self.io.text(content)
+        elif not self.streamed and isinstance(content, str) and content:  # else already shown
             esc, md = Escape(), Markdown()
             show(esc, md, content)
             show(esc, md, None)
@@ -1392,6 +1480,255 @@ def repl(agent: Agent) -> None:
             save_history(hist)
 
 
+# ---- ACP: myra as an Agent Client Protocol agent ----
+
+ACP_PROTOCOL_VERSION = 1
+
+
+def obj(v: Any) -> dict:
+    return v if isinstance(v, dict) else {}
+
+
+def tool_kind(name: str) -> str:
+    return "read" if name == "read" else "execute" if name == "shell" else "edit"
+
+
+def tool_title(name: str, detail: str) -> str:
+    """"name detail", detail cut at its first line."""
+    return f"{name} {detail.partition(chr(10))[0]}"
+
+
+def prompt_text(blocks: Any) -> str:
+    """The prompt's text blocks, with each resource link named, as one user message."""
+    s = ""
+    for b in blocks if isinstance(blocks, list) else ():
+        b = obj(b)
+        t, u = b.get("text"), b.get("uri")
+        if s:
+            s += "\n\n"
+        if b.get("type") == "text" and isinstance(t, str):
+            s += t
+        elif b.get("type") == "resource_link" and isinstance(u, str):
+            s += "Context: the user's open file " + u.removeprefix("file://")
+    return s
+
+
+class AcpServer:
+    """Serves the Agent Client Protocol on stdin and stdout: JSON-RPC, one message per line
+    (https://agentclientprotocol.com). Mirrors src/acp.c. stdout carries only protocol
+    messages; notes go to stderr.
+
+    Python has no curl progress callback for myra_poll, so a reader thread takes stdin. It
+    queues each message, except session/cancel, which it turns into a SIGINT to the main
+    thread: a model request or shell command then stops as on Ctrl-C."""
+
+    def __init__(self, agent: Agent):
+        self.agent = agent
+        self.queue: list[dict] = []  # parsed messages not yet handled
+        self.eof = False
+        self.cond = threading.Condition()  # guards queue and eof
+        self.out = threading.Lock()  # both threads write to stdout
+        self.next_id = 0
+        self.waiting = 0  # id of the outstanding call() to the client, or 0; under cond
+        self.initialized = False
+        self.calls = 0  # tool calls this session, for toolCallId
+        self.session = ""
+
+    def send(self, msg: dict) -> None:
+        global raising
+        msg["jsonrpc"] = "2.0"
+        line = json.dumps(msg, separators=(",", ":"), ensure_ascii=False)  # escapes newlines
+        main = threading.current_thread() is threading.main_thread()
+        outer = raising
+        if main:  # a cancel's KeyboardInterrupt must not cut the line short
+            raising = False
+        try:
+            with self.out:
+                sys.stdout.write(line + "\n")
+                sys.stdout.flush()
+        finally:
+            if main:
+                raising = outer
+        if main and raising and interrupted:
+            raise KeyboardInterrupt  # deferred from the write
+
+    def respond(self, req: dict, key: str, value: Any) -> None:
+        self.send({"id": req["id"], key: value})
+
+    def error(self, req: dict, code: int, message: str) -> None:
+        self.respond(req, "error", {"code": code, "message": message})
+
+    def read_stdin(self) -> None:
+        global interrupted
+        main = threading.main_thread().ident
+        for raw in sys.stdin.buffer:
+            if not raw.endswith(b"\n"):
+                break  # an incomplete last line is not a message
+            try:
+                m = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                with self.cond:
+                    if self.waiting:  # most likely the awaited reply: fail the call, not hang
+                        self.queue.append({"id": self.waiting, "error": {
+                            "message": "unparseable reply from the client"}})
+                        self.cond.notify()
+                        continue
+                self.error({"id": None}, -32700, "parse error")
+                continue
+            if not isinstance(m, dict):
+                continue  # acp.c queues it, but nothing ever takes it
+            if m.get("method") == "session/cancel":
+                interrupted = True
+                signal.pthread_kill(main, signal.SIGINT)  # cuts a blocking read short
+                continue
+            with self.cond:
+                self.queue.append(m)
+                self.cond.notify()
+        with self.cond:
+            self.eof = True
+            self.cond.notify()
+
+    def next(self, id_: int | None = None) -> dict | None:
+        """The next queued response to id_, or request or notification if id_ is None;
+        None at EOF."""
+        with self.cond:
+            while True:
+                for i, m in enumerate(self.queue):
+                    mid, response = m.get("id"), "method" not in m
+                    match_id = (isinstance(mid, int | float) and not isinstance(mid, bool)
+                                and abs(mid) < 2 ** 31 and int(mid) == id_)  # cJSON's valueint
+                    if (not response) if id_ is None else (response and match_id):
+                        return self.queue.pop(i)
+                if self.eof:
+                    return None
+                self.cond.wait()
+
+    def call(self, method: str, params: dict) -> dict | None:
+        """Send a request to the client and wait for its response; None at EOF."""
+        self.next_id += 1
+        with self.cond:
+            self.waiting = self.next_id
+        try:
+            self.send({"id": self.next_id, "method": method, "params": params})
+            return self.next(self.next_id)
+        finally:
+            with self.cond:
+                self.waiting = 0
+
+    def update(self, u: dict) -> None:
+        self.send({"method": "session/update", "params": {"sessionId": self.session, "update": u}})
+
+    @staticmethod
+    def failure(resp: dict | None) -> str | None:
+        """The error message of a response, or None if it succeeded."""
+        if resp is None:
+            return "the client closed the connection"
+        if "error" not in resp:
+            return None
+        msg = obj(resp["error"]).get("message")
+        return msg if isinstance(msg, str) else "error"
+
+    # ---- Io hooks ----
+
+    def on_text(self, s: str) -> None:
+        self.update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": s}})
+
+    def on_tool(self, name: str, detail: str) -> None:
+        self.calls += 1
+        self.update({"sessionUpdate": "tool_call", "toolCallId": f"call_{self.calls}",
+                     "title": tool_title(name, detail), "kind": tool_kind(name),
+                     "status": "in_progress"})
+
+    def on_read(self, path: str) -> str:
+        resp = self.call("fs/read_text_file", {"sessionId": self.session, "path": path})
+        if (why := self.failure(resp)) is not None:
+            raise ClientError(why)
+        text = obj(resp.get("result")).get("content")
+        if not isinstance(text, str):
+            raise ClientError("no content in the client's reply")
+        # A C string ends at NUL; lone surrogates cannot be encoded.
+        return text.partition("\0")[0].encode("utf-8", "replace").decode()
+
+    def on_write(self, path: str, content: str) -> None:
+        resp = self.call("fs/write_text_file",
+                         {"sessionId": self.session, "path": path, "content": content})
+        if (why := self.failure(resp)) is not None:
+            raise ClientError(why)
+
+    def on_allow(self, name: str, detail: str, outside: bool) -> bool:
+        title = tool_title(name, detail) + (" (outside the working directory)" if outside else "")
+        resp = self.call("session/request_permission", {
+            "sessionId": self.session,
+            "toolCall": {"toolCallId": f"call_{self.calls}",  # the call on_tool just announced
+                         "title": title, "kind": tool_kind(name)},
+            "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]})
+        outcome = obj(obj(obj(resp).get("result")).get("outcome"))
+        return outcome.get("outcome") == "selected" and outcome.get("optionId") == "allow"
+
+    # ---- requests ----
+
+    def initialize(self, req: dict, params: dict) -> None:
+        fs = obj(obj(params.get("clientCapabilities")).get("fs"))
+        io = Io(text=self.on_text, tool=self.on_tool, allow=self.on_allow)
+        # Files go through the client only if it serves both: edit reads, then writes.
+        if fs.get("readTextFile") is True and fs.get("writeTextFile") is True:
+            io.read, io.write = self.on_read, self.on_write
+        self.agent.io = io
+        self.respond(req, "result", {
+            "protocolVersion": ACP_PROTOCOL_VERSION,
+            "agentCapabilities": {"loadSession": False, "promptCapabilities": {}},
+            "agentInfo": {"name": "myra", "version": VERSION}, "authMethods": []})
+
+    def new_session(self, req: dict, params: dict) -> None:
+        """One session at a time: a new one starts a fresh conversation in cwd."""
+        if isinstance(cwd := params.get("cwd"), str):
+            try:
+                os.chdir(cwd)
+            except (OSError, ValueError):
+                self.error(req, -32602, "cannot change to the session's cwd")
+                return
+        self.agent.set_cwd()
+        self.agent.clear()
+        self.calls = 0
+        self.session = str(int(self.session or 0) + 1)
+        self.respond(req, "result", {"sessionId": self.session})
+
+    def prompt(self, req: dict, params: dict) -> None:
+        global interrupted
+        rc = self.agent.ask(prompt_text(params.get("prompt")))  # clears interrupted first
+        if interrupted:
+            self.respond(req, "result", {"stopReason": "cancelled"})
+        elif rc < 0:
+            self.error(req, -32603, "the model request failed; the agent's stderr says why")
+        else:
+            self.respond(req, "result", {"stopReason": "end_turn"})
+        interrupted = False
+
+    def serve(self) -> int:
+        """Serve until stdin closes."""
+        threading.Thread(target=self.read_stdin, daemon=True).start()
+        while (m := self.next()) is not None:
+            method, params = m.get("method"), obj(m.get("params"))
+            if m.get("id") is None:
+                pass  # a notification: none needs handling, and none gets a reply
+            elif method == "initialize":
+                self.initialize(m, params)
+                self.initialized = True
+            elif not self.initialized:  # the io hooks are unset: text would reach stdout raw
+                self.error(m, -32600, "not initialized")
+            elif method == "session/new":
+                self.new_session(m, params)
+            elif method == "session/prompt":
+                if not self.session or params.get("sessionId") != self.session:
+                    self.error(m, -32602, "unknown session")
+                else:
+                    self.prompt(m, params)
+            else:
+                self.error(m, -32601, "method not found")
+        return 0
+
+
 # ---- the CLI ----
 
 def provider_arg(name: str) -> Provider:
@@ -1418,6 +1755,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("-m", dest="model", metavar="model", help="model id; remembered per provider")
     ap.add_argument("-p", dest="prompt", metavar="prompt",
                     help="run one prompt headless and exit (default: REPL)")
+    ap.add_argument("--acp", action="store_true",
+                    help="serve the Agent Client Protocol on stdin and stdout, for an editor")
     ap.add_argument("-V", action="version", version=f"myra {VERSION}", help="print the version")
     ap.add_argument("--verbose", action="store_true",
                     help="show each tool call's full arguments and result, not one line")
@@ -1439,6 +1778,9 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     global color, markdown, escape_out, escape_err
     args = parser().parse_args(argv)
+    if args.acp and args.prompt is not None:
+        note("error: --acp takes prompts from the client, not -p\n", Style.ERROR)
+        return 2
     color = not args.no_color and not os.environ.get("NO_COLOR") and sys.stderr.isatty()
     markdown = not args.raw and not os.environ.get("NO_COLOR") and sys.stdout.isatty()
     escape_out, escape_err = sys.stdout.isatty(), sys.stderr.isatty()
@@ -1458,6 +1800,8 @@ def main(argv: list[str] | None = None) -> int:
     agent.save_provider = args.provider is not None
     signal.signal(signal.SIGINT, on_sigint)
 
+    if args.acp:
+        return AcpServer(agent).serve()
     if args.prompt is None:
         repl(agent)
         agent.session.report("[session]")

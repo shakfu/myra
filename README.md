@@ -149,6 +149,21 @@ Ctrl-C:
 
 When a request exceeds the model's context, older tool outputs are replaced by a placeholder and the request is retried once. If nothing is left to drop, the agent suggests `/clear`. If the turn fails anyway, the outputs are restored.
 
+### Editors: `--acp`
+
+`myra --acp` serves the [Agent Client Protocol](https://agentclientprotocol.com) on stdin and stdout, so an editor can run it, for example loki's `:agent`. Provider, model and `--permissions` work as in the REPL.
+
+If the editor serves files (`fs.readTextFile` and `fs.writeTextFile`):
+- `read` goes through the editor, so it sees unsaved buffers. If the editor refuses a path, for example one outside its project, `read` falls back to the disk.
+- `write` and `edit` go through the editor, and its refusal is an error.
+- `shell` always runs locally.
+
+A call that `--permissions` would ask about on the terminal is asked in the editor instead, as `session/request_permission`. So `--permissions ask` works there.
+
+`session/cancel` acts like Ctrl-C: it kills a running `shell` command or stops the model request, and the turn ends with `stopReason` `cancelled`. Reply text and each tool call stream as `session/update` messages. stdout carries only protocol messages; notes go to stderr as usual.
+
+There is one session at a time. `session/new` changes to the session's `cwd` and starts a new conversation. MCP servers offered in `session/new` are ignored: myra has only its four tools.
+
 ## Saved state
 
 Under `$XDG_STATE_HOME/myra/` (default `~/.local/state/myra/`):

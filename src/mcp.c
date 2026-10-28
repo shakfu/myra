@@ -49,7 +49,8 @@ static void reap(myra_mcp *s, int all) {
     for (int i = 0; i < 3; i++) {
         for (myra_mcp *p = s; p; p = all ? p->next : NULL)
             if (sig[i] && p->pgid) kill(-p->pgid, sig[i]);
-        for (int t = 0; t < 100; t++) { /* up to 1 s each */
+        /* On the clock: counting sleeps stretches with each oversleep, as on a loaded VM. */
+        for (double end = now() + 1;;) {
             int left = 0;
             for (myra_mcp *p = s; p; p = all ? p->next : NULL) {
                 if (p->pid) {
@@ -62,6 +63,7 @@ static void reap(myra_mcp *s, int all) {
                 left |= p->pid || p->pgid;
             }
             if (!left) return;
+            if (now() >= end) break;
             usleep(10000);
         }
     }

@@ -457,7 +457,7 @@ static void reap(pid_t pid, int *st) {
 /* SIGTERM the process group, SIGKILL whatever is left after 2 s. */
 static void kill_group(pid_t pid, int *st) {
     kill(-pid, SIGTERM);
-    for (int i = 0; i < 20 && waitpid(pid, st, WNOHANG) == 0; i++) usleep(100000);
+    for (double end = now() + 2; waitpid(pid, st, WNOHANG) == 0 && now() < end;) usleep(100000);
     kill(-pid, SIGKILL); /* also children that outlived sh */
     if (waitpid(pid, st, WNOHANG) == 0) reap(pid, st);
 }

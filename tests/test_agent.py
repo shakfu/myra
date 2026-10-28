@@ -14,6 +14,7 @@ import sys
 import termios
 import threading
 import time
+from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -2122,13 +2123,65 @@ def test_mcp_servers_stop_together(mock, tmp_path):
     servers = [fake_mcp(tmp_path, f"s{i}", MCP_STUBBORN="1") for i in range(3)]
     api.reply("done")
     cfg = mcp_config(tmp_path, *(s for s, _ in servers))
+    p = start(api, tmp_path, "--mcp-config", cfg, "-p", "go")
+    # Timed from the first EOF, when stopping starts: startup time varies with load.
+    wait_for(lambda: any(log.exists() and '"eof"' in log.read_text() for _, log in servers), 30)
     t = time.monotonic()
-    p = api.run(tmp_path, "--mcp-config", cfg, "-p", "go")
-    assert p.returncode == 0, p.stderr
+    _, err = p.communicate(timeout=30)
+    assert p.returncode == 0, err
     # Each takes 2 s to stop (1 s after EOF, 1 s after SIGTERM): 6 s one at a time.
     assert time.monotonic() - t < 4.5
     for _, log in servers:
         assert logged(log)[-1] == {"eof": True}
+
+
+def test_mcp_tools_list_without_end_is_cut_off(mock, tmp_path):
+    api = Api(mock, "local")
+    srv, _ = fake_mcp(tmp_path, MCP_ENDLESS="1")
+    api.reply("done")
+    p = api.run(tmp_path, "--mcp-config", mcp_config(tmp_path, srv), "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert "mcp fake: tools/list: more than 100 pages" in p.stderr
+    assert not [n for n in tool_names(mock.requests[0]) if n.startswith("mcp__")]
+
+
+def test_mcp_tool_called_with_empty_arguments(mock, tmp_path):
+    api = Api(mock, "local")
+    srv, _ = fake_mcp(tmp_path)
+    api.reply(calls=[("f", "mcp__fake__fail", "")])  # as some servers send for no parameters
+    api.reply("done")
+    p = api.run(tmp_path, "--mcp-config", mcp_config(tmp_path, srv), "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert api.results(mock.requests[1]) == {"f": ("it broke", True)}
+
+
+def test_mcp_failed_server_keeps_a_differently_cased_servers_tools(mock, tmp_path):
+    api = Api(mock, "local")
+    upper, _ = fake_mcp(tmp_path, "Fake")
+    lower, _ = fake_mcp(tmp_path, "fake", MCP_LIST_FAIL="1",
+                        MCP_LOG=str(tmp_path / "lower.log"))  # Fake.log on a case-blind disk
+    api.reply("done")
+    p = api.run(tmp_path, "--mcp-config", mcp_config(tmp_path, upper, lower), "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert "mcp fake: tools/list:" in p.stderr
+    names = [n for n in tool_names(mock.requests[0]) if n.startswith("mcp__")]
+    assert names == ["mcp__Fake__echo", "mcp__Fake__fail", "mcp__Fake__image",
+                     "mcp__Fake__slow", "mcp__Fake__bad_name_"]
+
+
+def test_mcp_server_stop_kills_its_process_group(mock, tmp_path):
+    api = Api(mock, "local")
+    pid_file = tmp_path / "orphan.pid"
+    srv, _ = fake_mcp(tmp_path, MCP_ORPHAN=str(pid_file))
+    api.reply("done")
+    p = api.run(tmp_path, "--mcp-config", mcp_config(tmp_path, srv), "-p", "go")
+    try:
+        assert p.returncode == 0, p.stderr
+        assert pid_gone(pid_file)
+        assert (tmp_path / "orphan.pid.term").exists()  # SIGTERM came first
+    finally:
+        with suppress(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), signal.SIGKILL)
 
 
 @pytest.mark.parametrize("content,msg", [(None, "cannot read"), ("{", "expected"),

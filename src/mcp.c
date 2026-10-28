@@ -16,6 +16,7 @@
 #define PROTOCOL_VERSION "2025-06-18"
 #define START_TIMEOUT 60 /* seconds for initialize and tools/list: npx may download first */
 #define NAME_MAX_LEN 64  /* OpenAI function names: [A-Za-z0-9_-]{1,64} */
+#define MAX_PAGES 100    /* of tools/list: a server whose cursor never ends would hang startup */
 
 /* What a server inherits of our environment, besides its own env: the MCP SDKs'
    POSIX default, so the provider key and other secrets do not reach it. */
@@ -27,6 +28,7 @@ struct myra_mcp {
     myra_mcp *next;
     char *name;
     pid_t pid;      /* 0 once it has exited */
+    pid_t pgid;     /* its process group, 0 once that is empty */
     int in, out;    /* its stdin, which we write; its stdout, which we read */
     char *line;     /* bytes of an incomplete line */
     size_t n;
@@ -35,7 +37,8 @@ struct myra_mcp {
 };
 
 /* Stop s, or with all set s and every server after it, together. Closing stdin asks
-   each to exit; then SIGTERM, then SIGKILL, as the spec's shutdown. */
+   each to exit; then SIGTERM, then SIGKILL, as the spec's shutdown. Each goes to the
+   whole process group, so what a server started does not outlive it. */
 static void reap(myra_mcp *s, int all) {
     for (myra_mcp *p = s; p; p = all ? p->next : NULL) {
         if (p->in >= 0) close(p->in);
@@ -45,19 +48,24 @@ static void reap(myra_mcp *s, int all) {
     int sig[] = {0, SIGTERM, SIGKILL};
     for (int i = 0; i < 3; i++) {
         for (myra_mcp *p = s; p; p = all ? p->next : NULL)
-            if (sig[i] && p->pid) kill(-p->pid, sig[i]);
+            if (sig[i] && p->pgid) kill(-p->pgid, sig[i]);
         for (int t = 0; t < 100; t++) { /* up to 1 s each */
             int left = 0;
             for (myra_mcp *p = s; p; p = all ? p->next : NULL) {
-                if (!p->pid) continue;
-                pid_t w = waitpid(p->pid, NULL, WNOHANG);
-                if (w == p->pid || (w < 0 && errno != EINTR)) p->pid = 0;
-                else left = 1;
+                if (p->pid) {
+                    pid_t w = waitpid(p->pid, NULL, WNOHANG);
+                    if (w == p->pid || (w < 0 && errno != EINTR)) p->pid = 0;
+                }
+                /* Signal 0 finds no process once the group is empty. Checked after the
+                   leader is reaped: its zombie would count. */
+                if (p->pgid && kill(-p->pgid, 0) != 0) p->pgid = 0;
+                left |= p->pid || p->pgid;
             }
             if (!left) return;
             usleep(10000);
         }
     }
+    for (myra_mcp *p = s; p; p = all ? p->next : NULL) p->pgid = 0; /* its id may be reused */
 }
 
 /* Send one message: -1 if the server has exited, has not read it by deadline, or
@@ -222,7 +230,8 @@ static void drop(myra_agent *a, myra_mcp *s) {
     for (int i = cJSON_GetArraySize(a->tools) - 1; i >= 0; i--) {
         const char *n = cJSON_GetStringValue(cJSON_GetObjectItem(
             cJSON_GetObjectItem(cJSON_GetArrayItem(a->tools, i), "function"), "name"));
-        if (n && cJSON_GetObjectItem(s->tools, n)) cJSON_DeleteItemFromArray(a->tools, i);
+        if (n && cJSON_GetObjectItemCaseSensitive(s->tools, n))
+            cJSON_DeleteItemFromArray(a->tools, i);
     }
     free(s->name);
     free(s->line);
@@ -233,7 +242,14 @@ static void drop(myra_agent *a, myra_mcp *s) {
 /* Add the server's tools to the model's: -1 if tools/list failed. */
 static int list_tools(myra_agent *a, myra_mcp *s) {
     char *cursor = NULL;
+    int pages = 0;
     do {
+        if (++pages > MAX_PAGES) {
+            myra_note(MYRA_ERROR, "error: mcp %s: tools/list: more than %d pages\n", s->name,
+                      MAX_PAGES);
+            free(cursor);
+            return -1;
+        }
         cJSON *p = cJSON_CreateObject();
         if (cursor) cJSON_AddStringToObject(p, "cursor", cursor);
         free(cursor);
@@ -278,29 +294,55 @@ static int list_tools(myra_agent *a, myra_mcp *s) {
     return 0;
 }
 
-/* Unset every variable not in INHERITED, and any shell function exported as one. */
-static void keep_inherited(void) {
-    for (size_t i = 0; environ[i];) {
-        const char *e = environ[i], *eq = strchr(e, '=');
-        size_t k = eq ? (size_t)(eq - e) : strlen(e);
-        int keep = 0;
-        for (size_t j = 0; eq && j < sizeof INHERITED / sizeof *INHERITED; j++)
-            keep |= strlen(INHERITED[j]) == k && !strncmp(e, INHERITED[j], k);
-        if (keep && strncmp(eq + 1, "()", 2)) { i++; continue; }
-        char *name = strndup(e, k);
-        if (!name || unsetenv(name) != 0) i++; /* else environ[i] is now the next one */
-        free(name);
+static void free_strings(char **v);
+
+/* A server's environment: INHERITED's variables that are set, less any shell function
+   exported as one, then env, which overrides them. The array and strings are malloc'd. */
+static char **server_env(char *const *env) {
+    size_t n = 0, ninh = sizeof INHERITED / sizeof *INHERITED, k = 0;
+    while (env && env[n]) n++;
+    char **v = calloc(ninh + n + 1, sizeof *v);
+    if (!v) { perror("calloc"); exit(1); }
+    for (size_t i = 0; i < ninh; i++) {
+        const char *val = getenv(INHERITED[i]);
+        size_t len = strlen(INHERITED[i]);
+        int set = 0;
+        for (size_t j = 0; j < n; j++)
+            set |= !strncmp(env[j], INHERITED[i], len) && env[j][len] == '=';
+        if (!val || !strncmp(val, "()", 2) || set) continue;
+        buf b = {0};
+        buf_add(&b, INHERITED[i], len);
+        buf_lit(&b, "=");
+        buf_add(&b, val, strlen(val));
+        v[k++] = b.p;
     }
+    for (size_t j = 0; j < n; j++) v[k++] = xstrdup(env[j]);
+    return v;
 }
 
 /* Start a server and add its tools; -1 if it fails, with the reason on stderr. */
 static int start(myra_agent *a, const char *name, const char *command, char *const *args,
                  char *const *env) {
+    /* Built before fork: another thread may hold malloc's lock, so the child must not
+       allocate. */
+    size_t n = 0;
+    while (args && args[n]) n++;
+    char **argv = calloc(n + 2, sizeof *argv), **envp = server_env(env);
+    if (!argv) { perror("calloc"); exit(1); }
+    argv[0] = (char *)command;
+    for (size_t i = 0; i < n; i++) argv[i + 1] = args[i];
+    buf failed = {0};
+    buf_lit(&failed, "error: mcp ");
+    buf_add(&failed, name, strlen(name));
+    buf_lit(&failed, ": cannot run ");
+    buf_add(&failed, command, strlen(command));
+    buf_lit(&failed, ": ");
+
     int to[2], from[2];
+    pid_t pid = -1;
     if (pipe(to) < 0) goto fail;
     if (pipe(from) < 0) { close(to[0]); close(to[1]); goto fail; }
-    pid_t pid = fork();
-    if (pid < 0) {
+    if ((pid = fork()) < 0) {
         close(to[0]), close(to[1]), close(from[0]), close(from[1]);
         goto fail;
     }
@@ -309,18 +351,16 @@ static int start(myra_agent *a, const char *name, const char *command, char *con
         dup2(to[0], 0);
         dup2(from[1], 1);
         close(to[0]), close(to[1]), close(from[0]), close(from[1]);
-        keep_inherited();
-        for (char *const *e = env; e && *e; e++) putenv(*e);
-        size_t n = 0;
-        while (args && args[n]) n++;
-        char **argv = calloc(n + 2, sizeof *argv);
-        if (!argv) _exit(127);
-        argv[0] = (char *)command;
-        for (size_t i = 0; i < n; i++) argv[i + 1] = args[i];
+        environ = envp;
         execvp(command, argv);
-        fprintf(stderr, "error: mcp %s: cannot run %s: %s\n", name, command, strerror(errno));
+        const char *why = strerror(errno);
+        if (write(2, failed.p, failed.n) < 0 || write(2, why, strlen(why)) < 0 ||
+            write(2, "\n", 1) < 0) {}
         _exit(127);
     }
+    free(argv);
+    free_strings(envp);
+    free(failed.p);
     setpgid(pid, pid);
     close(to[0]);
     close(from[1]);
@@ -330,7 +370,7 @@ static int start(myra_agent *a, const char *name, const char *command, char *con
     fcntl(to[1], F_SETFL, O_NONBLOCK); /* so send_line can give up on a server not reading */
     myra_mcp *s = calloc(1, sizeof *s);
     if (!s) { perror("calloc"); exit(1); }
-    *s = (myra_mcp){.name = xstrdup(name), .pid = pid, .in = to[1], .out = from[0],
+    *s = (myra_mcp){.name = xstrdup(name), .pid = pid, .pgid = pid, .in = to[1], .out = from[0],
                     .tools = cJSON_CreateObject()};
     s->next = a->mcp;
     a->mcp = s;
@@ -355,6 +395,9 @@ static int start(myra_agent *a, const char *name, const char *command, char *con
     return 0;
 fail:
     myra_note(MYRA_ERROR, "error: mcp %s: %s\n", name, strerror(errno));
+    free(argv);
+    free_strings(envp);
+    free(failed.p);
     return -1;
 }
 

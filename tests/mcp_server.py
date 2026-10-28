@@ -4,7 +4,10 @@ to $MCP_LOG as one JSON line, and {"eof": true} when stdin closes.
 With $MCP_HANG set, initialize is never answered; with $MCP_WAIT, it is answered
 once that file exists. With $MCP_LIST_FAIL, the server exits instead of sending page 2.
 With $MCP_ENV_LOG, it writes its environment there at start. With $MCP_DEAF, slow stops
-reading stdin. With $MCP_STUBBORN, it outlives EOF and ignores SIGTERM.
+reading stdin. With $MCP_STUBBORN, it outlives EOF and ignores SIGTERM. With
+$MCP_ENDLESS, tools/list always has a next page. With $MCP_ORPHAN, it starts a
+background process in its group and writes that process's pid there; on SIGTERM, that
+process creates the file named by the pid file plus ".term", then exits.
 
 Tools: echo (asks the client for a ping first, then returns its text and
 $MCP_GREETING), fail (isError), image (non-text content) and slow (30 s; a cancel
@@ -12,6 +15,7 @@ ends it). tools/list answers in two pages."""
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 
@@ -44,6 +48,17 @@ def result(rid, r):
     send({"id": rid, "result": r})
 
 
+if os.environ.get("MCP_ORPHAN"):
+    term = os.environ["MCP_ORPHAN"] + ".term"
+    code = ("import signal, sys, time\n"
+            f"signal.signal(signal.SIGTERM, lambda *_: (open({term!r}, 'w').close(), sys.exit(0)))\n"
+            "print(flush=True)\n"
+            "time.sleep(60)\n")
+    orphan = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE)
+    orphan.stdout.readline()  # its handler is set
+    with open(os.environ["MCP_ORPHAN"], "w") as f:
+        f.write(str(orphan.pid))
 if os.environ.get("MCP_ENV_LOG"):
     with open(os.environ["MCP_ENV_LOG"], "w") as f:
         json.dump(dict(os.environ), f)
@@ -64,6 +79,8 @@ while True:
         r = {"tools": TOOLS[page]}
         if page + 1 < len(TOOLS):
             r["nextCursor"] = str(page + 1)
+        if os.environ.get("MCP_ENDLESS"):
+            r["nextCursor"] = "0"
         result(rid, r)
     elif method == "tools/call":
         name, args = p["name"], p.get("arguments", {})

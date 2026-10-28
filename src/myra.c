@@ -1436,7 +1436,8 @@ int myra_step(myra_agent *a, cJSON *resp) {
                 cJSON_AddStringToObject(call, "id", gen);
         }
         const char *name = get_str(fn, "name"), *args = get_str(fn, "arguments");
-        cJSON *input = cJSON_Parse(args ? args : "");
+        /* Some servers send "" for a tool without parameters. */
+        cJSON *input = cJSON_Parse(args && *args ? args : "{}");
         int err = 1;
         a->announced = 0;
         /* Every call still gets a result, so the history stays valid. */

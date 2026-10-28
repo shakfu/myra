@@ -949,6 +949,7 @@ def retry_delay() -> float:
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_START_TIMEOUT = 60  # seconds for initialize and tools/list: npx may download first
+MCP_MAX_PAGES = 100  # of tools/list: a server whose cursor never ends would hang startup
 # What a server inherits of our environment, besides its own env: the MCP SDKs' POSIX
 # default, so the provider key and other secrets do not reach it.
 MCP_INHERITED_ENV = ("HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER")
@@ -1025,6 +1026,7 @@ class McpServer:
         self.next_id = 0
         self.tools: dict[str, str] = {}  # exposed name -> the server's own name
         self.alive = True
+        self.pgid = proc.pid  # its process group, 0 once that is empty
 
     @classmethod
     def start(cls, name: str, command: str, args: list[str], env: dict[str, str],
@@ -1057,24 +1059,41 @@ class McpServer:
     @staticmethod
     def reap_all(servers: list[McpServer]) -> None:
         """Stop servers together. Closing stdin asks each to exit; then SIGTERM, then
-        SIGKILL, as the spec's shutdown."""
+        SIGKILL, as the spec's shutdown. Each goes to the whole process group, so what a
+        server started does not outlive it."""
         for s in servers:
             for f in (s.proc.stdin, s.proc.stdout):
                 with suppress(OSError):
                     f.close()
             s.alive = False
+
+        def running(s: McpServer) -> bool:
+            # Signal 0 finds no process once the group is empty. Checked after poll()
+            # reaps the leader: its zombie would count.
+            if s.proc.poll() is None:
+                return True
+            if s.pgid:
+                try:
+                    os.killpg(s.pgid, 0)
+                    return True
+                except OSError:
+                    s.pgid = 0
+            return False
+
         for sig in (None, signal.SIGTERM, signal.SIGKILL):
-            left = [s for s in servers if s.proc.poll() is None]
-            for s in left if sig else ():
-                with suppress(OSError):
-                    os.killpg(s.proc.pid, sig)
+            for s in servers if sig else ():
+                if s.pgid:
+                    with suppress(OSError):
+                        os.killpg(s.pgid, sig)
             end = time.monotonic() + 1
-            while any(s.proc.poll() is None for s in left):
+            while [s for s in servers if running(s)]:  # a list: every server is checked
                 if time.monotonic() >= end:
                     break
                 time.sleep(0.01)
             else:
                 return
+        for s in servers:
+            s.pgid = 0  # its id may be reused
 
     def reap(self) -> None:
         McpServer.reap_all([self])
@@ -1178,7 +1197,7 @@ class McpServer:
     def list_tools(self, tools: list[dict]) -> None:
         """Add the server's tools to tools as mcp__<server>__<tool>."""
         cursor = None
-        while True:
+        for _ in range(MCP_MAX_PAGES):
             r = self.rpc("tools/list", {"cursor": cursor} if cursor else {}, MCP_START_TIMEOUT)
             for t in r.get("tools") if isinstance(r.get("tools"), list) else ():
                 if not isinstance(name := obj(t).get("name"), str):
@@ -1196,6 +1215,7 @@ class McpServer:
             cursor = r.get("nextCursor")
             if not (isinstance(cursor, str) and cursor):
                 return
+        raise McpError(f"more than {MCP_MAX_PAGES} pages")
 
     def call(self, exposed: str, args: dict) -> tuple[str, bool]:
         try:
@@ -1548,7 +1568,7 @@ class Agent:
             name = fn.get("name") if isinstance(fn.get("name"), str) else None
             raw = fn.get("arguments") if isinstance(fn.get("arguments"), str) else ""
             try:
-                args = json.loads(raw)
+                args = json.loads(raw or "{}")  # some servers send "" for a tool without parameters
             except ValueError:
                 args = None
             self.announced = False

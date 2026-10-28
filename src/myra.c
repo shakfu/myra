@@ -290,7 +290,7 @@ static char *sink_take(sink *s) {
         head.n = keep;
         size_t skip = 0;
         while (skip < tail.n && is_cont(tail.p[skip])) skip++;
-        memmove(tail.p, tail.p + skip, tail.n - skip);
+        if (skip) memmove(tail.p, tail.p + skip, tail.n - skip); /* tail.p is NULL when empty */
         tail.n -= skip;
         dropped += (s->head.n - head.n) + skip;
     }

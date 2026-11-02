@@ -88,6 +88,8 @@ Requests to `openrouter` carry a top-level `"cache_control": {"type": "ephemeral
     export OPENROUTER_API_KEY=...
     ./myra                              # REPL
     ./myra -p "fix the build"           # headless: one task, then exit
+    ./myra "fix the build"              # REPL, with this as the first line
+    ./myra -- "-v crashes; fix it"      # -- before a prompt that starts with -
     ./myra -m openai/gpt-5.5 -p "..."   # any OpenRouter model id; remembered
     ./myra -P local                     # llama-server on :8080; remembered
     ./myra --permissions ask            # approve each write, edit and shell
@@ -122,6 +124,8 @@ REPL commands:
 | `/exit`            | quit; so does Ctrl-D                                    |
 
 On a terminal, the REPL has line editing, history and UTF-8 input (linenoise, vendored). Tab completes a REPL command at the start of the line, a model id after `/model `, and otherwise a path in the working directory; repeated tabs cycle the matches. Completing a model id costs one `/models` request, made once per session and only if you ask for it. Piped input is read line by line, without a prompt.
+
+Words after the options are joined by single spaces and taken as the REPL's first line, as if typed: a line of blanks is skipped, and `/exit` or another command runs as one. The REPL then reads stdin as usual. They cannot be combined with `-p` or `--acp`.
 
 `--permissions` sets when `write`, `edit` and `shell` run without asking:
 

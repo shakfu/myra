@@ -4,6 +4,8 @@
 
 ### Added
 
+- `myra [options] PROMPT...` starts the REPL with the words, joined by spaces, as its first line, so a launcher can start a session already working on a task. With `-p` or `--acp` they are an error, exit status 2.
+
 - `--acp` serves the Agent Client Protocol on stdin and stdout, so an editor can drive myra (README, "Editors"). File reads and writes go through the editor when it serves them, so `read` sees unsaved buffers. Permission questions appear in the editor's UI, and `session/cancel` works like Ctrl-C. myralib gets `myra_io` hooks for text, tool calls, file access and permission, plus a `myra_poll` hook. The CLI keeps the defaults. One thread polls stdin from curl's progress callback and the `shell` wait loop, so a cancel is seen mid-request without a reader thread and locking.
 
 - `--mcp-config FILE` starts the stdio MCP servers in FILE, in the `{"mcpServers": {...}}` format other clients use, so existing configs work unchanged (README, "MCP servers"). Under `--acp` they start with each session, before the editor's. Ctrl-C while they start exits with status 130, since running on with some servers missing is easy to overlook. A project `.mcp.json` is not read automatically, since a cloned repository could then run commands. Servers inherit only `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM` and `USER`, plus their own `env`, as the MCP SDKs do: an editor can name any server, and the full environment would hand it the provider key.

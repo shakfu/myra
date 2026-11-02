@@ -39,11 +39,13 @@ static void repl_help(FILE *f) {
 static int usage(const char *argv0, int rc) {
     FILE *f = rc ? stderr : stdout;
     fprintf(f,
-            "usage: %s [options] [-P provider] [-m model] [-p prompt]\n"
+            "usage: %s [options] [-P provider] [-m model] [-p prompt | [--] PROMPT...]\n"
             "  -P  openrouter or local; remembered. Default: the remembered one if usable,\n"
             "      else the first cloud provider whose key is set\n"
             "  -m  model id; remembered per provider\n"
             "  -p  run one prompt headless and exit (default: REPL)\n"
+            "  PROMPT...   start the REPL with these words, joined by spaces, as the\n"
+            "              first line; -- before them if they start with -\n"
             "  --acp       serve the Agent Client Protocol on stdin and stdout, for an editor\n"
             "  --mcp-config FILE\n"
             "      start the stdio MCP servers in FILE, {\"mcpServers\": {...}}; their tools\n"
@@ -193,7 +195,8 @@ static void complete(const char *buf, linenoise_completions_t *lc) {
     }
 }
 
-static void repl(myra_agent *a) {
+/* first, if not NULL, is taken as the first line, as if typed. */
+static void repl(myra_agent *a, const char *first) {
     myra_note(MYRA_BOLD, "myra %s\n", MYRA_VERSION);
     myra_note(MYRA_DIM, "%s %s\n", a->prov->name, a->model);
     char *line = NULL;
@@ -211,7 +214,17 @@ static void repl(myra_agent *a) {
         int interrupted;
         /* An interrupted turn leaves the flag set; cleared here, before completion can fetch. */
         myra_interrupted = 0;
-        if (!next_line(ctx, &line, &cap, &interrupted)) {
+        if (first) {
+            free(line);
+            if (!(line = strdup(first))) { perror("strdup"); exit(1); }
+            cap = strlen(line) + 1;
+            first = NULL;
+            for (size_t n = cap - 1; n && strchr(" \t\r\n", line[n - 1]);) line[--n] = 0;
+            if (ctx) {
+                myra_note(MYRA_PLAIN, "> %s\n", line);
+                if (*line) linenoise_history_add(ctx, line);
+            }
+        } else if (!next_line(ctx, &line, &cap, &interrupted)) {
             if (!interrupted) { /* EOF or read error */
                 if (tty) fputc('\n', stderr); /* leave the prompt's line */
                 break;
@@ -302,9 +315,13 @@ int main(int argc, char **argv) {
         else if (opt == 'm') model = optarg;
         else return usage(argv[0], opt == 'h' ? 0 : 2);
     }
-    if (optind < argc) return usage(argv[0], 2);
-    if (acp && prompt) {
-        myra_note(MYRA_ERROR, "error: --acp takes prompts from the client, not -p\n");
+    if (acp && (prompt || optind < argc)) {
+        myra_note(MYRA_ERROR, "error: --acp takes prompts from the client, not %s\n",
+                  prompt ? "-p" : "the command line");
+        return 2;
+    }
+    if (prompt && optind < argc) {
+        myra_note(MYRA_ERROR, "error: give the prompt with -p or as PROMPT, not both\n");
         return 2;
     }
     myra_color = color && isatty(STDERR_FILENO);
@@ -345,6 +362,7 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
 
     int rc = 0;
+    char *first = NULL;
     if (acp) {
         rc = myra_acp(&a, servers); /* started with each session, in its cwd */
     } else {
@@ -355,11 +373,18 @@ int main(int argc, char **argv) {
             rc = myra_ask(&a, prompt) < 0;
             if (myra_interrupted) rc = 130; /* 128 + SIGINT, as a shell would report */
         } else {
-            repl(&a);
+            /* the REPL's first line: the PROMPT words joined by spaces */
+            size_t flen = 1, at = 0;
+            for (int i = optind; i < argc; i++) flen += strlen(argv[i]) + 1;
+            if (optind < argc && !(first = malloc(flen))) { perror("malloc"); exit(1); }
+            for (int i = optind; first && i < argc; i++)
+                at += (size_t)sprintf(first + at, "%s%s", i > optind ? " " : "", argv[i]);
+            repl(&a, first);
             myra_report_session(&a);
         }
     }
     myra_free(&a);
     cJSON_Delete(servers);
+    free(first);
     return rc;
 }

@@ -345,6 +345,51 @@ def test_repl_keeps_history_and_rolls_back_failures(api, tmp_path):
     assert len(api.mock.requests) == 4
 
 
+def users(req):
+    return [m["content"] for m in req["body"]["messages"] if m["role"] == "user"]
+
+
+def test_prompt_words_are_the_first_repl_line(api, tmp_path):
+    api.reply("first")
+    api.reply("second")
+    p = api.run(tmp_path, "fix", "the  build", "-m", "qwen", stdin="two\n")
+    assert p.returncode == 0, p.stderr
+    assert p.stdout == "first\nsecond\n"
+    assert [users(r) for r in api.mock.requests] == [["fix the  build"], ["fix the  build", "two"]]
+    assert api.mock.requests[0]["body"]["model"] == "qwen"  # options may follow the words
+
+
+def test_double_dash_ends_options(api, tmp_path):
+    api.reply("ok")
+    p = api.run(tmp_path, "--", "-v", "flag")
+    assert p.returncode == 0, p.stderr
+    assert [users(r) for r in api.mock.requests] == [["-v flag"]]
+
+
+def test_blank_prompt_words_are_no_prompt(api, tmp_path):
+    api.reply("ok")
+    p = api.run(tmp_path, " ", "\t", stdin="hi\n")
+    assert p.returncode == 0, p.stderr
+    assert [users(r) for r in api.mock.requests] == [["hi"]]
+
+
+def test_prompt_words_run_repl_commands(api, tmp_path):
+    p = api.run(tmp_path, "/exit", stdin="never\n")
+    assert p.returncode == 0, p.stderr
+    assert not api.mock.requests
+
+
+@pytest.mark.parametrize("flags, msg", [
+    (["-p", "x"], "error: give the prompt with -p or as PROMPT, not both\n"),
+    (["--acp"], "error: --acp takes prompts from the client, not the command line\n"),
+])
+def test_prompt_words_conflicts(mock, tmp_path, flags, msg):
+    p = Api(mock, "local").run(tmp_path, *flags, "y")
+    assert p.returncode == 2
+    assert p.stderr == msg
+    assert not mock.requests
+
+
 def test_truncated_reply_drops_tool_calls(api, tmp_path):
     api.reply("partial", [("t", "shell", {"command": "touch x"})], stop="length")
     api.reply("next")

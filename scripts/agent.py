@@ -1765,7 +1765,8 @@ def read_line(editing: bool, tty: bool) -> str | None:
     return line.rstrip(" \t\r\n")
 
 
-def repl(agent: Agent) -> None:
+def repl(agent: Agent, first: str | None = None) -> None:
+    """first, if not None, is taken as the first line, as if typed."""
     note(f"myra {VERSION}\n", Style.BOLD)
     note(f"{agent.prov.name} {agent.model}\n", Style.DIM)
     tty = sys.stdin.isatty()  # no prompt or editing when input is piped
@@ -1780,7 +1781,14 @@ def repl(agent: Agent) -> None:
             # An interrupted turn leaves the flag set; cleared here, before completion can fetch.
             interrupted = False
             try:
-                line = read_line(editing, tty)
+                if first is not None:
+                    line, first = first.rstrip(" \t\r\n"), None
+                    if tty:
+                        note(f"> {line}\n")
+                    if editing and line:
+                        readline.add_history(line)
+                else:
+                    line = read_line(editing, tty)
             except KeyboardInterrupt:  # Ctrl-C at the prompt: drop the line
                 note("\n")
                 continue
@@ -2129,6 +2137,9 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("-m", dest="model", metavar="model", help="model id; remembered per provider")
     ap.add_argument("-p", dest="prompt", metavar="prompt",
                     help="run one prompt headless and exit (default: REPL)")
+    ap.add_argument("words", nargs="*", metavar="PROMPT",
+                    help="start the REPL with these words, joined by spaces, as the\n"
+                         "first line; -- before them if they start with -")
     ap.add_argument("--acp", action="store_true",
                     help="serve the Agent Client Protocol on stdin and stdout, for an editor")
     ap.add_argument("--mcp-config", metavar="FILE",
@@ -2154,9 +2165,13 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     global color, markdown, escape_out, escape_err
-    args = parser().parse_args(argv)
-    if args.acp and args.prompt is not None:
-        note("error: --acp takes prompts from the client, not -p\n", Style.ERROR)
+    args = parser().parse_intermixed_args(argv)  # options after PROMPT words, as getopt allows
+    if args.acp and (args.prompt is not None or args.words):
+        how = "-p" if args.prompt is not None else "the command line"
+        note(f"error: --acp takes prompts from the client, not {how}\n", Style.ERROR)
+        return 2
+    if args.prompt is not None and args.words:
+        note("error: give the prompt with -p or as PROMPT, not both\n", Style.ERROR)
         return 2
     color = not args.no_color and not os.environ.get("NO_COLOR") and sys.stderr.isatty()
     markdown = not args.raw and not os.environ.get("NO_COLOR") and sys.stdout.isatty()
@@ -2187,7 +2202,7 @@ def main(argv: list[str] | None = None) -> int:
         if interrupted:  # Ctrl-C while servers start: exit, as at any other point of a run
             return 130
         if args.prompt is None:
-            repl(agent)
+            repl(agent, " ".join(args.words) if args.words else None)
             agent.session.report("[session]")
             return 0
         rc = 1 if agent.ask(args.prompt) < 0 else 0

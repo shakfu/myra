@@ -133,8 +133,14 @@ class Escape:
         return out
 
 
+last_error = ""  # the text of the last Style.ERROR note, trailing newline dropped
+
+
 def note(msg: str, style: Style = Style.PLAIN) -> None:
     """Write msg to stderr, colored by style when color is on."""
+    global last_error
+    if style == Style.ERROR:
+        last_error = msg.rstrip("\n")
     if escape_err:
         msg = escape(msg)
     if color and style:
@@ -1239,6 +1245,7 @@ class Agent:
     context_full: bool = False  # the last request failed as too long for the model's context
     streamed: bool = False  # the last reply's text was printed while it streamed
     turn_calls: int = 0
+    truncated: bool = False  # this turn ended early: a reply hit the length limit or the call cap
     announced: bool = False  # io.tool was told of the current call, so io.done follows
     session: Usage = field(default_factory=Usage)
     io: Io = field(default_factory=Io)
@@ -1541,6 +1548,7 @@ class Agent:
         # history valid: every tool call must be followed by its result.
         if finish == "length":
             note("warning: reply hit the length limit\n", Style.WARN)
+            self.truncated = True
             msg.pop("tool_calls", None)
         content = msg.get("content")
         if not self.streamed and isinstance(content, str) and content and self.io.text:
@@ -1597,6 +1605,7 @@ class Agent:
             return 0  # end the turn without asking the model again
         if skipped:
             note(f"stopped: {MAX_TOOL_CALLS} tool calls in one turn; skipped {skipped}\n", Style.WARN)
+            self.truncated = True
             return 0
         return 1 if calls else 0
 
@@ -1621,7 +1630,7 @@ class Agent:
         """Run one user turn. -1 on failure, with history rolled back to before the turn."""
         global interrupted
         interrupted = False
-        self.turn_calls = 0
+        self.turn_calls, self.truncated = 0, False
         before = len(self.messages)
         self.messages.append({"role": "user", "content": text})
         turn = Usage()
@@ -1647,6 +1656,7 @@ class Agent:
                 break
             if self.turn_calls >= MAX_TOOL_CALLS:  # a model looping on tools
                 note(f"stopped: {self.turn_calls} tool calls in one turn\n", Style.WARN)
+                self.truncated = True
                 rc = 0
                 break
         turn.report("[usage]")
@@ -2137,6 +2147,10 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("-m", dest="model", metavar="model", help="model id; remembered per provider")
     ap.add_argument("-p", dest="prompt", metavar="prompt",
                     help="run one prompt headless and exit (default: REPL)")
+    ap.add_argument("--json", action="store_true",
+                    help="with -p: stdout is one JSON line, the result: outcome, text,\n"
+                         "error, cost, tokens, model, provider")
+    ap.add_argument("-C", "--cwd", metavar="DIR", help="run in DIR, as if started there")
     ap.add_argument("words", nargs="*", metavar="PROMPT",
                     help="start the REPL with these words, joined by spaces, as the\n"
                          "first line; -- before them if they start with -")
@@ -2163,6 +2177,18 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
+def json_result(agent: Agent | None, p: Provider | None, model: str | None, outcome: str) -> None:
+    """The --json result line on stdout. agent is None if setup failed before it existed."""
+    u = agent.session if agent else Usage()
+    err = last_error.removeprefix("error: ") or "failed"
+    r = {"type": "result", "outcome": outcome, "text": (agent and agent.last_reply()) or "",
+         "error": err if outcome == "error" else None, "cost": u.cost if u.costed else None,
+         "requests": u.requests, "input_tokens": int(u.tokens_in),
+         "output_tokens": int(u.out), "cached_tokens": int(u.cached),
+         "model": agent.model if agent else model, "provider": p.name if p else None}
+    print(json.dumps(r), flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     global color, markdown, escape_out, escape_err
     args = parser().parse_intermixed_args(argv)  # options after PROMPT words, as getopt allows
@@ -2173,6 +2199,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.prompt is not None and args.words:
         note("error: give the prompt with -p or as PROMPT, not both\n", Style.ERROR)
         return 2
+    if args.acp and args.cwd is not None:
+        note("error: --acp takes the working directory from the client, not -C\n", Style.ERROR)
+        return 2
+    if args.json and args.prompt is None:
+        note("error: --json needs -p\n", Style.ERROR)
+        return 2
     color = not args.no_color and not os.environ.get("NO_COLOR") and sys.stderr.isatty()
     markdown = not args.raw and not os.environ.get("NO_COLOR") and sys.stdout.isatty()
     escape_out, escape_err = sys.stdout.isatty(), sys.stderr.isatty()
@@ -2182,15 +2214,32 @@ def main(argv: list[str] | None = None) -> int:
         note(f"error: -p takes a prompt; did you mean -P {args.prompt}?\n", Style.ERROR)
         return 2
 
+    # From here on, --json reports every failure as a result line.
+    def result(agent: Agent | None, p: Provider | None, outcome: str) -> None:
+        if args.json:
+            json_result(agent, p, args.model, outcome)
+
+    if args.cwd is not None:
+        try:
+            os.chdir(args.cwd)
+        except OSError as e:
+            note(f"error: cannot change to {args.cwd}: {e.strerror}\n", Style.ERROR)
+            result(None, args.provider, "error")
+            return 2
     if not (p := args.provider or default_provider()):
         keys = "".join(f" {q.key_env}" for q in PROVIDERS.values() if not q.key_optional)
         note(f"error: no provider: set{keys} or pass -P local\n", Style.ERROR)
+        result(None, None, "error")
         return 1
     servers = None
     if args.mcp_config is not None and (servers := mcp_load(args.mcp_config)) is None:
+        result(None, p, "error")
         return 2
     if not (agent := Agent.create(p, args.model, args.permissions)):
+        result(None, p, "error")
         return 1
+    if args.json:
+        agent.io.text = lambda s: None  # stdout carries only the result line
     agent.verbose = args.verbose
     agent.save_provider = args.provider is not None
     signal.signal(signal.SIGINT, on_sigint)
@@ -2200,13 +2249,17 @@ def main(argv: list[str] | None = None) -> int:
     agent.mcp_start(servers)
     try:
         if interrupted:  # Ctrl-C while servers start: exit, as at any other point of a run
+            result(agent, p, "cancelled")
             return 130
         if args.prompt is None:
             repl(agent, " ".join(args.words) if args.words else None)
             agent.session.report("[session]")
             return 0
         rc = 1 if agent.ask(args.prompt) < 0 else 0
-        return 130 if interrupted else rc  # 128 + SIGINT, as a shell would report
+        rc = 130 if interrupted else rc  # 128 + SIGINT, as a shell would report
+        result(agent, p, "cancelled" if rc == 130 else "error" if rc
+               else "truncated" if agent.truncated else "complete")
+        return rc
     finally:
         agent.mcp_stop()
 

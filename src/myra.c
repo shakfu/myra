@@ -51,6 +51,7 @@ static const char *TOOLS_JSON =
 volatile sig_atomic_t myra_interrupted;
 void (*myra_poll)(void);
 int myra_color, myra_escape_out, myra_escape_err;
+char myra_last_error[1024];
 
 void myra_note(myra_style style, const char *fmt, ...) {
     static const char *const codes[] = {[MYRA_PLAIN] = "", [MYRA_TOOL] = "\033[36m",
@@ -66,6 +67,11 @@ void myra_note(myra_style style, const char *fmt, ...) {
     vsnprintf(s, n < 0 ? 1 : (size_t)n + 1, fmt, again);
     va_end(again);
     va_end(ap);
+    if (style == MYRA_ERROR) {
+        size_t k = (size_t)snprintf(myra_last_error, sizeof myra_last_error, "%s", s);
+        if (k >= sizeof myra_last_error) k = sizeof myra_last_error - 1;
+        while (k && myra_last_error[k - 1] == '\n') myra_last_error[--k] = 0;
+    }
     char *e = myra_escape_err ? myra_escape(NULL, s, 0) : NULL;
     if (on) fputs(codes[style], stderr);
     fputs(e ? e : s, stderr);
@@ -199,6 +205,13 @@ static void sanitize_utf8(buf *b) {
     }
     free(b->p);
     *b = out;
+}
+
+char *myra_utf8(const char *s) {
+    buf b = {0};
+    buf_add(&b, s, strlen(s));
+    sanitize_utf8(&b);
+    return b.p;
 }
 
 static int is_cont(char c) { return ((unsigned char)c & 0xC0) == 0x80; }
@@ -1408,6 +1421,7 @@ int myra_step(myra_agent *a, cJSON *resp) {
        history valid: every tool call must be followed by its result. */
     if (!strcmp(finish, "length")) {
         myra_note(MYRA_WARN, "warning: reply hit the length limit\n");
+        a->truncated = 1;
         cJSON_DeleteItemFromObject(msg, "tool_calls");
     }
     const char *text = get_str(msg, "content");
@@ -1466,6 +1480,7 @@ int myra_step(myra_agent *a, cJSON *resp) {
     if (skipped) {
         myra_note(MYRA_WARN, "stopped: %d tool calls in one turn; skipped %d\n", MYRA_MAX_TOOL_CALLS,
                   skipped);
+        a->truncated = 1;
         return 0;
     }
     return ncalls > 0;
@@ -1521,7 +1536,7 @@ void myra_report_session(myra_agent *a) { usage_print("[session]", &a->session);
 
 int myra_ask(myra_agent *a, const char *text) {
     myra_interrupted = 0;
-    a->turn_calls = 0;
+    a->turn_calls = a->truncated = 0;
     int before = cJSON_GetArraySize(a->messages);
     cJSON *m = cJSON_CreateObject();
     cJSON_AddStringToObject(m, "role", "user");
@@ -1551,6 +1566,7 @@ int myra_ask(myra_agent *a, const char *text) {
         if (rc != 1) break;
         if (a->turn_calls >= MYRA_MAX_TOOL_CALLS) { /* a model looping on tools */
             myra_note(MYRA_WARN, "stopped: %d tool calls in one turn\n", a->turn_calls);
+            a->truncated = 1;
             rc = 0;
             break;
         }

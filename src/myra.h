@@ -30,6 +30,10 @@ extern int myra_color;
 typedef enum { MYRA_PLAIN, MYRA_TOOL, MYRA_ERROR, MYRA_WARN, MYRA_DIM, MYRA_BOLD } myra_style;
 /* fprintf to stderr, colored by style when myra_color is set. */
 void myra_note(myra_style style, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+/* The text of the last MYRA_ERROR note, trailing newline dropped; "" if none. */
+extern char myra_last_error[1024];
+/* s with each invalid UTF-8 byte replaced by U+FFFD; malloc'd. */
+char *myra_utf8(const char *s);
 
 /* Show control characters in caret notation on stdout and stderr, so model and tool
    output cannot drive the terminal. The CLI sets each when that stream is a terminal.
@@ -123,6 +127,7 @@ typedef struct {
     int streamed;        /* the last reply's text was printed while it streamed */
     int verbose;         /* full tool arguments and results on stderr, not one line per call */
     int turn_calls;      /* tool calls run in this turn */
+    int truncated;       /* this turn ended early: a reply hit the length limit or the call cap */
     int announced;       /* io.tool was told of the current call, so io.done follows */
     myra_usage session; /* totals over every turn */
     myra_io io;

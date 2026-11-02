@@ -90,6 +90,8 @@ Requests to `openrouter` carry a top-level `"cache_control": {"type": "ephemeral
     ./myra -p "fix the build"           # headless: one task, then exit
     ./myra "fix the build"              # REPL, with this as the first line
     ./myra -- "-v crashes; fix it"      # -- before a prompt that starts with -
+    ./myra -C ~/src/app -p "..."        # run in another directory
+    ./myra --json -p "..."              # headless, with a JSON result line on stdout
     ./myra -m openai/gpt-5.5 -p "..."   # any OpenRouter model id; remembered
     ./myra -P local                     # llama-server on :8080; remembered
     ./myra --permissions ask            # approve each write, edit and shell
@@ -126,6 +128,20 @@ REPL commands:
 On a terminal, the REPL has line editing, history and UTF-8 input (linenoise, vendored). Tab completes a REPL command at the start of the line, a model id after `/model `, and otherwise a path in the working directory; repeated tabs cycle the matches. Completing a model id costs one `/models` request, made once per session and only if you ask for it. Piped input is read line by line, without a prompt.
 
 Words after the options are joined by single spaces and taken as the REPL's first line, as if typed: a line of blanks is skipped, and `/exit` or another command runs as one. The REPL then reads stdin as usual. They cannot be combined with `-p` or `--acp`.
+
+`-C DIR` (`--cwd DIR`) changes to DIR before anything else, so tools, the system prompt and a relative `--mcp-config` path all see DIR. A missing DIR is an error, exit status 2. Under `--acp` it is rejected: each session's cwd comes from the editor.
+
+`--json` needs `-p`. stdout then holds one line, the result:
+
+    {"type": "result", "outcome": "complete", "text": "...", "error": null, "cost": 0.0123,
+     "requests": 2, "input_tokens": 2100, "output_tokens": 25, "cached_tokens": 900,
+     "model": "...", "provider": "openrouter"}
+
+- `outcome` is `complete`, `truncated` (a reply hit the length limit or the turn hit the 100 tool-call cap), `error` or `cancelled` (Ctrl-C).
+- `text` is the last assistant message with text, or `""`. `error` is the error message, or null unless `outcome` is `error`.
+- `cost` is null when the server reports none. `requests` and the token counts are those of the `[usage]` line, which counts only responses that report usage.
+- A setup failure after the options are accepted, such as a bad `-C` or a missing key, also prints a result line. Invalid options print none.
+- Exit status is as for `-p`. stderr is unchanged.
 
 `--permissions` sets when `write`, `edit` and `shell` run without asking:
 

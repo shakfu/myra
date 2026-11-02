@@ -390,6 +390,109 @@ def test_prompt_words_conflicts(mock, tmp_path, flags, msg):
     assert not mock.requests
 
 
+def test_cwd_flag_moves_tools_and_system_prompt(api, tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    api.reply("", [("w", "write", {"path": "a.txt", "content": "x"}),
+                   ("s", "shell", {"command": "pwd"})])
+    api.reply("done")
+    p = api.run(tmp_path, "-C", "sub", "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert (sub / "a.txt").exists() and not (tmp_path / "a.txt").exists()
+    real = os.path.realpath(sub)
+    assert api.results(api.mock.requests[1])["s"][0].startswith(real + "\n")
+    assert f"The working directory is {real}." in api.mock.requests[0]["body"]["messages"][0]["content"]
+
+
+def test_cwd_long_flag_in_repl(api, tmp_path):
+    (tmp_path / "sub").mkdir()
+    api.reply("ok")
+    p = api.run(tmp_path, "--cwd", "sub", stdin="hi\n")
+    assert p.returncode == 0, p.stderr
+    sys_prompt = api.mock.requests[0]["body"]["messages"][0]["content"]
+    assert f"The working directory is {os.path.realpath(tmp_path / 'sub')}." in sys_prompt
+
+
+def test_bad_cwd_is_an_error(mock, tmp_path):
+    p = Api(mock, "local").run(tmp_path, "-C", "missing", "-p", "x")
+    assert p.returncode == 2
+    assert p.stderr == "error: cannot change to missing: No such file or directory\n"
+    assert not p.stdout and not mock.requests
+
+
+def test_cwd_with_acp_is_rejected(mock, tmp_path):
+    p = Api(mock, "local").run(tmp_path, "--acp", "-C", ".")
+    assert p.returncode == 2
+    assert p.stderr == "error: --acp takes the working directory from the client, not -C\n"
+
+
+def json_lines(p):
+    """stdout's lines, each parsed as JSON; the run must print nothing else there."""
+    assert p.stdout.endswith("\n")
+    return [json.loads(line) for line in p.stdout.splitlines()]
+
+
+def test_json_result_record(mock, tmp_path):
+    api = Api(mock, "openrouter")
+    api.reply("working", [("s", "shell", {"command": "true"})])
+    mock.replies[-1][1]["usage"] = {"prompt_tokens": 100, "completion_tokens": 10,
+                                    "prompt_tokens_details": {"cached_tokens": 50}, "cost": 0.25}
+    api.reply("done \u00e9\n\"x\"")
+    mock.replies[-1][1]["usage"] = {"prompt_tokens": 120, "completion_tokens": 5, "cost": 0.125}
+    p = api.run(tmp_path, "--json", "-m", "qwen", "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert json_lines(p)[-1] == {
+        "type": "result", "outcome": "complete", "text": "done \u00e9\n\"x\"", "error": None,
+        "cost": 0.375, "requests": 2, "input_tokens": 220, "output_tokens": 15,
+        "cached_tokens": 50, "model": "qwen", "provider": "openrouter"}
+    assert "[tool] shell true" in p.stderr and "[usage]" in p.stderr
+
+
+def test_json_cost_is_null_when_unreported(api, tmp_path):
+    api.reply("hi")
+    p = api.run(tmp_path, "--json", "-p", "go")
+    assert p.returncode == 0, p.stderr
+    r = json_lines(p)[-1]
+    assert r["outcome"] == "complete" and r["text"] == "hi"
+    assert r["cost"] is None and r["requests"] == 0 and r["input_tokens"] == 0
+
+
+def test_json_error_record(api, tmp_path):
+    api.mock.replies.append((400, {"error": {"message": "nope"}}))
+    p = api.run(tmp_path, "--json", "-p", "go")
+    assert p.returncode == 1
+    r = json_lines(p)[-1]
+    assert r["outcome"] == "error" and r["text"] == "" and r["cost"] is None
+    assert r["error"].startswith("api error (http 400)") and "nope" in r["error"]
+
+
+def test_json_truncated_record(api, tmp_path):
+    api.reply("partial", stop="length")
+    p = api.run(tmp_path, "--json", "-p", "go")
+    assert p.returncode == 0, p.stderr
+    r = json_lines(p)[-1]
+    assert r["outcome"] == "truncated" and r["text"] == "partial" and r["error"] is None
+
+
+@pytest.mark.parametrize("args, rc, err", [
+    (["-C", "missing"], 2, "cannot change to missing: No such file or directory"),
+    (["-P", "openrouter"], 1, "OPENROUTER_API_KEY is not set"),
+])
+def test_json_setup_failure_record(mock, tmp_path, args, rc, err):
+    p = Api(mock, "local").run(tmp_path, *args, "--json", "-p", "x", provider_flag=False, key=None)
+    assert p.returncode == rc
+    r = json_lines(p)[-1]
+    assert r["outcome"] == "error" and r["error"] == err and r["text"] == ""
+    assert not mock.requests
+
+
+@pytest.mark.parametrize("args", [["--json"], ["--json", "task"], ["--json", "--acp"]])
+def test_json_needs_p(mock, tmp_path, args):
+    p = Api(mock, "local").run(tmp_path, *args)
+    assert p.returncode == 2
+    assert p.stderr == "error: --json needs -p\n" and not p.stdout
+
+
 def test_truncated_reply_drops_tool_calls(api, tmp_path):
     api.reply("partial", [("t", "shell", {"command": "touch x"})], stop="length")
     api.reply("next")
@@ -815,6 +918,18 @@ def test_sigint_during_request_exits_130(mock, tmp_path):
     assert time.monotonic() - t < 3  # curl checks roughly once a second
     assert p.returncode == 130 and "interrupted" in err
     assert "retrying" not in err
+
+
+def test_json_sigint_records_cancelled(mock, tmp_path):
+    api = Api(mock, "local")
+    mock.replies.append((200, {"choices": []}, 20))  # the server stalls
+    p = start(api, tmp_path, "--json", "-p", "go")
+    wait_for(lambda: mock.requests)
+    p.send_signal(signal.SIGINT)
+    out, _ = p.communicate(timeout=10)
+    assert p.returncode == 130
+    r = json.loads(out.splitlines()[-1])
+    assert r["outcome"] == "cancelled" and r["error"] is None
 
 
 def test_repl_survives_sigint_at_prompt_and_mid_turn(mock, tmp_path):

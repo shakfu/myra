@@ -44,6 +44,9 @@ static int usage(const char *argv0, int rc) {
             "      else the first cloud provider whose key is set\n"
             "  -m  model id; remembered per provider\n"
             "  -p  run one prompt headless and exit (default: REPL)\n"
+            "  --json      with -p: stdout is one JSON line, the result: outcome, text,\n"
+            "              error, cost, tokens, model, provider\n"
+            "  -C, --cwd DIR  run in DIR, as if started there\n"
             "  PROMPT...   start the REPL with these words, joined by spaces, as the\n"
             "              first line; -- before them if they start with -\n"
             "  --acp       serve the Agent Client Protocol on stdin and stdout, for an editor\n"
@@ -64,6 +67,41 @@ static int usage(const char *argv0, int rc) {
     repl_help(f);
     return rc;
 }
+
+static void add_str(cJSON *o, const char *key, const char *s) {
+    char *v = s ? myra_utf8(s) : NULL;
+    if (v) cJSON_AddStringToObject(o, key, v);
+    else cJSON_AddNullToObject(o, key);
+    free(v);
+}
+
+/* The --json result line on stdout. a is NULL if setup failed before the agent existed. */
+static void json_result(const myra_agent *a, const myra_provider *p, const char *model,
+                        const char *outcome) {
+    static const myra_usage none = {0};
+    const myra_usage *u = a ? &a->session : &none;
+    const char *text = a ? myra_last_reply((myra_agent *)a) : NULL;
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "type", "result");
+    cJSON_AddStringToObject(r, "outcome", outcome);
+    add_str(r, "text", text ? text : "");
+    const char *err = !strncmp(myra_last_error, "error: ", 7) ? myra_last_error + 7 : myra_last_error;
+    add_str(r, "error", strcmp(outcome, "error") ? NULL : *err ? err : "failed");
+    if (u->costed) cJSON_AddNumberToObject(r, "cost", u->cost);
+    else cJSON_AddNullToObject(r, "cost");
+    cJSON_AddNumberToObject(r, "requests", u->requests);
+    cJSON_AddNumberToObject(r, "input_tokens", u->in);
+    cJSON_AddNumberToObject(r, "output_tokens", u->out);
+    cJSON_AddNumberToObject(r, "cached_tokens", u->cached);
+    add_str(r, "model", a ? a->model : model);
+    add_str(r, "provider", p ? p->name : NULL);
+    char *s = cJSON_PrintUnformatted(r);
+    if (s) printf("%s\n", s), fflush(stdout);
+    free(s);
+    cJSON_Delete(r);
+}
+
+static void discard(void *ud, const char *s) { (void)ud, (void)s; }
 
 static void on_sigint(int sig) {
     (void)sig;
@@ -280,18 +318,20 @@ int main(int argc, char **argv) {
                                         [MYRA_ALL] = "all", [MYRA_READ_ONLY] = "read-only"};
     static const struct option longopts[] = {{"permissions", required_argument, NULL, 'W'},
                                              {"verbose", no_argument, NULL, 'v'},
-                                             {"no-color", no_argument, NULL, 'C'},
+                                             {"no-color", no_argument, NULL, 'N'},
+                                             {"cwd", required_argument, NULL, 'C'},
+                                             {"json", no_argument, NULL, 'J'},
                                              {"raw", no_argument, NULL, 'R'},
                                              {"acp", no_argument, NULL, 'A'},
                                              {"mcp-config", required_argument, NULL, 'M'},
                                              {"help", no_argument, NULL, 'h'},
                                              {NULL, 0, NULL, 0}};
     myra_permissions perms = MYRA_AUTO;
-    int opt, verbose = 0, color = 1, raw = 0, acp = 0;
-    const char *mcp_config = NULL;
+    int opt, verbose = 0, color = 1, raw = 0, acp = 0, json = 0;
+    const char *mcp_config = NULL, *dir = NULL;
     const char *no_color = getenv("NO_COLOR"); /* https://no-color.org */
     if (no_color && *no_color) color = 0, raw = 1;
-    while ((opt = getopt_long(argc, argv, "p:P:m:hV", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:P:m:hVC:", longopts, NULL)) != -1) {
         if (opt == 'V') {
             printf("myra %s\n", MYRA_VERSION);
             return 0;
@@ -299,7 +339,9 @@ int main(int argc, char **argv) {
         if (opt == 'v') verbose = 1;
         else if (opt == 'A') acp = 1;
         else if (opt == 'M') mcp_config = optarg;
-        else if (opt == 'C') color = 0;
+        else if (opt == 'N') color = 0;
+        else if (opt == 'C') dir = optarg;
+        else if (opt == 'J') json = 1;
         else if (opt == 'R') raw = 1;
         else if (opt == 'W') {
             size_t i = 0;
@@ -324,6 +366,14 @@ int main(int argc, char **argv) {
         myra_note(MYRA_ERROR, "error: give the prompt with -p or as PROMPT, not both\n");
         return 2;
     }
+    if (acp && dir) {
+        myra_note(MYRA_ERROR, "error: --acp takes the working directory from the client, not -C\n");
+        return 2;
+    }
+    if (json && !prompt) {
+        myra_note(MYRA_ERROR, "error: --json needs -p\n");
+        return 2;
+    }
     myra_color = color && isatty(STDERR_FILENO);
     myra_markdown = !raw && isatty(STDOUT_FILENO);
     myra_escape_out = isatty(STDOUT_FILENO);
@@ -333,27 +383,41 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    const myra_provider *p;
-    if (pname) {
-        if (!(p = myra_provider_named(pname))) {
-            myra_note(MYRA_ERROR, "error: unknown provider %s\n", pname);
-            return usage(argv[0], 2);
-        }
-    } else if (!(p = myra_provider_default())) {
+    const myra_provider *p = NULL;
+    if (pname && !(p = myra_provider_named(pname))) {
+        myra_note(MYRA_ERROR, "error: unknown provider %s\n", pname);
+        return usage(argv[0], 2);
+    }
+    /* From here on, --json reports every failure as a result line. */
+    if (dir && chdir(dir) < 0) {
+        myra_note(MYRA_ERROR, "error: cannot change to %s: %s\n", dir, strerror(errno));
+        if (json) json_result(NULL, p, model, "error");
+        return 2;
+    }
+    if (!p && !(p = myra_provider_default())) {
         char keys[256] = "";
         for (size_t i = 0; i < MYRA_NPROVIDERS; i++)
             if (!MYRA_PROVIDERS[i].key_optional)
                 snprintf(keys + strlen(keys), sizeof keys - strlen(keys), " %s",
                          MYRA_PROVIDERS[i].key_env);
         myra_note(MYRA_ERROR, "error: no provider: set%s or pass -P local\n", keys);
+        if (json) json_result(NULL, NULL, model, "error");
         return 1;
     }
 
     cJSON *servers = NULL;
-    if (mcp_config && !(servers = myra_mcp_load(mcp_config))) return 2;
+    if (mcp_config && !(servers = myra_mcp_load(mcp_config))) {
+        if (json) json_result(NULL, p, model, "error");
+        return 2;
+    }
     myra_agent a;
-    if (myra_init(&a, p, model, perms) < 0) { cJSON_Delete(servers); return 1; }
+    if (myra_init(&a, p, model, perms) < 0) {
+        if (json) json_result(NULL, p, model, "error");
+        cJSON_Delete(servers);
+        return 1;
+    }
     a.verbose = verbose;
+    if (json) a.io.text = discard; /* stdout carries only the result line */
     a.save_provider = pname != NULL;
     /* No SA_RESTART: blocking reads return EINTR, so Ctrl-C takes effect at once. */
     struct sigaction sa = {0};
@@ -369,9 +433,13 @@ int main(int argc, char **argv) {
         myra_mcp_start_list(&a, servers);
         if (myra_interrupted) {
             rc = 130; /* Ctrl-C while servers start: exit, as at any other point of a run */
+            if (json) json_result(&a, p, model, "cancelled");
         } else if (prompt) {
             rc = myra_ask(&a, prompt) < 0;
             if (myra_interrupted) rc = 130; /* 128 + SIGINT, as a shell would report */
+            if (json)
+                json_result(&a, p, model, rc == 130 ? "cancelled" : rc ? "error"
+                                          : a.truncated ? "truncated" : "complete");
         } else {
             /* the REPL's first line: the PROMPT words joined by spaces */
             size_t flen = 1, at = 0;

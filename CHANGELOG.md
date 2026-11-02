@@ -4,6 +4,10 @@
 
 ### Added
 
+- `-C DIR` / `--cwd DIR` runs myra as if started in DIR, so a launcher need not set the process cwd. With `--acp` it is an error, since each ACP session names its own cwd.
+
+- `--json`, with `-p`, makes stdout a single JSON result line: outcome, final reply, error, cost (null when unreported), token counts, model and provider (README, "Use"). Setup failures after option parsing print one too, so a caller always finds a record.
+
 - `myra [options] PROMPT...` starts the REPL with the words, joined by spaces, as its first line, so a launcher can start a session already working on a task. With `-p` or `--acp` they are an error, exit status 2.
 
 - `--acp` serves the Agent Client Protocol on stdin and stdout, so an editor can drive myra (README, "Editors"). File reads and writes go through the editor when it serves them, so `read` sees unsaved buffers. Permission questions appear in the editor's UI, and `session/cancel` works like Ctrl-C. myralib gets `myra_io` hooks for text, tool calls, file access and permission, plus a `myra_poll` hook. The CLI keeps the defaults. One thread polls stdin from curl's progress callback and the `shell` wait loop, so a cancel is seen mid-request without a reader thread and locking.

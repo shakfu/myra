@@ -2191,7 +2191,11 @@ def json_result(agent: Agent | None, p: Provider | None, model: str | None, outc
 
 def main(argv: list[str] | None = None) -> int:
     global color, markdown, escape_out, escape_err
-    args = parser().parse_intermixed_args(argv)  # options after PROMPT words, as getopt allows
+    argv = sys.argv[1:] if argv is None else argv
+    # Split at "--" here: parse_intermixed_args ignores it before Python 3.12.7.
+    cut = argv.index("--") if "--" in argv else len(argv)
+    args = parser().parse_intermixed_args(argv[:cut])  # options after PROMPT words, as getopt allows
+    args.words += argv[cut + 1:]
     if args.acp and (args.prompt is not None or args.words):
         how = "-p" if args.prompt is not None else "the command line"
         note(f"error: --acp takes prompts from the client, not {how}\n", Style.ERROR)

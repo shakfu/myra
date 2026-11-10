@@ -195,8 +195,9 @@ static cJSON *call_update(const char *status) {
     return u;
 }
 
-static void on_tool(void *ud, const char *name, const char *detail, int pending) {
-    (void)ud;
+static void on_tool(void *ud, const char *name, const char *detail, const cJSON *input,
+                    int pending) {
+    (void)ud, (void)input;
     char id[32], *title = tool_title(name, detail);
     snprintf(id, sizeof id, "call_%d", in.open = ++in.calls);
     cJSON *u = cJSON_CreateObject();

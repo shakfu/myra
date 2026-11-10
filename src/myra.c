@@ -48,8 +48,9 @@ static const char *TOOLS_JSON =
     "\"timeout\":{\"type\":\"integer\"}},"
     "\"required\":[\"command\"],\"additionalProperties\":false}}}]";
 
-volatile sig_atomic_t myra_interrupted;
+atomic_int myra_interrupted;
 void (*myra_poll)(void);
+void (*myra_note_hook)(myra_style style, const char *text);
 int myra_color, myra_escape_out, myra_escape_err;
 char myra_last_error[1024];
 
@@ -71,6 +72,11 @@ void myra_note(myra_style style, const char *fmt, ...) {
         size_t k = (size_t)snprintf(myra_last_error, sizeof myra_last_error, "%s", s);
         if (k >= sizeof myra_last_error) k = sizeof myra_last_error - 1;
         while (k && myra_last_error[k - 1] == '\n') myra_last_error[--k] = 0;
+    }
+    if (myra_note_hook) {
+        myra_note_hook(style, s);
+        free(s);
+        return;
     }
     char *e = myra_escape_err ? myra_escape(NULL, s, 0) : NULL;
     if (on) fputs(codes[style], stderr);
@@ -630,11 +636,12 @@ static void tool_log(myra_agent *a, const char *name, const char *detail) {
 }
 
 /* Log the call, and tell the front end. */
-static void tool_start(myra_agent *a, const char *name, const char *detail, int outside) {
+static void tool_start(myra_agent *a, const char *name, const char *detail, const cJSON *input,
+                       int outside) {
     tool_log(a, name, detail);
     a->announced = 1;
     int pending = strcmp(name, "read") && asks(a->permissions, outside);
-    if (a->io.tool) a->io.tool(a->io.ud, name, detail, pending);
+    if (a->io.tool) a->io.tool(a->io.ud, name, detail, input, pending);
 }
 
 /* text, freed, cut to the tool result cap as a local read would be. */
@@ -666,7 +673,7 @@ char *myra_run_tool(myra_agent *a, const char *name, cJSON *input, int *err) {
     *err = 1;
     int served = a->io.read && a->io.write; /* the front end owns the files */
     if (!strcmp(name, "read") && path) {
-        tool_start(a, "read", path, 0);
+        tool_start(a, "read", path, input, 0);
         char *why_not = NULL, *out = a->io.read ? served_read(a, path, err, &why_not) : NULL;
         if (out) return out;
         /* Inside the cwd a refusal likely means a binary file, which a disk read reports
@@ -678,7 +685,7 @@ char *myra_run_tool(myra_agent *a, const char *name, cJSON *input, int *err) {
     }
     if (!strcmp(name, "write") && path && content) {
         int outside = outside_cwd(path);
-        tool_start(a, "write", path, outside);
+        tool_start(a, "write", path, input, outside);
         if ((why = denied(a, outside, "write", path))) return xstrdup(why);
         if (served) {
             char *abs = absolute(path), *failed = a->io.write(a->io.ud, abs, content);
@@ -692,12 +699,12 @@ char *myra_run_tool(myra_agent *a, const char *name, cJSON *input, int *err) {
     }
     if (!strcmp(name, "edit") && path && old && new) {
         int outside = outside_cwd(path);
-        tool_start(a, "edit", path, outside);
+        tool_start(a, "edit", path, input, outside);
         if ((why = denied(a, outside, "edit", path))) return xstrdup(why);
         return tool_edit(served ? &a->io : NULL, path, old, new, err);
     }
     if (!strcmp(name, "shell") && cmd) {
-        tool_start(a, "shell", cmd, 0);
+        tool_start(a, "shell", cmd, input, 0);
         if ((why = denied(a, 0, "shell", cmd))) return xstrdup(why); /* unconfinable */
         cJSON *t = cJSON_GetObjectItemCaseSensitive(input, "timeout");
         double want = cJSON_IsNumber(t) ? t->valuedouble : MYRA_SHELL_TIMEOUT;
@@ -708,7 +715,7 @@ char *myra_run_tool(myra_agent *a, const char *name, cJSON *input, int *err) {
     }
     if (myra_mcp_has(a, name)) {
         char *args = cJSON_PrintUnformatted(input);
-        tool_start(a, name, args ? args : "", 0);
+        tool_start(a, name, args ? args : "", input, 0);
         why = denied(a, 0, name, args ? args : ""); /* unconfinable, like shell */
         free(args);
         if (why) return xstrdup(why);
@@ -1156,6 +1163,9 @@ static void stream_event(stream *st, const char *data) {
         } else if (!strcmp(f->string, "reasoning_details") && cJSON_IsArray(f)) {
             merge_details(st, f);
         } else if (strcmp(f->string, "role") && cJSON_IsString(f) && *f->valuestring) {
+            if (st->io->reasoning && (!strcmp(f->string, "reasoning") ||
+                                      !strcmp(f->string, "reasoning_content")))
+                st->io->reasoning(st->io->ud, f->valuestring);
             add_text(st, f->string, f->valuestring);
         }
     }

@@ -2,7 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- `myra_interrupted` is an `atomic_int`, not a `volatile sig_atomic_t`. A front end that runs `myra_ask` on a worker thread and cancels from its UI thread no longer has a data race. `sig_atomic_t` is only defined for signal handlers; a lock-free atomic is valid in both.
+
 ### Added
+
+- `myra-ui` (`ui/`, built by `make ui`): a desktop front end on `myralib`, drawn with CUI 1.3.1, vendored as its single-file release in `vendor/cui/` (README, "Desktop UI"). It links `myralib` rather than speaking ACP, so a change to `myralib` breaks its build at once instead of drifting. It is off by default, so the CLI still needs only libcurl.
+
+- `myra_io` gains `reasoning`, the streamed `reasoning` or `reasoning_content` text, and `tool` now also receives the call's parsed arguments, so a front end can show diffs. `myra_note_hook` sends notes to a front end instead of stderr. ACP output is unchanged.
 
 - `-C DIR` / `--cwd DIR` runs myra as if started in DIR, so a launcher need not set the process cwd. With `--acp` it is an error, since each ACP session names its own cwd.
 

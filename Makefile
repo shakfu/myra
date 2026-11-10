@@ -23,19 +23,27 @@ install: all
 asan:
 	$(MAKE) test BUILD=build-asan TYPE=Debug CMAKE_ARGS=-DMYRA_SANITIZE=ON LINK=
 
+# The CUI front end in ui/, with every test, in its own tree: ./build-ui/ui/myra-ui
+ui:
+	$(MAKE) test BUILD=build-ui CMAKE_ARGS=-DMYRA_UI=ON LINK=
+
 # clang's static analyzer on our C, and ruff (pinned: new versions add rules) on the Python.
 lint:
 	for f in src/*.c; do \
 	  clang --analyze -Xclang -analyzer-werror -std=c11 -D_DEFAULT_SOURCE -DMYRA_VERSION='""' \
 	    -Isrc -Ivendor/cjson -Ivendor/linenoise/include -o /dev/null $$f || exit 1; \
 	done
-	uvx ruff@0.16.8 check scripts tests
+	for f in ui/*.c; do \
+	  clang --analyze -Xclang -analyzer-werror -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DMYRA_VERSION='""' \
+	    -Isrc -Iui -Ivendor/cjson -Ivendor/cui -o /dev/null $$f || exit 1; \
+	done
+	uvx ruff@0.16.8 check scripts tests ui/tests
 
 clean:
-	rm -rf build build-asan
+	rm -rf build build-asan build-ui
 	rm -f myra
 
-.PHONY: all test asan lint install clean
+.PHONY: all test asan ui lint install clean
 
 # cmake writes CMakeCache.txt before it fails; without this a failed configure
 # leaves a cache behind and the next make skips configure and reports a missing Makefile.

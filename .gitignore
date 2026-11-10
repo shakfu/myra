@@ -55,6 +55,7 @@ dkms.conf
 *.dwo
 build/
 build-asan/
+build-ui/
 /myra
 .pytest_cache/
 __pycache__/

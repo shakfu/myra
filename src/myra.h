@@ -4,6 +4,7 @@
 
 #include <cJSON.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -18,8 +19,9 @@
 
 /* Set it from a SIGINT handler installed without SA_RESTART. It stops the running
    shell command (killing its process group) or model request, and ends the turn.
-   myra_ask clears it on entry. */
-extern volatile sig_atomic_t myra_interrupted;
+   myra_ask clears it on entry. Atomic, so another thread may also set it; lock-free
+   atomics are safe in a signal handler too. */
+extern atomic_int myra_interrupted;
 
 /* Called often while a model request or shell command runs, so a front end can
    read its input and set myra_interrupted. NULL: none. */
@@ -30,6 +32,9 @@ extern int myra_color;
 typedef enum { MYRA_PLAIN, MYRA_TOOL, MYRA_ERROR, MYRA_WARN, MYRA_DIM, MYRA_BOLD } myra_style;
 /* fprintf to stderr, colored by style when myra_color is set. */
 void myra_note(myra_style style, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+/* When set, myra_note passes each formatted, unescaped note here instead of stderr.
+   For a front end without a terminal; it may be called from the agent's thread. */
+extern void (*myra_note_hook)(myra_style style, const char *text);
 /* The text of the last MYRA_ERROR note, trailing newline dropped; "" if none. */
 extern char myra_last_error[1024];
 /* s with each invalid UTF-8 byte replaced by U+FFFD; malloc'd. */
@@ -101,8 +106,9 @@ extern const size_t MYRA_NPROVIDERS;
 typedef struct {
     void *ud;
     void (*text)(void *ud, const char *s); /* reply text, as it streams */
-    /* A tool call starts; pending: it waits for allow before it runs. */
-    void (*tool)(void *ud, const char *name, const char *detail, int pending);
+    /* A tool call starts; pending: it waits for allow before it runs. input is the
+       call's parsed arguments, valid only during the call. */
+    void (*tool)(void *ud, const char *name, const char *detail, const cJSON *input, int pending);
     /* The call tool announced has finished: its result, err set if it failed. */
     void (*done)(void *ud, int err, const char *result);
     /* The file at absolute path, malloc'd; NULL on failure, with *why malloc'd. */
@@ -111,6 +117,8 @@ typedef struct {
     char *(*write)(void *ud, const char *path, const char *content);
     /* Whether a mutating tool may run, asked where --permissions would ask. 1 allows. */
     int (*allow)(void *ud, const char *name, const char *detail, int outside);
+    /* Reasoning text, as it streams: the reasoning or reasoning_content delta. */
+    void (*reasoning)(void *ud, const char *s);
 } myra_io;
 
 typedef struct myra_mcp myra_mcp; /* mcp.h */

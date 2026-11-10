@@ -19,7 +19,7 @@ myra builds to one binary of about 135 KB (Linux, Release). It links only libc a
 
 ## Build
 
-Requires CMake 3.16+, a C11 compiler and libcurl. Everything else is optional. cJSON 1.7.19 (MIT) is vendored in `vendor/cjson/`, linenoise 2.0 (BSD-2) in `vendor/linenoise/`. The Makefile wraps CMake and uses Ninja when installed.
+Requires CMake 3.16+, a C11 compiler and libcurl. Everything else is optional. cJSON 1.7.19 (MIT) is vendored in `vendor/cjson/`, linenoise 2.0 (BSD-2) in `vendor/linenoise/`, and CUI 1.3.1 (MIT, used only by `ui/`) in `vendor/cui/`. The Makefile wraps CMake and uses Ninja when installed.
 
 | Dependency   | Needed for            | Debian or Ubuntu       | macOS                    |
 |--------------|-----------------------|------------------------|--------------------------|
@@ -38,6 +38,7 @@ Missing libcurl stops configure with `Could NOT find CURL`. A missing optional d
     make              # configure and build into build/; ./myra links to build/myra
     make test         # ctest: unit tests plus the end-to-end suite
     make asan         # the same, in build-asan/ with AddressSanitizer and UBSan
+    make ui           # the same plus myra-ui and its tests, in build-ui/ (see "Desktop UI")
     make install      # stripped, to PREFIX/bin; PREFIX=~/.local by default
     make clean
     make BUILD=out TYPE=Debug CMAKE_ARGS=-DMYRA_SANITIZE=ON   # overrides
@@ -55,6 +56,7 @@ Layout:
 | `tests/unit.c`        | `myralib` unit tests; each `TEST(name)` is a ctest `unit.<name>` |
 | `tests/test_agent.py` | end-to-end tests against a mock server; ctest `e2e`, needs `uv`  |
 | `scripts/agent.py`    | myra in Python 3.11+, stdlib only; same options and state. ctest `e2e-py` runs the suite against it |
+| `ui/`                 | `myra-ui`, a desktop front end on `myralib` and CUI; ctest `ui.*` |
 
 CMake writes `build/compile_commands.json`, which clangd finds automatically.
 
@@ -199,6 +201,25 @@ There is one session at a time. `session/new` changes to the session's `cwd` and
 
 Each session starts the `--mcp-config` servers, then those listed in `session/new`, in the session's `cwd`. They work as described under `--mcp-config`, with `session/cancel` in place of Ctrl-C. myra declares no `http` or `sse` MCP capability. A new session stops the previous servers.
 
+### Desktop UI: `myra-ui`
+
+`make ui` builds `build-ui/ui/myra-ui`, a window on the same `myralib`, drawn by [CUI](https://github.com/yappologistic/CUI). The CLI build does not need it. Linux also needs the X11 headers (`libx11-dev`).
+
+    ./build-ui/ui/myra-ui [-P provider] [-m model] [--permissions MODE] [-C DIR] [PROMPT...]
+
+Options work as for `myra`; words after them are sent as the first message. `--permissions` defaults to `ask`, since a window keeps no scrollback to review changes in afterwards. The header switches it for the next turn.
+
+The window has:
+
+- the chat, with replies as markdown, reasoning in a collapsible block, and each tool call with its status, time, input and output
+- an inline diff under each `write` and `edit`, also shown when asking to allow one
+- a file browser of the working directory; double-click adds a path to the prompt
+- a log of myra's notes (`[tool]`, `[usage]`, errors); errors also show as a toast
+- a model picker over the provider's `/models`, and a folder picker that starts a new chat there
+- a command palette (Cmd+K on macOS, Ctrl+K elsewhere); Esc stops a turn
+
+Panels dock and rearrange by dragging their tabs. Closing the window during a turn interrupts it and waits for it to end, so a running `write` or `shell` finishes first.
+
 ## Saved state
 
 Under `$XDG_STATE_HOME/myra/` (default `~/.local/state/myra/`):
@@ -208,6 +229,7 @@ Under `$XDG_STATE_HOME/myra/` (default `~/.local/state/myra/`):
 | `provider`          | the last `-P`                           |
 | `<provider>.model`  | the last model used with that provider  |
 | `history`           | REPL input history, mode 0600; last 1000 lines |
+| `ui.theme`, `ui.layout` | `myra-ui`'s light or dark theme and panel layout |
 
 `provider` and the model files are saved only after the server accepts a request, so a mistyped `-P` or `-m` is not kept.
 

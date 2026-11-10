@@ -10,6 +10,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -842,6 +843,95 @@ TEST(stale_context_full_does_not_drop_tool_output) {
     return 0;
 }
 
+/* ---- front-end hooks ---- */
+
+static char hooked[4096];
+static int hooked_style = -1;
+
+static void capture_note(myra_style style, const char *text) {
+    hooked_style = (int)style;
+    snprintf(hooked, sizeof hooked, "%s", text);
+}
+
+TEST(note_hook_replaces_stderr) {
+    myra_note_hook = capture_note;
+    myra_note(MYRA_ERROR, "failed %d\n", 7);
+    myra_note_hook = NULL;
+    CHECK(hooked_style == MYRA_ERROR && !strcmp(hooked, "failed 7\n"));
+    CHECK(!strcmp(myra_last_error, "failed 7")); /* still recorded for callers */
+    return 0;
+}
+
+static void capture_tool(void *ud, const char *name, const char *detail, const cJSON *input,
+                         int pending) {
+    (void)ud, (void)pending;
+    snprintf(hooked, sizeof hooked, "%s|%s|%s", name, detail,
+             cJSON_GetStringValue(cJSON_GetObjectItem(input, "content")));
+}
+
+TEST(tool_hook_receives_input) {
+    A.io.tool = capture_tool;
+    int err;
+    free(tool("write", "{\"path\":\"f\",\"content\":\"body\"}", &err));
+    CHECK(!err && !strcmp(hooked, "write|f|body"));
+    return 0;
+}
+
+/* Serve one HTTP request with an SSE body from a child process; returns its port. */
+static int serve_once(const char *sse, pid_t *child) {
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t len = sizeof sa;
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0 || bind(s, (struct sockaddr *)&sa, sizeof sa) < 0 || listen(s, 1) < 0 ||
+        getsockname(s, (struct sockaddr *)&sa, &len) < 0)
+        return -1;
+    if ((*child = fork()) == 0) {
+        int c = accept(s, NULL, NULL);
+        char req[65536];
+        size_t n = 0;
+        ssize_t k;
+        while (n < sizeof req - 1 && (k = read(c, req + n, sizeof req - 1 - n)) > 0) {
+            n += (size_t)k;
+            req[n] = 0;
+            char *end = strstr(req, "\r\n\r\n"), *cl = strstr(req, "Content-Length:"); /* curl's spelling */
+            if (end && cl && n >= (size_t)(end + 4 - req) + (size_t)atol(cl + 15)) break;
+        }
+        const char *head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                           "Connection: close\r\n\r\n";
+        if (write(c, head, strlen(head)) < 0 || write(c, sse, strlen(sse)) < 0) _exit(1);
+        close(c);
+        _exit(0);
+    }
+    close(s);
+    return *child > 0 ? ntohs(sa.sin_port) : -1;
+}
+
+static char thought[256], said[256];
+static void capture_reasoning(void *ud, const char *s) { (void)ud; strncat(thought, s, sizeof thought - strlen(thought) - 1); }
+static void capture_text(void *ud, const char *s) { (void)ud; strncat(said, s, sizeof said - strlen(said) - 1); }
+
+TEST(reasoning_hook_streams_both_fields) {
+    pid_t child;
+    int port = serve_once(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"think \"}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"hard\"}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n", &child);
+    CHECK(port > 0);
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/v1", port);
+    setenv("LOCAL_BASE_URL", url, 1);
+    A.io.reasoning = capture_reasoning;
+    A.io.text = capture_text;
+    int rc = myra_ask(&A, "hi");
+    int st = 0;
+    waitpid(child, &st, 0);
+    CHECK(rc == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(!strcmp(thought, "think hard") && !strcmp(said, "done"));
+    return 0;
+}
+
 TEST(command_parsing) {
     CHECK(!strcmp(myra_command("/model", "/model"), ""));
     CHECK(!strcmp(myra_command("/model   qwen", "/model"), "qwen"));
@@ -903,6 +993,9 @@ static const struct { const char *name; int (*fn)(void); int needs_agent; } TEST
     T(step_failures_leave_history_alone, 1),
     T(clear_keeps_only_system_prompt, 1),
     T(stale_context_full_does_not_drop_tool_output, 1),
+    T(note_hook_replaces_stderr, 0),
+    T(tool_hook_receives_input, 1),
+    T(reasoning_hook_streams_both_fields, 1),
     T(command_parsing, 0),
     T(escape_controls, 0),
     T(markdown_inline, 0),

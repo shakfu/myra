@@ -11,6 +11,7 @@ endif()
 
 option(MYRA_SANITIZE "Build with AddressSanitizer and UBSan" OFF)
 option(MYRA_WERROR "Treat our own warnings as errors (CI)" OFF)
+option(MYRA_UI "Build myra-ui, the CUI desktop front end in ui/" OFF)
 if(MYRA_SANITIZE)
   # no-recover: undefined behaviour fails the test instead of printing a warning.
   add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
@@ -66,6 +67,10 @@ target_link_libraries(myra PRIVATE myralib linenoise)
 install(TARGETS myra RUNTIME DESTINATION bin)
 
 enable_testing()
+
+if(MYRA_UI)
+  add_subdirectory(ui)
+endif()
 
 add_executable(unit tests/unit.c)
 target_compile_options(unit PRIVATE ${WARNINGS})

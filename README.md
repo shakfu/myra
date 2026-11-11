@@ -42,6 +42,7 @@ Missing libcurl stops configure with `Could NOT find CURL`. A missing optional d
     make ui           # build and run myra-ui; ARGS='-P local' passes options
     make install      # stripped, to PREFIX/bin; PREFIX=~/.local by default
     make install-ui   # the same for myra and myra-ui, built in build-ui/
+    make vendor-cui VERSION=1.x.y   # replace vendor/cui/ with that CUI release
     make clean
     make BUILD=out TYPE=Debug CMAKE_ARGS=-DMYRA_SANITIZE=ON   # overrides
 

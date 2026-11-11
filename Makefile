@@ -48,11 +48,25 @@ lint:
 	done
 	uvx ruff@0.16.8 check scripts tests ui/tests
 
+# Replace vendor/cui/ with release VERSION of CUI. Files land only if all three
+# download and the header names VERSION; review with git diff, then make test-ui.
+vendor-cui:
+	@echo "$(VERSION)" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || { echo "usage: make vendor-cui VERSION=1.x.y"; exit 2; }
+	tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	rel=https://github.com/yappologistic/CUI/releases/download/v$(VERSION) && \
+	curl -fsSL -o "$$tmp/cui.h" "$$rel/cui.h" && curl -fsSL -o "$$tmp/cui.c" "$$rel/cui.c" && \
+	curl -fsSL -o "$$tmp/LICENSE" https://raw.githubusercontent.com/yappologistic/CUI/v$(VERSION)/LICENSE && \
+	for f in cui.h cui.c; do grep -q '^/\* CUI $(VERSION),' "$$tmp/$$f" || { echo "$$f is not CUI $(VERSION)"; exit 1; }; done && \
+	mv "$$tmp/cui.h" "$$tmp/cui.c" "$$tmp/LICENSE" vendor/cui/
+	sed -i.bak -E 's/CUI [0-9]+\.[0-9]+\.[0-9]+ \(MIT/CUI $(VERSION) (MIT/' README.md && rm README.md.bak
+	git diff --stat -- vendor/cui README.md
+	@echo "vendor-cui: add a CHANGELOG entry, then run make test-ui and make lint"
+
 clean:
 	rm -rf build build-asan build-ui
 	rm -f myra
 
-.PHONY: all test asan test-ui ui lint install install-ui clean
+.PHONY: all test asan test-ui ui lint install install-ui vendor-cui clean
 
 # cmake writes CMakeCache.txt before it fails; without this a failed configure
 # leaves a cache behind and the next make skips configure and reports a missing Makefile.

@@ -38,8 +38,10 @@ Missing libcurl stops configure with `Could NOT find CURL`. A missing optional d
     make              # configure and build into build/; ./myra links to build/myra
     make test         # ctest: unit tests plus the end-to-end suite
     make asan         # the same, in build-asan/ with AddressSanitizer and UBSan
-    make ui           # the same plus myra-ui and its tests, in build-ui/ (see "Desktop UI")
+    make test-ui      # the same plus myra-ui and its tests, in build-ui/ (see "Desktop UI")
+    make ui           # build and run myra-ui; ARGS='-P local' passes options
     make install      # stripped, to PREFIX/bin; PREFIX=~/.local by default
+    make install-ui   # the same for myra and myra-ui, built in build-ui/
     make clean
     make BUILD=out TYPE=Debug CMAKE_ARGS=-DMYRA_SANITIZE=ON   # overrides
 
@@ -203,9 +205,9 @@ Each session starts the `--mcp-config` servers, then those listed in `session/ne
 
 ### Desktop UI: `myra-ui`
 
-`make ui` builds `build-ui/ui/myra-ui`, a window on the same `myralib`, drawn by [CUI](https://github.com/yappologistic/CUI). The CLI build does not need it. Linux also needs the X11 headers (`libx11-dev`).
+`make ui` builds and runs `build-ui/ui/myra-ui`, `make test-ui` tests it and `make install-ui` installs it, a window on the same `myralib`, drawn by [CUI](https://github.com/yappologistic/CUI). The CLI build does not need it. Linux also needs the X11 headers (`libx11-dev`).
 
-    ./build-ui/ui/myra-ui [-P provider] [-m model] [--permissions MODE] [-C DIR] [PROMPT...]
+    myra-ui [-P provider] [-m model] [--permissions MODE] [-C DIR] [PROMPT...]
 
 Options work as for `myra`; words after them are sent as the first message. `--permissions` defaults to `ask`, since a window keeps no scrollback to review changes in afterwards. The header switches it for the next turn.
 

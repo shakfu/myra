@@ -8,7 +8,7 @@
 
 ### Added
 
-- `myra-ui` (`ui/`, built by `make ui`): a desktop front end on `myralib`, drawn with CUI 1.3.1, vendored as its single-file release in `vendor/cui/` (README, "Desktop UI"). It links `myralib` rather than speaking ACP, so a change to `myralib` breaks its build at once instead of drifting. It is off by default, so the CLI still needs only libcurl.
+- `myra-ui` (`ui/`, run by `make ui`, tested by `make test-ui`, installed by `make install-ui`): a desktop front end on `myralib`, drawn with CUI 1.3.1, vendored as its single-file release in `vendor/cui/` (README, "Desktop UI"). It links `myralib` rather than speaking ACP, so a change to `myralib` breaks its build at once instead of drifting. It is off by default, so the CLI still needs only libcurl.
 
 - `myra_io` gains `reasoning`, the streamed `reasoning` or `reasoning_content` text, and `tool` now also receives the call's parsed arguments, so a front end can show diffs. `myra_note_hook` sends notes to a front end instead of stderr. ACP output is unchanged.
 

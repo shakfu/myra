@@ -1,4 +1,4 @@
-# myra-ui: a desktop front end on CUI (vendor/cui). Built with -DMYRA_UI=ON, or `make ui`.
+# myra-ui: a desktop front end on CUI (vendor/cui). Built with -DMYRA_UI=ON, or `make test-ui`.
 find_package(Threads REQUIRED)
 
 # The amalgamated library, built without our warnings. On macOS its window layer is
@@ -25,6 +25,7 @@ target_link_libraries(transcript PUBLIC Threads::Threads)
 add_executable(myra-ui main.c view.c worker.c)
 target_compile_options(myra-ui PRIVATE ${WARNINGS})
 target_link_libraries(myra-ui PRIVATE cui myralib transcript)
+install(TARGETS myra-ui RUNTIME DESTINATION bin)
 
 add_executable(ui_transcript tests/test_transcript.c)
 target_compile_options(ui_transcript PRIVATE ${WARNINGS})

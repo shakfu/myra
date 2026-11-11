@@ -24,8 +24,17 @@ asan:
 	$(MAKE) test BUILD=build-asan TYPE=Debug CMAKE_ARGS=-DMYRA_SANITIZE=ON LINK=
 
 # The CUI front end in ui/, with every test, in its own tree: ./build-ui/ui/myra-ui
-ui:
+test-ui:
 	$(MAKE) test BUILD=build-ui CMAKE_ARGS=-DMYRA_UI=ON LINK=
+
+# Build and run it, without tests: make ui ARGS='-P local'
+ui:
+	$(MAKE) all BUILD=build-ui CMAKE_ARGS=-DMYRA_UI=ON LINK=
+	./build-ui/ui/myra-ui $(ARGS)
+
+# myra and myra-ui, from build-ui, to PREFIX/bin.
+install-ui:
+	$(MAKE) install BUILD=build-ui CMAKE_ARGS=-DMYRA_UI=ON LINK=
 
 # clang's static analyzer on our C, and ruff (pinned: new versions add rules) on the Python.
 lint:
@@ -43,7 +52,7 @@ clean:
 	rm -rf build build-asan build-ui
 	rm -f myra
 
-.PHONY: all test asan ui lint install clean
+.PHONY: all test asan test-ui ui lint install install-ui clean
 
 # cmake writes CMakeCache.txt before it fails; without this a failed configure
 # leaves a cache behind and the next make skips configure and reports a missing Makefile.

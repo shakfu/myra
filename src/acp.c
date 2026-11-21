@@ -24,6 +24,7 @@ static struct {
     int next_id;
     int calls;    /* tool calls this session, for toolCallId */
     int open;     /* the announced call not yet reported done, or 0 */
+    const cJSON *input; /* that call's parsed arguments, valid until it is done */
     int waiting;  /* id of the outstanding call() to the client, or 0 */
     int prompting; /* a session/prompt is running: session/cancel applies */
     int initialized;
@@ -198,9 +199,10 @@ static cJSON *call_update(const char *status) {
 
 static void on_tool(void *ud, const char *name, const char *detail, const cJSON *input,
                     int pending) {
-    (void)ud, (void)input;
+    (void)ud;
     char id[32], *title = tool_title(name, detail);
     snprintf(id, sizeof id, "call_%d", in.open = ++in.calls);
+    in.input = input;
     cJSON *u = cJSON_CreateObject();
     cJSON_AddStringToObject(u, "sessionUpdate", "tool_call");
     cJSON_AddStringToObject(u, "toolCallId", id);
@@ -223,6 +225,7 @@ static void on_done(void *ud, int err, const char *result) {
     cJSON_AddItemToObject(u, "content", items);
     update(u);
     in.open = 0;
+    in.input = NULL;
 }
 
 /* The error message of a response, malloc'd, or NULL if it succeeded. */
@@ -284,6 +287,7 @@ static int on_allow(void *ud, const char *name, const char *detail, int outside)
     }
     cJSON_AddStringToObject(tc, "title", title);
     cJSON_AddStringToObject(tc, "kind", tool_kind(name));
+    if (in.input) cJSON_AddItemToObject(tc, "rawInput", cJSON_Duplicate(in.input, 1));
     cJSON_AddItemToObject(p, "toolCall", tc);
     cJSON_AddItemToArray(opts, option("allow", "Allow", "allow_once"));
     cJSON_AddItemToArray(opts, option("reject", "Reject", "reject_once"));

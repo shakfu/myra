@@ -2167,10 +2167,22 @@ def test_acp_permission_asked_in_the_client(api, tmp_path, answer, result):
     assert (tmp_path / "d.txt").exists() == (answer == "allow")
     (perm,) = acp.perms
     assert perm["toolCall"]["title"] == "shell touch d.txt"
+    assert perm["toolCall"]["rawInput"] == {"command": "touch d.txt"}  # what the client approves
     # Announced as waiting for approval; it runs only once allowed.
     want = ["pending", "in_progress", "completed"] if answer == "allow" else ["pending", "failed"]
     assert statuses(acp.updates) == {"call_1": want}
     assert [o["kind"] for o in perm["options"]] == ["allow_once", "reject_once"]
+    acp.close()
+
+
+def test_acp_permission_for_a_write_carries_its_content(api, tmp_path):
+    api.reply(calls=[("w", "write", {"path": "b.txt", "content": "new\n"})])
+    api.reply("ok")
+    acp = Acp(api, tmp_path, "--permissions", "ask", permission="reject").start(tmp_path)
+    acp.prompt("go")
+    (perm,) = acp.perms
+    assert perm["toolCall"]["rawInput"] == {"path": "b.txt", "content": "new\n"}
+    assert not (tmp_path / "b.txt").exists()
     acp.close()
 
 

@@ -588,7 +588,7 @@ class Io:
     """Hooks that replace the terminal and the local filesystem, for a front end that owns
     both (ACP mode). None keeps the default behaviour."""
     text: Callable[[str], None] | None = None  # reply text, as it streams
-    tool: Callable[[str, str, bool], None] | None = None  # a call starts: name, detail, pending
+    tool: Callable[[str, str, dict, bool], None] | None = None  # a call starts: name, detail, args, pending
     done: Callable[[bool, str], None] | None = None  # the announced call ended: err, result
     read: Callable[[str], str] | None = None  # the file at an absolute path; raises ClientError
     write: Callable[[str, str], None] | None = None  # path, content; raises ClientError
@@ -1555,12 +1555,12 @@ class Agent:
         cut = bool(nl) or len(line) > room
         note(f"[tool] {name} {line[:room]}{' ...' if cut else ''}\n", Style.TOOL)
 
-    def tool_start(self, name: str, detail: str, outside: bool = False) -> None:
+    def tool_start(self, name: str, detail: str, args: dict, outside: bool = False) -> None:
         """Log the call, and tell the front end."""
         self.tool_log(name, detail)
         self.announced = True
         if self.io.tool:
-            self.io.tool(name, detail, name != "read" and asks(self.permissions, outside))
+            self.io.tool(name, detail, args, name != "read" and asks(self.permissions, outside))
 
     def served_read(self, path: str) -> str:
         """read through the front end, capped like a local read. Raises ClientError if
@@ -1574,7 +1574,7 @@ class Agent:
         served = self.io.read is not None and self.io.write is not None  # the front end owns the files
         match name, args:
             case "read", {"path": str(path)}:
-                self.tool_start(name, path)
+                self.tool_start(name, path, args)
                 if self.io.read:
                     try:
                         return self.served_read(path), False
@@ -1585,7 +1585,7 @@ class Agent:
                             return with_why(f"cannot read {path}", str(e)), True
                 return tool_read(path, self.max_output)
             case "write", {"path": str(path), "content": str(content)}:
-                self.tool_start(name, path, outside := outside_cwd(path))
+                self.tool_start(name, path, args, outside := outside_cwd(path))
                 if why := denied(self.permissions, outside, name, path, self.io.allow):
                     return why, True
                 if served:
@@ -1596,12 +1596,12 @@ class Agent:
                     return f"wrote {path}", False
                 return tool_write(path, content)
             case "edit", {"path": str(path), "old_string": str(old), "new_string": str(new)}:
-                self.tool_start(name, path, outside := outside_cwd(path))
+                self.tool_start(name, path, args, outside := outside_cwd(path))
                 if why := denied(self.permissions, outside, name, path, self.io.allow):
                     return why, True
                 return tool_edit(path, old, new, self.io if served else None)
             case "shell", {"command": str(cmd)}:
-                self.tool_start(name, cmd)
+                self.tool_start(name, cmd, args)
                 if why := denied(self.permissions, False, name, cmd, self.io.allow):  # unconfinable
                     return why, True
                 want = args.get("timeout", SHELL_TIMEOUT)
@@ -1611,7 +1611,7 @@ class Agent:
                 return tool_shell(cmd, int(secs), self.max_output)
         if srv := next((s for s in self.mcp if name in s.tools), None):
             detail = json.dumps(args, separators=(",", ":"), ensure_ascii=False)
-            self.tool_start(name, detail)
+            self.tool_start(name, detail, args)
             if why := denied(self.permissions, False, name, detail, self.io.allow):  # unconfinable
                 return why, True
             out, err = srv.call(name, args)
@@ -1981,6 +1981,7 @@ class AcpServer:
         self.looked = False  # the context window was looked up, found or not
         self.calls = 0  # tool calls this session, for toolCallId
         self.open = 0  # the announced call not yet reported done, or 0
+        self.input: dict | None = None  # that call's parsed arguments, until it is done
         self.session = ""
 
     def send(self, msg: dict) -> None:
@@ -2090,9 +2091,10 @@ class AcpServer:
         self.update({"sessionUpdate": "tool_call_update", "toolCallId": f"call_{self.open}",
                      "status": status, **extra})
 
-    def on_tool(self, name: str, detail: str, pending: bool) -> None:
+    def on_tool(self, name: str, detail: str, args: dict, pending: bool) -> None:
         self.calls += 1
         self.open = self.calls
+        self.input = args  # for on_allow
         self.update({"sessionUpdate": "tool_call", "toolCallId": f"call_{self.calls}",
                      "title": tool_title(name, detail), "kind": tool_kind(name),
                      "status": "pending" if pending else "in_progress"})
@@ -2101,6 +2103,7 @@ class AcpServer:
         self.call_update("failed" if err else "completed",
                          content=[{"type": "content", "content": {"type": "text", "text": result}}])
         self.open = 0
+        self.input = None
 
     def on_read(self, path: str) -> str:
         resp = self.call("fs/read_text_file", {"sessionId": self.session, "path": path})
@@ -2123,7 +2126,8 @@ class AcpServer:
         resp = self.call("session/request_permission", {
             "sessionId": self.session,
             "toolCall": {"toolCallId": f"call_{self.calls}",  # the call on_tool just announced
-                         "title": title, "kind": tool_kind(name)},
+                         "title": title, "kind": tool_kind(name),
+                         **({"rawInput": self.input} if self.input is not None else {})},
             "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"},
                         {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]})
         outcome = obj(obj(obj(resp).get("result")).get("outcome"))

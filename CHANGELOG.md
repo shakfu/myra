@@ -40,6 +40,8 @@
 
 ### Fixed
 
+- ACP: `session/request_permission` carries the call's arguments as `rawInput`. It sent only the title, which for `write` and `edit` names the path but not the content, so a client approved a write it could not see.
+
 - An HTTP error read `api error (No error, http 400)`: the curl message was printed even when the transfer succeeded. It now reads `api error (http 400)`, as in `scripts/agent.py`.
 
 - In `scripts/agent.py`, `--permissions ask`, and `auto` outside the working directory, refused every call as "no terminal to confirm", even on a terminal. Text mode `open("/dev/tty", "r+")` needs a seekable file and raises `io.UnsupportedOperation`, an `OSError` subclass, which the no-terminal branch caught. The e2e suite checked only the no-terminal case.

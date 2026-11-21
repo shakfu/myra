@@ -426,6 +426,9 @@ def test_cwd_with_acp_is_rejected(mock, tmp_path):
     assert p.stderr == "error: --acp takes the working directory from the client, not -C\n"
 
 
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+
+
 def json_lines(p):
     """stdout's lines, each parsed as JSON; the run must print nothing else there."""
     assert p.stdout.endswith("\n")
@@ -441,7 +444,9 @@ def test_json_result_record(mock, tmp_path):
     mock.replies[-1][1]["usage"] = {"prompt_tokens": 120, "completion_tokens": 5, "cost": 0.125}
     p = api.run(tmp_path, "--json", "-m", "qwen", "-p", "go")
     assert p.returncode == 0, p.stderr
-    assert json_lines(p)[-1] == {
+    r = json_lines(p)[-1]
+    assert UUID.fullmatch(r.pop("session_id"))
+    assert r == {
         "type": "result", "outcome": "complete", "text": "done \u00e9\n\"x\"", "error": None,
         "cost": 0.375, "requests": 2, "input_tokens": 220, "output_tokens": 15,
         "cached_tokens": 50, "model": "qwen", "provider": "openrouter"}
@@ -491,6 +496,132 @@ def test_json_needs_p(mock, tmp_path, args):
     p = Api(mock, "local").run(tmp_path, *args)
     assert p.returncode == 2
     assert p.stderr == "error: --json needs -p\n" and not p.stdout
+
+
+@pytest.mark.parametrize("args", [["--resume", "x"], ["--resume", "x", "task"],
+                                  ["--resume", "x", "--acp"]])
+def test_resume_needs_p(mock, tmp_path, args):
+    p = Api(mock, "local").run(tmp_path, *args)
+    assert p.returncode == 2
+    assert p.stderr == "error: --resume needs -p\n" and not p.stdout and not mock.requests
+
+
+# ---- saved sessions ----
+
+def session_file(state, sid):
+    return state / "myra" / "sessions" / f"{sid}.json"
+
+
+def test_json_saves_the_session_and_resume_continues_it(mock, tmp_path):
+    api = Api(mock, "openrouter")
+    details = [{"type": "reasoning.encrypted", "data": "sig", "index": 0}]
+    api.reply("looking", [("s", "shell", {"command": "echo out"})])
+    mock.replies[-1][1]["choices"][0]["message"]["reasoning_details"] = details
+    api.reply("first")
+    p = api.run(tmp_path, "--json", "-p", "one")
+    assert p.returncode == 0, p.stderr
+    sid = json_lines(p)[-1]["session_id"]
+    assert UUID.fullmatch(sid)
+    f = session_file(tmp_path / ".state", sid)
+    assert f.stat().st_mode & 0o777 == 0o600
+    before = mock.requests[-1]["body"]["messages"]
+    assert before[2]["reasoning_details"] == details
+
+    api.reply("second")
+    p = api.run(tmp_path, "--resume", sid, "--json", "-p", "two")
+    assert p.returncode == 0, p.stderr
+    r = json_lines(p)[-1]
+    assert r["outcome"] == "complete" and r["text"] == "second" and r["session_id"] == sid
+    msgs = mock.requests[-1]["body"]["messages"]
+    assert msgs == [*before, {"role": "assistant", "content": "first"},
+                    {"role": "user", "content": "two"}]
+    saved = json.loads(f.read_text())
+    assert saved["messages"] == [*msgs[1:], {"role": "assistant", "content": "second"}]
+    assert saved["cwd"] == str(tmp_path.resolve())
+
+
+def test_resume_without_json_saves_under_the_same_id(api, tmp_path):
+    api.reply("first")
+    sid = json_lines(api.run(tmp_path, "--json", "-p", "one"))[-1]["session_id"]
+    api.reply("second")
+    p = api.run(tmp_path, "--resume", sid, "-p", "two")
+    assert p.returncode == 0, p.stderr
+    assert p.stdout == "second\n"
+    saved = json.loads(session_file(tmp_path / ".state", sid).read_text())
+    assert [m["content"] for m in saved["messages"]] == ["one", "first", "two", "second"]
+    assert os.listdir(tmp_path / ".state" / "myra" / "sessions") == [f"{sid}.json"]
+
+
+def test_failed_resumed_turn_keeps_the_session(api, tmp_path):
+    api.reply("first")
+    sid = json_lines(api.run(tmp_path, "--json", "-p", "one"))[-1]["session_id"]
+    f = session_file(tmp_path / ".state", sid)
+    kept = f.read_text()
+    api.mock.replies.append((400, {"error": {"message": "nope"}}))
+    p = api.run(tmp_path, "--resume", sid, "--json", "-p", "two")
+    assert p.returncode == 1
+    r = json_lines(p)[-1]
+    # text is this run's: the resumed session's "first" is not reported again
+    assert r["outcome"] == "error" and r["text"] == "" and r["session_id"] == sid
+    assert f.read_text() == kept
+
+
+@pytest.mark.parametrize("sid", ["nope", "../sessions/nope", ""])
+def test_resume_unknown_session(api, tmp_path, sid):
+    p = api.run(tmp_path, "--resume", sid, "--json", "-p", "x")
+    assert p.returncode == 1
+    r = json_lines(p)[-1]
+    assert r["outcome"] == "error" and r["error"] == f"no session {sid}"
+    assert r["session_id"] is None and not api.mock.requests
+
+
+def test_resume_damaged_session(api, tmp_path):
+    f = session_file(tmp_path / ".state", "bad")
+    f.parent.mkdir(parents=True)
+    f.write_text('{"messages": "x"}')
+    p = api.run(tmp_path, "--resume", "bad", "--json", "-p", "x")
+    assert p.returncode == 1
+    assert json_lines(p)[-1]["error"] == "cannot read session bad: not a myra session"
+    assert not api.mock.requests
+
+
+def test_resume_refuses_another_directory(api, tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    state = {"XDG_STATE_HOME": str(tmp_path / ".state")}
+    api.reply("first")
+    sid = json_lines(api.run(tmp_path / "a", "--json", "-p", "one", env=state))[-1]["session_id"]
+    p = api.run(tmp_path, "-C", "b", "--resume", sid, "--json", "-p", "two", env=state)
+    assert p.returncode == 1
+    a, b = (tmp_path / "a").resolve(), (tmp_path / "b").resolve()
+    assert json_lines(p)[-1]["error"] == f"session {sid} was saved in {a}, not {b}"
+    assert len(api.mock.requests) == 1
+
+
+def test_resume_keeps_the_session_model(api, tmp_path):
+    api.reply("first")
+    sid = json_lines(api.run(tmp_path, "--json", "-m", "qwen", "-p", "one"))[-1]["session_id"]
+    remembered = tmp_path / ".state" / "myra" / f"{api.provider}.model"
+    remembered.write_text("other\n")
+    api.reply("second")
+    p = api.run(tmp_path, "--resume", sid, "--json", "-p", "two")
+    assert p.returncode == 0, p.stderr
+    assert api.mock.requests[-1]["body"]["model"] == "qwen"
+    assert json_lines(p)[-1]["model"] == "qwen"
+    assert remembered.read_text() == "other\n"
+    api.reply("third")
+    p = api.run(tmp_path, "--resume", sid, "--json", "-m", "m2", "-p", "three")
+    assert api.mock.requests[-1]["body"]["model"] == "m2"
+
+
+@pytest.mark.parametrize("args", [["--json", "--no-save"], []])
+def test_no_session_saved(api, tmp_path, args):
+    api.reply("hi")
+    p = api.run(tmp_path, *args, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    if args:
+        assert json_lines(p)[-1]["session_id"] is None
+    assert not (tmp_path / ".state" / "myra" / "sessions").exists()
 
 
 def test_truncated_reply_drops_tool_calls(api, tmp_path):
@@ -2084,6 +2215,101 @@ def test_acp_empty_session_id_before_session_new(api, tmp_path):
 def test_acp_and_p_conflict(api, tmp_path):
     p = api.run(tmp_path, "--acp", "-p", "x")
     assert p.returncode == 2 and "--acp" in p.stderr
+
+
+# ---- ACP usage_update ----
+
+def costed_reply(api, text, prompt, completion, cost=None):
+    api.reply(text)
+    usage = {"prompt_tokens": prompt, "completion_tokens": completion}
+    if cost is not None:
+        usage["cost"] = cost
+    api.mock.replies[-1][1]["usage"] = usage
+
+
+def models(api, *entries):
+    api.mock.replies.append((200, {"data": list(entries)}))
+
+
+def usages(updates):
+    return [u for u in updates if u["sessionUpdate"] == "usage_update"]
+
+
+def test_acp_usage_update_ends_each_turn_with_the_session_cost(api, tmp_path):
+    costed_reply(api, "one", 100, 10, 0.25)
+    models(api, {"id": "other/model", "context_length": 1}, {"id": "t/m", "context_length": 64000})
+    costed_reply(api, "two", 150, 5, 0.125)
+    acp = Acp(api, tmp_path, "-m", "t/m").start(tmp_path)
+    currency = "USD" if api.provider == "openrouter" else "credits"
+    _, chunks = acp.prompt("a")
+    assert chunks == "one" and acp.updates[-1] == {
+        "sessionUpdate": "usage_update", "used": 110, "size": 64000,
+        "cost": {"amount": 0.25, "currency": currency}}
+    acp.prompt("b")
+    assert usages(acp.updates) == [{"sessionUpdate": "usage_update", "used": 155, "size": 64000,
+                                    "cost": {"amount": 0.375, "currency": currency}}]
+    # The window is looked up once, after the first turn that reported usage.
+    assert [r["method"] for r in api.mock.requests] == ["POST", "GET", "POST"]
+    assert api.mock.requests[1]["path"] == PROVIDERS[api.provider][2] + "/models"
+    acp.close()
+
+
+def test_acp_usage_update_without_a_reported_cost_has_none(api, tmp_path):
+    costed_reply(api, "one", 100, 10)
+    models(api, {"id": "t/m", "context_length": 8192})
+    acp = Acp(api, tmp_path, "-m", "t/m").start(tmp_path)
+    acp.prompt("a")
+    assert usages(acp.updates) == [{"sessionUpdate": "usage_update", "used": 110, "size": 8192}]
+    acp.close()
+
+
+def test_acp_context_window_flag_skips_the_lookup(api, tmp_path):
+    costed_reply(api, "one", 100, 10, 0.5)
+    acp = Acp(api, tmp_path, "--context-window", "32000").start(tmp_path)
+    acp.prompt("a")
+    assert usages(acp.updates)[0]["size"] == 32000
+    assert [r["method"] for r in api.mock.requests] == ["POST"]
+    acp.close()
+
+
+def test_acp_no_usage_update_without_a_known_window(api, tmp_path):
+    costed_reply(api, "one", 100, 10, 0.5)
+    models(api, {"id": "other/model", "context_length": 1})
+    costed_reply(api, "two", 100, 10, 0.5)
+    acp = Acp(api, tmp_path, "-m", "t/m").start(tmp_path)
+    r, _ = acp.prompt("a")
+    assert r["result"] == {"stopReason": "end_turn"} and usages(acp.updates) == []
+    acp.prompt("b")  # not looked up again
+    assert usages(acp.updates) == [] and len(api.mock.requests) == 3
+    assert "--context-window" in acp.close()
+
+
+def test_acp_no_usage_update_or_lookup_when_nothing_was_reported(api, tmp_path):
+    api.reply("one")
+    acp = Acp(api, tmp_path).start(tmp_path)
+    acp.prompt("a")
+    assert usages(acp.updates) == [] and len(api.mock.requests) == 1
+    acp.close()
+
+
+def test_acp_new_session_starts_its_cost_at_zero(api, tmp_path):
+    costed_reply(api, "one", 100, 10, 0.25)
+    costed_reply(api, "two", 100, 10, 0.125)
+    acp = Acp(api, tmp_path, "--context-window", "1000").start(tmp_path)
+    acp.prompt("a")
+    acp.sid = acp.request("session/new", {"cwd": str(tmp_path), "mcpServers": []})["result"]["sessionId"]
+    acp.prompt("b")
+    assert usages(acp.updates)[0]["cost"]["amount"] == 0.125
+    acp.close()
+
+
+@pytest.mark.parametrize("args,error", [
+    (["--acp", "--context-window", "0"], "--context-window takes a positive number of tokens"),
+    (["--acp", "--context-window", "8k"], "--context-window takes a positive number of tokens"),
+    (["--context-window", "8000", "-p", "x"], "--context-window needs --acp")])
+def test_context_window_flag_errors(api, tmp_path, args, error):
+    p = api.run(tmp_path, *args)
+    assert p.returncode == 2 and error in p.stderr
 
 
 # ---- MCP servers given by the ACP client ----

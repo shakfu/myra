@@ -138,8 +138,11 @@ typedef struct {
     int truncated;       /* this turn ended early: a reply hit the length limit or the call cap */
     int announced;       /* io.tool was told of the current call, so io.done follows */
     myra_usage session; /* totals over every turn */
+    double context_used; /* prompt plus completion tokens of the last response */
+    long context_window; /* the model's, in tokens; 0 unknown */
     myra_io io;
     myra_mcp *mcp;       /* running MCP servers, newest first */
+    char session_id[64]; /* the saved session this conversation is, "" if none */
     cJSON *tools, *messages;
 } myra_agent;
 
@@ -162,6 +165,8 @@ void myra_clear(myra_agent *a);
 void myra_set_model(myra_agent *a, const char *model);
 /* Print the session's usage totals, if the server reported any. */
 void myra_report_session(myra_agent *a);
+/* The model's context window from the provider's /models entry; 0 if it gives none. Fetches. */
+long myra_context_window(myra_agent *a);
 /* Print the provider's model ids that contain filter, ignoring case; the current one is starred. */
 void myra_list_models(myra_agent *a, const char *filter);
 
@@ -171,6 +176,16 @@ void myra_free_model_ids(char **ids);
 
 /* Rebuild the system prompt for the current working directory. */
 void myra_set_cwd(myra_agent *a);
+
+/* Saved sessions: $XDG_STATE_HOME/myra/sessions/<id>.json, mode 0600, without the
+   system prompt. The session saved as id, parsed; NULL with an error note if there is
+   none, it cannot be read, or it was saved in another working directory. */
+cJSON *myra_session_load(const char *id);
+/* Replace a's conversation with that of s, from myra_session_load, and take its id. */
+void myra_session_resume(myra_agent *a, const cJSON *s, const char *id);
+/* Save a's conversation as a->session_id, first picking a new id if it is "". -1 with a
+   warning if it cannot, and a->session_id is then "". */
+int myra_session_save(myra_agent *a);
 
 /* Lower-level pieces, exposed for tests. */
 

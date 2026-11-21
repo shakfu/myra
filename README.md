@@ -140,13 +140,30 @@ Words after the options are joined by single spaces and taken as the REPL's firs
 
     {"type": "result", "outcome": "complete", "text": "...", "error": null, "cost": 0.0123,
      "requests": 2, "input_tokens": 2100, "output_tokens": 25, "cached_tokens": 900,
-     "model": "...", "provider": "openrouter"}
+     "model": "...", "provider": "openrouter", "session_id": "..."}
 
 - `outcome` is `complete`, `truncated` (a reply hit the length limit or the turn hit the 100 tool-call cap), `error` or `cancelled` (Ctrl-C).
-- `text` is the last assistant message with text, or `""`. `error` is the error message, or null unless `outcome` is `error`.
+- `text` is this run's last assistant message with text, or `""`. `error` is the error message, or null unless `outcome` is `error`.
 - `cost` is null when the server reports none. `requests` and the token counts are those of the `[usage]` line, which counts only responses that report usage.
 - A setup failure after the options are accepted, such as a bad `-C` or a missing key, also prints a result line. Invalid options print none.
+- `session_id` names the saved session that holds the conversation, or is null if none does.
 - Exit status is as for `-p`. stderr is unchanged.
+
+### Sessions: `--resume`
+
+With `--json`, `-p` saves the conversation as a new session, named by `session_id`. `--resume ID -p TEXT` loads session ID, sends TEXT as the next turn, and saves the session again under the same ID:
+
+    id=$(./myra --json -p "read main.c" | jq -r .session_id)
+    ./myra --resume "$id" --json -p "now add a test"
+
+- A session is `$XDG_STATE_HOME/myra/sessions/ID.json`, mode 0600. It holds every message but the system prompt: tool calls, tool results and reasoning payloads, so the next turn replays them.
+- A session holds whatever the tools printed, secrets included. `--no-save` saves nothing.
+- A resumed run keeps the session's provider and model, unless `-P` names another provider or `-m` another model. The model is not remembered as the provider's default.
+- A failed turn is rolled back and not saved; `session_id` still names the session as it was. A cancelled turn is saved.
+- An unknown ID, or a session saved in another working directory, is an error, exit status 1, since the history names files there.
+- `--resume` needs `-p`. Plain `-p`, without `--json` or `--resume`, saves nothing: nothing reports the id.
+- Two runs that resume one session at once both save it; the last to finish wins.
+- Sessions are never deleted. Remove old files by hand.
 
 `--permissions` sets when `write`, `edit` and `shell` run without asking:
 
@@ -202,6 +219,8 @@ A call that `--permissions` would ask about on the terminal is asked in the edit
 
 There is one session at a time. `session/new` changes to the session's `cwd` and starts a new conversation.
 
+A `usage_update` ends each turn that the server reported usage for: `used` is the last response's prompt and completion tokens, `size` the model's context window, and `cost` the session's total, in `USD` on OpenRouter and `credits` elsewhere. The window comes from the provider's `/models` entry, looked up once; OpenRouter gives one, most local servers do not. `--context-window TOKENS` gives it instead. Without a window, no `usage_update` is sent, since `size` is required.
+
 Each session starts the `--mcp-config` servers, then those listed in `session/new`, in the session's `cwd`. They work as described under `--mcp-config`, with `session/cancel` in place of Ctrl-C. myra declares no `http` or `sse` MCP capability. A new session stops the previous servers.
 
 ### Desktop UI: `myra-ui`
@@ -232,6 +251,7 @@ Under `$XDG_STATE_HOME/myra/` (default `~/.local/state/myra/`):
 | `provider`          | the last `-P`                           |
 | `<provider>.model`  | the last model used with that provider  |
 | `history`           | REPL input history, mode 0600; last 1000 lines |
+| `sessions/ID.json`  | saved conversations, mode 0600; see "Sessions" |
 | `ui.theme`, `ui.layout` | `myra-ui`'s light or dark theme and panel layout |
 
 `provider` and the model files are saved only after the server accepts a request, so a mistyped `-P` or `-m` is not kept.
@@ -252,7 +272,7 @@ Besides the provider variables above:
 
 - `read` is not confined either: the model can read any file you can, including keys and history outside the project.
 
-- The REPL history file holds your prompts verbatim. Delete it, or point `XDG_STATE_HOME` elsewhere, if they are sensitive.
+- The REPL history file holds your prompts verbatim, and session files hold tool output too. Delete them, or point `XDG_STATE_HOME` elsewhere, if they are sensitive.
 
 - The atomic replacement falls back to writing in place where no temporary file can be created, such as a read-only directory holding a writable file. That path can still truncate on failure.
 

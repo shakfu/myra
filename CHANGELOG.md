@@ -8,6 +8,10 @@
 
 ### Added
 
+- ACP: each turn ends with a `usage_update` carrying the context in use, the model's window and the session's cost, so a client such as `minosb` can report what a run spent. The window comes from OpenRouter's `/models` entry, looked up once per process after the first turn that reports usage rather than at `session/new`, so a run that reports none makes no extra request. `--context-window TOKENS` gives it for a server that has none.
+
+- Sessions: `--json -p` saves the conversation and reports its `session_id`, and `--resume ID -p TEXT` runs TEXT as the session's next turn (README, "Sessions"). A launcher can then run myra once per turn, as gilda and hax allow. Sessions are files under `$XDG_STATE_HOME/myra/sessions/`, mode 0600, since tool output can hold secrets; `--no-save` turns saving off. A session saved in another working directory is refused, since its history names files there. The `--json` `text` is now this run's reply only, so a failed resumed turn does not repeat the previous one.
+
 - `myra-ui` (`ui/`, run by `make ui`, tested by `make test-ui`, installed by `make install-ui`, updated by `make vendor-cui VERSION=1.x.y`): a desktop front end on `myralib`, drawn with CUI 1.3.1, vendored as its single-file release in `vendor/cui/` (README, "Desktop UI"). It links `myralib` rather than speaking ACP, so a change to `myralib` breaks its build at once instead of drifting. It is off by default, so the CLI still needs only libcurl.
 
 - `myra_io` gains `reasoning`, the streamed `reasoning` or `reasoning_content` text, and `tool` now also receives the call's parsed arguments, so a front end can show diffs. `myra_note_hook` sends notes to a front end instead of stderr. ACP output is unchanged.

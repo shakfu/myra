@@ -27,6 +27,7 @@ static struct {
     int waiting;  /* id of the outstanding call() to the client, or 0 */
     int prompting; /* a session/prompt is running: session/cancel applies */
     int initialized;
+    int looked;   /* the context window was looked up, found or not */
     char session[16]; /* empty until session/new */
     cJSON *config;    /* --mcp-config servers, started with each session */
 } in;
@@ -339,6 +340,8 @@ static void new_session(myra_agent *a, cJSON *id, cJSON *params) {
     }
     myra_set_cwd(a);
     myra_clear(a);
+    a->session = (myra_usage){0}; /* the cost is the session's */
+    a->context_used = 0;
     start_servers(a, in.config, cJSON_GetObjectItem(params, "mcpServers"));
     in.calls = in.open = 0;
     snprintf(in.session, sizeof in.session, "%d", atoi(in.session) + 1);
@@ -372,12 +375,39 @@ static char *prompt_text(cJSON *blocks) {
     return s;
 }
 
+/* usage_update: the context and the session's cost, after a turn the server reported
+   usage for. size is required, so nothing is sent while the window is unknown. */
+static void report_usage(myra_agent *a) {
+    if (!a->session.requests) return;
+    if (!a->context_window && !in.looked && !myra_interrupted) { /* a cancel would abort it */
+        in.looked = 1;
+        a->context_window = myra_context_window(a);
+        if (!a->context_window)
+            myra_note(MYRA_WARN, "note: the provider gives no context window for %s, so no "
+                      "usage_update is sent; pass --context-window\n", a->model);
+    }
+    if (!a->context_window) return;
+    cJSON *u = cJSON_CreateObject();
+    cJSON_AddStringToObject(u, "sessionUpdate", "usage_update");
+    cJSON_AddNumberToObject(u, "used", a->context_used);
+    cJSON_AddNumberToObject(u, "size", (double)a->context_window);
+    if (a->session.costed) {
+        cJSON *c = cJSON_CreateObject();
+        cJSON_AddNumberToObject(c, "amount", a->session.cost);
+        /* OpenRouter's credits are dollars; other servers do not say. */
+        cJSON_AddStringToObject(c, "currency", strcmp(a->prov->name, "openrouter") ? "credits" : "USD");
+        cJSON_AddItemToObject(u, "cost", c);
+    }
+    update(u);
+}
+
 static void prompt(myra_agent *a, cJSON *id, cJSON *params) {
     char *text = prompt_text(cJSON_GetObjectItem(params, "prompt"));
     in.prompting = 1;
     int rc = myra_ask(a, text); /* clears myra_interrupted first */
     in.prompting = 0;
     free(text);
+    report_usage(a);
     if (myra_interrupted) {
         cJSON *r = cJSON_CreateObject();
         cJSON_AddStringToObject(r, "stopReason", "cancelled");

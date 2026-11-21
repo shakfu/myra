@@ -45,7 +45,11 @@ static int usage(const char *argv0, int rc) {
             "  -m  model id; remembered per provider\n"
             "  -p  run one prompt headless and exit (default: REPL)\n"
             "  --json      with -p: stdout is one JSON line, the result: outcome, text,\n"
-            "              error, cost, tokens, model, provider\n"
+            "              error, cost, tokens, model, provider, session_id. The\n"
+            "              conversation is saved as that session\n"
+            "  --resume ID with -p: continue saved session ID, in its directory, with\n"
+            "              its provider and model unless -P or -m is given\n"
+            "  --no-save   save no session\n"
             "  -C, --cwd DIR  run in DIR, as if started there\n"
             "  PROMPT...   start the REPL with these words, joined by spaces, as the\n"
             "              first line; -- before them if they start with -\n"
@@ -53,6 +57,9 @@ static int usage(const char *argv0, int rc) {
             "  --mcp-config FILE\n"
             "      start the stdio MCP servers in FILE, {\"mcpServers\": {...}}; their tools\n"
             "      are offered as mcp__<server>__<tool>\n"
+            "  --context-window TOKENS\n"
+            "      with --acp: the model's context window, for usage_update. Default: the\n"
+            "      provider's /models entry; OpenRouter gives one, most local servers do not\n"
             "  -V  print the version\n"
             "  -h, --help  print this help\n"
             "  --verbose   show each tool call's full arguments and result, not one line\n"
@@ -75,12 +82,20 @@ static void add_str(cJSON *o, const char *key, const char *s) {
     free(v);
 }
 
-/* The --json result line on stdout. a is NULL if setup failed before the agent existed. */
-static void json_result(const myra_agent *a, const myra_provider *p, const char *model,
+/* The --json result line on stdout. a is NULL if setup failed before the agent existed.
+   text is the last reply at or after message index from, so not one of a resumed session. */
+static void json_result(const myra_agent *a, int from, const myra_provider *p, const char *model,
                         const char *outcome) {
     static const myra_usage none = {0};
     const myra_usage *u = a ? &a->session : &none;
-    const char *text = a ? myra_last_reply((myra_agent *)a) : NULL;
+    const char *text = NULL;
+    for (int i = a ? cJSON_GetArraySize(a->messages) - 1 : -1; i >= from && !text; i--) {
+        cJSON *m = cJSON_GetArrayItem(a->messages, i), *c = cJSON_GetObjectItem(m, "content");
+        cJSON *role = cJSON_GetObjectItem(m, "role");
+        if (cJSON_IsString(role) && !strcmp(role->valuestring, "assistant") && cJSON_IsString(c) &&
+            *c->valuestring)
+            text = c->valuestring;
+    }
     cJSON *r = cJSON_CreateObject();
     cJSON_AddStringToObject(r, "type", "result");
     cJSON_AddStringToObject(r, "outcome", outcome);
@@ -95,6 +110,7 @@ static void json_result(const myra_agent *a, const myra_provider *p, const char 
     cJSON_AddNumberToObject(r, "cached_tokens", u->cached);
     add_str(r, "model", a ? a->model : model);
     add_str(r, "provider", p ? p->name : NULL);
+    add_str(r, "session_id", a && *a->session_id ? a->session_id : NULL);
     char *s = cJSON_PrintUnformatted(r);
     if (s) printf("%s\n", s), fflush(stdout);
     free(s);
@@ -321,14 +337,18 @@ int main(int argc, char **argv) {
                                              {"no-color", no_argument, NULL, 'N'},
                                              {"cwd", required_argument, NULL, 'C'},
                                              {"json", no_argument, NULL, 'J'},
+                                             {"resume", required_argument, NULL, 'S'},
+                                             {"no-save", no_argument, NULL, 'X'},
                                              {"raw", no_argument, NULL, 'R'},
                                              {"acp", no_argument, NULL, 'A'},
                                              {"mcp-config", required_argument, NULL, 'M'},
+                                             {"context-window", required_argument, NULL, 'K'},
                                              {"help", no_argument, NULL, 'h'},
                                              {NULL, 0, NULL, 0}};
     myra_permissions perms = MYRA_AUTO;
-    int opt, verbose = 0, color = 1, raw = 0, acp = 0, json = 0;
-    const char *mcp_config = NULL, *dir = NULL;
+    int opt, verbose = 0, color = 1, raw = 0, acp = 0, json = 0, no_save = 0;
+    const char *mcp_config = NULL, *dir = NULL, *resume = NULL;
+    long window = 0;
     const char *no_color = getenv("NO_COLOR"); /* https://no-color.org */
     if (no_color && *no_color) color = 0, raw = 1;
     while ((opt = getopt_long(argc, argv, "p:P:m:hVC:", longopts, NULL)) != -1) {
@@ -339,9 +359,20 @@ int main(int argc, char **argv) {
         if (opt == 'v') verbose = 1;
         else if (opt == 'A') acp = 1;
         else if (opt == 'M') mcp_config = optarg;
+        else if (opt == 'K') {
+            char *end;
+            errno = 0;
+            window = strtol(optarg, &end, 10);
+            if (errno || end == optarg || *end || window < 1) {
+                myra_note(MYRA_ERROR, "error: --context-window takes a positive number of tokens\n");
+                return 2;
+            }
+        }
         else if (opt == 'N') color = 0;
         else if (opt == 'C') dir = optarg;
         else if (opt == 'J') json = 1;
+        else if (opt == 'S') resume = optarg;
+        else if (opt == 'X') no_save = 1;
         else if (opt == 'R') raw = 1;
         else if (opt == 'W') {
             size_t i = 0;
@@ -370,8 +401,16 @@ int main(int argc, char **argv) {
         myra_note(MYRA_ERROR, "error: --acp takes the working directory from the client, not -C\n");
         return 2;
     }
+    if (window && !acp) {
+        myra_note(MYRA_ERROR, "error: --context-window needs --acp\n");
+        return 2;
+    }
     if (json && !prompt) {
         myra_note(MYRA_ERROR, "error: --json needs -p\n");
+        return 2;
+    }
+    if (resume && !prompt) {
+        myra_note(MYRA_ERROR, "error: --resume needs -p\n");
         return 2;
     }
     myra_color = color && isatty(STDERR_FILENO);
@@ -391,8 +430,21 @@ int main(int argc, char **argv) {
     /* From here on, --json reports every failure as a result line. */
     if (dir && chdir(dir) < 0) {
         myra_note(MYRA_ERROR, "error: cannot change to %s: %s\n", dir, strerror(errno));
-        if (json) json_result(NULL, p, model, "error");
+        if (json) json_result(NULL, 0, p, model, "error");
         return 2;
+    }
+    /* Loaded before the provider is chosen: the session's own is the default. */
+    cJSON *saved = resume ? myra_session_load(resume) : NULL;
+    if (resume && !saved) {
+        if (json) json_result(NULL, 0, p, model, "error");
+        return 1;
+    }
+    const char *saved_model = NULL;
+    cJSON *sp = cJSON_GetObjectItem(saved, "provider"), *sm = cJSON_GetObjectItem(saved, "model");
+    if (cJSON_IsString(sp)) {
+        if (!p) p = myra_provider_named(sp->valuestring);
+        if (!model && cJSON_IsString(sm) && p == myra_provider_named(sp->valuestring))
+            saved_model = sm->valuestring;
     }
     if (!p && !(p = myra_provider_default())) {
         char keys[256] = "";
@@ -401,22 +453,33 @@ int main(int argc, char **argv) {
                 snprintf(keys + strlen(keys), sizeof keys - strlen(keys), " %s",
                          MYRA_PROVIDERS[i].key_env);
         myra_note(MYRA_ERROR, "error: no provider: set%s or pass -P local\n", keys);
-        if (json) json_result(NULL, NULL, model, "error");
+        if (json) json_result(NULL, 0, NULL, model, "error");
+        cJSON_Delete(saved);
         return 1;
     }
 
     cJSON *servers = NULL;
     if (mcp_config && !(servers = myra_mcp_load(mcp_config))) {
-        if (json) json_result(NULL, p, model, "error");
+        if (json) json_result(NULL, 0, p, model, "error");
+        cJSON_Delete(saved);
         return 2;
     }
     myra_agent a;
-    if (myra_init(&a, p, model, perms) < 0) {
-        if (json) json_result(NULL, p, model, "error");
+    if (myra_init(&a, p, model ? model : saved_model, perms) < 0) {
+        if (json) json_result(NULL, 0, p, model, "error");
         cJSON_Delete(servers);
+        cJSON_Delete(saved);
         return 1;
     }
+    if (!model) a.save_model = 0; /* the session's model is not a choice to remember */
+    if (saved) myra_session_resume(&a, saved, resume);
+    cJSON_Delete(saved);
+    /* Saved only when the caller can learn the id: from the result line, or by naming it. */
+    int save = prompt && !no_save && (json || resume);
+    if (!save) a.session_id[0] = 0;
+    int from = cJSON_GetArraySize(a.messages);
     a.verbose = verbose;
+    a.context_window = window;
     if (json) a.io.text = discard; /* stdout carries only the result line */
     a.save_provider = pname != NULL;
     /* No SA_RESTART: blocking reads return EINTR, so Ctrl-C takes effect at once. */
@@ -433,12 +496,13 @@ int main(int argc, char **argv) {
         myra_mcp_start_list(&a, servers);
         if (myra_interrupted) {
             rc = 130; /* Ctrl-C while servers start: exit, as at any other point of a run */
-            if (json) json_result(&a, p, model, "cancelled");
+            if (json) json_result(&a, from, p, model, "cancelled");
         } else if (prompt) {
             rc = myra_ask(&a, prompt) < 0;
+            if (save && !rc) myra_session_save(&a); /* a failed turn is rolled back: nothing new */
             if (myra_interrupted) rc = 130; /* 128 + SIGINT, as a shell would report */
             if (json)
-                json_result(&a, p, model, rc == 130 ? "cancelled" : rc ? "error"
+                json_result(&a, from, p, model, rc == 130 ? "cancelled" : rc ? "error"
                                           : a.truncated ? "truncated" : "complete");
         } else {
             /* the REPL's first line: the PROMPT words joined by spaces */

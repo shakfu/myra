@@ -24,6 +24,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
@@ -445,6 +446,47 @@ def store_state(name: str, value: str) -> None:
         note(f"warning: cannot save {path}\n", Style.WARN)
 
 
+# ---- saved sessions: $XDG_STATE_HOME/myra/sessions/<id>.json, mode 0600 ----
+
+SESSION_ID_CHARS = frozenset("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_")
+
+
+def session_path(sid: str, make_dir: bool = False) -> Path | None:
+    return state_path(f"sessions/{sid}.json", make_dir)
+
+
+def load_session(sid: str) -> dict | None:
+    """The session saved as sid; None with an error note if there is none, it cannot be
+    read, or it was saved in another working directory."""
+    # Letters, digits, '-' and '_' only, so an id cannot name a path outside sessions/.
+    valid = 0 < len(sid) < 64 and set(sid) <= SESSION_ID_CHARS
+    try:
+        if not (valid and (path := session_path(sid))):
+            raise FileNotFoundError
+        s = json.loads(path.read_text(errors="replace"))
+    except FileNotFoundError:
+        note(f"error: no session {sid}\n", Style.ERROR)
+        return None
+    except OSError as e:
+        note(f"error: cannot read session {sid}: {e.strerror}\n", Style.ERROR)
+        return None
+    except ValueError:
+        s = None
+    msgs = s.get("messages") if isinstance(s, dict) else None
+    if not (isinstance(msgs, list) and isinstance(s.get("cwd"), str)
+            and all(isinstance(m, dict) and isinstance(m.get("role"), str) for m in msgs)):
+        note(f"error: cannot read session {sid}: not a myra session\n", Style.ERROR)
+        return None
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = "."
+    if s["cwd"] != cwd:  # its history names files there
+        note(f"error: session {sid} was saved in {s['cwd']}, not {cwd}\n", Style.ERROR)
+        return None
+    return s
+
+
 # ---- files ----
 
 def dangling_symlink(path: str | Path) -> bool:
@@ -453,13 +495,14 @@ def dangling_symlink(path: str | Path) -> bool:
     return os.path.islink(path) and not os.path.exists(path)
 
 
-def spit(path: str | Path, data: bytes) -> None:
+def spit(path: str | Path, data: bytes, mode: int | None = None) -> None:
     """Replace path's contents atomically: a failed write leaves the old file intact.
 
     Writes a temporary file beside the target (symlinks followed, mode kept) and renames it
     over; a hard-linked file thus gets its own copy. A dangling symlink is refused, not
     replaced by a regular file. Where no temporary file can be made, e.g. a read-only
-    directory holding a writable file, it writes in place. Raises OSError.
+    directory holding a writable file, it writes in place. mode, if given, replaces the
+    mode. Raises OSError.
     """
     try:
         target = os.path.realpath(path, strict=True)
@@ -467,16 +510,20 @@ def spit(path: str | Path, data: bytes) -> None:
         if dangling_symlink(path):
             raise  # the rename would eat the link
         target = os.fspath(path)  # a new file: as given
-    try:
-        mode = stat.S_IMODE(os.stat(target).st_mode)
-    except OSError:
-        mask = os.umask(0)
-        os.umask(mask)
-        mode = 0o666 & ~mask
+    fixed = mode is not None
+    if mode is None:
+        try:
+            mode = stat.S_IMODE(os.stat(target).st_mode)
+        except OSError:
+            mask = os.umask(0)
+            os.umask(mask)
+            mode = 0o666 & ~mask
     try:
         fd, tmp = tempfile.mkstemp(prefix=".myra-tmp-", dir=os.path.dirname(target) or ".")
     except OSError:  # in place, as a last resort
         with open(target, "wb") as f:
+            if fixed:
+                os.fchmod(f.fileno(), mode)
             f.write(data)
         return
     try:
@@ -1248,10 +1295,13 @@ class Agent:
     truncated: bool = False  # this turn ended early: a reply hit the length limit or the call cap
     announced: bool = False  # io.tool was told of the current call, so io.done follows
     session: Usage = field(default_factory=Usage)
+    context_used: int = 0  # prompt plus completion tokens of the last response
+    context_window: int = 0  # the model's, in tokens; 0 unknown
     io: Io = field(default_factory=Io)
     messages: list[dict] = field(default_factory=list)
     tools: list[dict] = field(default_factory=lambda: list(TOOLS))
     mcp: list[McpServer] = field(default_factory=list)  # running MCP servers
+    session_id: str | None = None  # the saved session this conversation is
 
     @classmethod
     def create(cls, p: Provider, model: str | None, perms: Permissions) -> Agent | None:
@@ -1294,6 +1344,33 @@ class Agent:
     def clear(self) -> None:
         """Drop the conversation, keeping the system prompt."""
         del self.messages[1:]
+
+    def resume(self, s: dict, sid: str) -> None:
+        """Replace the conversation with that of s, from load_session, and take its id."""
+        self.messages[1:] = s["messages"]
+        self.session_id = sid
+
+    def save_session(self) -> bool:
+        """Save the conversation as session_id, first picking a new id if it is None. False
+        with a warning if it cannot, and session_id is then None."""
+        self.session_id = self.session_id or str(uuid.uuid4())
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = "."
+        # The system prompt is left out: resuming rebuilds it for the same directory.
+        s = {"version": 1, "id": self.session_id, "cwd": cwd, "provider": self.prov.name,
+             "model": self.model, "messages": self.messages[1:]}
+        path = session_path(self.session_id, make_dir=True)
+        try:
+            if not path:
+                raise OSError
+            spit(path, json.dumps(s).encode(), 0o600)  # tool results can hold secrets
+        except OSError:
+            note(f"warning: cannot save session {path or self.session_id}\n", Style.WARN)
+            self.session_id = None
+            return False
+        return True
 
     def mcp_start(self, servers: Any) -> None:
         """Start each server of a list in ACP's shape, [{name, command, args, env:
@@ -1441,6 +1518,16 @@ class Agent:
             note("error: no model list in response\n", Style.ERROR)
             return []
         return [m["id"] for m in data if isinstance(m, dict) and isinstance(m.get("id"), str)]
+
+    def model_context_window(self) -> int:
+        """The model's context window from the provider's /models entry; 0 if it gives none."""
+        resp = self.request("/models")
+        data = resp.get("data") if isinstance(resp, dict) else None
+        for m in data if isinstance(data, list) else []:
+            if isinstance(m, dict) and m.get("id") == self.model:
+                n = num(m, "context_length")  # OpenRouter's field
+                return int(n) if n >= 1 else 0
+        return 0
 
     def list_models(self, filter_: str) -> None:
         """Print the model ids that contain filter, ignoring case; the current one is starred."""
@@ -1640,6 +1727,8 @@ class Agent:
             usage = resp.get("usage") if isinstance(resp, dict) else None
             turn.add(usage)
             self.session.add(usage)
+            if isinstance(usage, dict):
+                self.context_used = int(num(usage, "prompt_tokens") + num(usage, "completion_tokens"))
             if resp is None and self.context_full:
                 if undropped is None:
                     undropped = copy.deepcopy(self.messages)
@@ -1889,6 +1978,7 @@ class AcpServer:
         self.next_id = 0
         self.waiting = 0  # id of the outstanding call() to the client, or 0; under cond
         self.initialized = False
+        self.looked = False  # the context window was looked up, found or not
         self.calls = 0  # tool calls this session, for toolCallId
         self.open = 0  # the announced call not yet reported done, or 0
         self.session = ""
@@ -2068,6 +2158,7 @@ class AcpServer:
                 return
         self.agent.set_cwd()
         self.agent.clear()
+        self.agent.session, self.agent.context_used = Usage(), 0  # the cost is the session's
         self.start_servers(params.get("mcpServers"))
         self.calls = self.open = 0
         self.session = str(int(self.session or 0) + 1)
@@ -2081,6 +2172,26 @@ class AcpServer:
         self.agent.mcp_start(self.config)
         self.agent.mcp_start(servers)
 
+    def report_usage(self) -> None:
+        """usage_update: the context and the session's cost, after a turn the server reported
+        usage for. size is required, so nothing is sent while the window is unknown."""
+        a = self.agent
+        if not a.session.requests:
+            return
+        if not a.context_window and not self.looked and not interrupted:  # a cancel would abort it
+            self.looked = True
+            a.context_window = a.model_context_window()
+            if not a.context_window:
+                note(f"note: the provider gives no context window for {a.model}, so no "
+                     "usage_update is sent; pass --context-window\n", Style.WARN)
+        if not a.context_window:
+            return
+        u = {"sessionUpdate": "usage_update", "used": a.context_used, "size": a.context_window}
+        if a.session.costed:  # OpenRouter's credits are dollars; other servers do not say
+            u["cost"] = {"amount": a.session.cost,
+                         "currency": "USD" if a.prov.name == "openrouter" else "credits"}
+        self.update(u)
+
     def prompt(self, req: dict, params: dict) -> None:
         global interrupted
         self.prompting = True
@@ -2088,6 +2199,7 @@ class AcpServer:
             rc = self.agent.ask(prompt_text(params.get("prompt")))  # clears interrupted first
         finally:
             self.prompting = False
+        self.report_usage()
         if interrupted:
             self.respond(req, "result", {"stopReason": "cancelled"})
         elif rc < 0:
@@ -2149,7 +2261,12 @@ def parser() -> argparse.ArgumentParser:
                     help="run one prompt headless and exit (default: REPL)")
     ap.add_argument("--json", action="store_true",
                     help="with -p: stdout is one JSON line, the result: outcome, text,\n"
-                         "error, cost, tokens, model, provider")
+                         "error, cost, tokens, model, provider, session_id. The\n"
+                         "conversation is saved as that session")
+    ap.add_argument("--resume", metavar="ID",
+                    help="with -p: continue saved session ID, in its directory, with\n"
+                         "its provider and model unless -P or -m is given")
+    ap.add_argument("--no-save", action="store_true", help="save no session")
     ap.add_argument("-C", "--cwd", metavar="DIR", help="run in DIR, as if started there")
     ap.add_argument("words", nargs="*", metavar="PROMPT",
                     help="start the REPL with these words, joined by spaces, as the\n"
@@ -2159,6 +2276,9 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--mcp-config", metavar="FILE",
                     help='start the stdio MCP servers in FILE, {"mcpServers": {...}}; their '
                          "tools are offered as mcp__<server>__<tool>")
+    ap.add_argument("--context-window", metavar="TOKENS",
+                    help="with --acp: the model's context window, for usage_update. Default: the\n"
+                         "provider's /models entry; OpenRouter gives one, most local servers do not")
     ap.add_argument("-V", action="version", version=f"myra {VERSION}", help="print the version")
     ap.add_argument("--verbose", action="store_true",
                     help="show each tool call's full arguments and result, not one line")
@@ -2177,15 +2297,20 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
-def json_result(agent: Agent | None, p: Provider | None, model: str | None, outcome: str) -> None:
-    """The --json result line on stdout. agent is None if setup failed before it existed."""
+def json_result(agent: Agent | None, start: int, p: Provider | None, model: str | None,
+                outcome: str) -> None:
+    """The --json result line on stdout. agent is None if setup failed before it existed.
+    text is the last reply at or after message index start, so not one of a resumed session."""
     u = agent.session if agent else Usage()
     err = last_error.removeprefix("error: ") or "failed"
-    r = {"type": "result", "outcome": outcome, "text": (agent and agent.last_reply()) or "",
+    text = next((t for m in reversed(agent.messages[start:]) if m.get("role") == "assistant"
+                 and isinstance(t := m.get("content"), str) and t), "") if agent else ""
+    r = {"type": "result", "outcome": outcome, "text": text,
          "error": err if outcome == "error" else None, "cost": u.cost if u.costed else None,
          "requests": u.requests, "input_tokens": int(u.tokens_in),
          "output_tokens": int(u.out), "cached_tokens": int(u.cached),
-         "model": agent.model if agent else model, "provider": p.name if p else None}
+         "model": agent.model if agent else model, "provider": p.name if p else None,
+         "session_id": agent.session_id if agent else None}
     print(json.dumps(r), flush=True)
 
 
@@ -2206,8 +2331,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.acp and args.cwd is not None:
         note("error: --acp takes the working directory from the client, not -C\n", Style.ERROR)
         return 2
+    window = 0
+    if args.context_window is not None:
+        window = int(w) if (w := args.context_window).isascii() and w.isdigit() else 0
+        if window < 1:
+            note("error: --context-window takes a positive number of tokens\n", Style.ERROR)
+            return 2
+        if not args.acp:
+            note("error: --context-window needs --acp\n", Style.ERROR)
+            return 2
     if args.json and args.prompt is None:
         note("error: --json needs -p\n", Style.ERROR)
+        return 2
+    if args.resume is not None and args.prompt is None:
+        note("error: --resume needs -p\n", Style.ERROR)
         return 2
     color = not args.no_color and not os.environ.get("NO_COLOR") and sys.stderr.isatty()
     markdown = not args.raw and not os.environ.get("NO_COLOR") and sys.stdout.isatty()
@@ -2219,9 +2356,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # From here on, --json reports every failure as a result line.
+    start = 0
+
     def result(agent: Agent | None, p: Provider | None, outcome: str) -> None:
         if args.json:
-            json_result(agent, p, args.model, outcome)
+            json_result(agent, start, p, args.model, outcome)
 
     if args.cwd is not None:
         try:
@@ -2230,7 +2369,18 @@ def main(argv: list[str] | None = None) -> int:
             note(f"error: cannot change to {args.cwd}: {e.strerror}\n", Style.ERROR)
             result(None, args.provider, "error")
             return 2
-    if not (p := args.provider or default_provider()):
+    # Loaded before the provider is chosen: the session's own is the default.
+    saved = None
+    if args.resume is not None and (saved := load_session(args.resume)) is None:
+        result(None, args.provider, "error")
+        return 1
+    saved_p = PROVIDERS.get(saved.get("provider")) if saved and isinstance(
+        saved.get("provider"), str) else None
+    p = args.provider or saved_p
+    model = args.model
+    if model is None and saved_p and p is saved_p and isinstance(saved.get("model"), str):
+        model = saved["model"]
+    if not (p := p or default_provider()):
         keys = "".join(f" {q.key_env}" for q in PROVIDERS.values() if not q.key_optional)
         note(f"error: no provider: set{keys} or pass -P local\n", Style.ERROR)
         result(None, None, "error")
@@ -2239,12 +2389,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.mcp_config is not None and (servers := mcp_load(args.mcp_config)) is None:
         result(None, p, "error")
         return 2
-    if not (agent := Agent.create(p, args.model, args.permissions)):
+    if not (agent := Agent.create(p, model, args.permissions)):
         result(None, p, "error")
         return 1
+    if args.model is None:
+        agent.save_model = False  # the session's model is not a choice to remember
+    if saved:
+        agent.resume(saved, args.resume)
+    # Saved only when the caller can learn the id: from the result line, or by naming it.
+    save = args.prompt is not None and not args.no_save and (args.json or saved is not None)
+    if not save:
+        agent.session_id = None
+    start = len(agent.messages)
     if args.json:
         agent.io.text = lambda s: None  # stdout carries only the result line
     agent.verbose = args.verbose
+    agent.context_window = window
     agent.save_provider = args.provider is not None
     signal.signal(signal.SIGINT, on_sigint)
 
@@ -2260,6 +2420,8 @@ def main(argv: list[str] | None = None) -> int:
             agent.session.report("[session]")
             return 0
         rc = 1 if agent.ask(args.prompt) < 0 else 0
+        if save and not rc:  # a failed turn is rolled back: nothing new
+            agent.save_session()
         rc = 130 if interrupted else rc  # 128 + SIGINT, as a shell would report
         result(agent, p, "cancelled" if rc == 130 else "error" if rc
                else "truncated" if agent.truncated else "complete")

@@ -33,3 +33,4 @@ These exist in the code. Nobody has chosen them.
 | One-line `[tool]` log | cut to the terminal width in bytes, on a character boundary | cut in code points |
 | Path completion order | `readdir` order | sorted |
 | Markdown line start held before it counts as plain | 256 bytes | 256 code points |
+| Invalid UTF-8 in a session file | kept, and sent to the server | replaced by U+FFFD |

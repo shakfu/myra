@@ -1,6 +1,7 @@
 /* main.c - the agent CLI: options, provider choice, headless mode and the REPL. */
 #include "myra.h"
 #include "acp.h"
+#include "family.h"
 #include "mcp.h"
 
 #include <dirent.h>
@@ -43,7 +44,7 @@ static int usage(const char *argv0, int rc) {
             "  -P  openrouter or local; remembered. Default: the remembered one if usable,\n"
             "      else the first cloud provider whose key is set\n"
             "  -m  model id; remembered per provider\n"
-            "  -p  run one prompt headless and exit (default: REPL)\n"
+            "  -p, --prompt  run one prompt headless and exit (default: REPL)\n"
             "  --json      with -p: stdout is one JSON line, the result: outcome, text,\n"
             "              error, cost, tokens, model, provider, session_id. The\n"
             "              conversation is saved as that session\n"
@@ -60,6 +61,15 @@ static int usage(const char *argv0, int rc) {
             "  --context-window TOKENS\n"
             "      with --acp: the model's context window, for usage_update. Default: the\n"
             "      provider's /models entry; OpenRouter gives one, most local servers do not\n"
+            "  -r, --recurse  let the agent start child agents through shell, with\n"
+            "      %s -r spawn --name NAME [-m MODEL] -- TASK, then\n"
+            "      -r wait NAME_OR_ID [--timeout SECS], -r agents, -r shutdown [--grace SECS].\n"
+            "      Children stop when their parent exits. See docs/dev/recursion.md\n"
+            "  --budget-tokens N\n"
+            "      with -r, required: the most tokens the family may use. A request that\n"
+            "      would cross it fails and stops the requesting agent's children\n"
+            "  --budget-cost USD\n"
+            "      with -r: a second limit, in dollars at the rates OpenRouter lists\n"
             "  -V  print the version\n"
             "  -h, --help  print this help\n"
             "  --verbose   show each tool call's full arguments and result, not one line\n"
@@ -70,7 +80,7 @@ static int usage(const char *argv0, int rc) {
             "      auto       always, except write/edit outside the working directory (default)\n"
             "      ask        never: ask on the terminal each time\n"
             "      all        always\n"
-            "      read-only  refuse them; read still runs\n", argv0);
+            "      read-only  refuse them; read still runs\n", argv0, argv0);
     repl_help(f);
     return rc;
 }
@@ -82,20 +92,25 @@ static void add_str(cJSON *o, const char *key, const char *s) {
     free(v);
 }
 
-/* The --json result line on stdout. a is NULL if setup failed before the agent existed.
-   text is the last reply at or after message index from, so not one of a resumed session. */
-static void json_result(const myra_agent *a, int from, const myra_provider *p, const char *model,
-                        const char *outcome) {
-    static const myra_usage none = {0};
-    const myra_usage *u = a ? &a->session : &none;
-    const char *text = NULL;
-    for (int i = a ? cJSON_GetArraySize(a->messages) - 1 : -1; i >= from && !text; i--) {
+/* The last assistant text at or after message index from, so not one of a resumed
+   session; NULL if none. */
+static const char *last_text(const myra_agent *a, int from) {
+    for (int i = a ? cJSON_GetArraySize(a->messages) - 1 : -1; i >= from; i--) {
         cJSON *m = cJSON_GetArrayItem(a->messages, i), *c = cJSON_GetObjectItem(m, "content");
         cJSON *role = cJSON_GetObjectItem(m, "role");
         if (cJSON_IsString(role) && !strcmp(role->valuestring, "assistant") && cJSON_IsString(c) &&
             *c->valuestring)
-            text = c->valuestring;
+            return c->valuestring;
     }
+    return NULL;
+}
+
+/* The --json result line on stdout. a is NULL if setup failed before the agent existed. */
+static void json_result(const myra_agent *a, int from, const myra_provider *p, const char *model,
+                        const char *outcome) {
+    static const myra_usage none = {0};
+    const myra_usage *u = a ? &a->session : &none;
+    const char *text = last_text(a, from);
     cJSON *r = cJSON_CreateObject();
     cJSON_AddStringToObject(r, "type", "result");
     cJSON_AddStringToObject(r, "outcome", outcome);
@@ -121,6 +136,12 @@ static void discard(void *ud, const char *s) { (void)ud, (void)s; }
 
 static void on_sigint(int sig) {
     (void)sig;
+    myra_interrupted = 1;
+}
+
+/* SIGTERM and SIGHUP: stop as for Ctrl-C, then end the run. */
+static void on_term(int sig) {
+    myra_terminated = sig;
     myra_interrupted = 1;
 }
 
@@ -266,6 +287,7 @@ static void repl(myra_agent *a, const char *first) {
     }
     for (;;) {
         int interrupted;
+        if (myra_terminated) break;
         /* An interrupted turn leaves the flag set; cleared here, before completion can fetch. */
         myra_interrupted = 0;
         if (first) {
@@ -279,7 +301,7 @@ static void repl(myra_agent *a, const char *first) {
                 if (*line) linenoise_history_add(ctx, line);
             }
         } else if (!next_line(ctx, &line, &cap, &interrupted)) {
-            if (!interrupted) { /* EOF or read error */
+            if (!interrupted || myra_terminated) { /* EOF, read error or SIGTERM */
                 if (tty) fputc('\n', stderr); /* leave the prompt's line */
                 break;
             }
@@ -329,6 +351,7 @@ static void repl(myra_agent *a, const char *first) {
 }
 
 int main(int argc, char **argv) {
+    if (myra_family_is_command(argc, argv)) return myra_family_command(argc - 2, argv + 2);
     const char *prompt = NULL, *pname = NULL, *model = NULL;
     static const char *const modes[] = {[MYRA_AUTO] = "auto", [MYRA_ASK] = "ask",
                                         [MYRA_ALL] = "all", [MYRA_READ_ONLY] = "read-only"};
@@ -343,20 +366,39 @@ int main(int argc, char **argv) {
                                              {"acp", no_argument, NULL, 'A'},
                                              {"mcp-config", required_argument, NULL, 'M'},
                                              {"context-window", required_argument, NULL, 'K'},
+                                             {"recurse", no_argument, NULL, 'r'},
+                                             {"budget-tokens", required_argument, NULL, 'T'},
+                                             {"budget-cost", required_argument, NULL, 'U'},
+                                             {"prompt", required_argument, NULL, 'p'},
                                              {"help", no_argument, NULL, 'h'},
                                              {NULL, 0, NULL, 0}};
     myra_permissions perms = MYRA_AUTO;
-    int opt, verbose = 0, color = 1, raw = 0, acp = 0, json = 0, no_save = 0;
+    int opt, verbose = 0, color = 1, raw = 0, acp = 0, json = 0, no_save = 0, recurse = 0;
     const char *mcp_config = NULL, *dir = NULL, *resume = NULL;
     long window = 0;
+    double budget = 0, budget_cost = 0;
     const char *no_color = getenv("NO_COLOR"); /* https://no-color.org */
     if (no_color && *no_color) color = 0, raw = 1;
-    while ((opt = getopt_long(argc, argv, "p:P:m:hVC:", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:P:m:hVC:r", longopts, NULL)) != -1) {
         if (opt == 'V') {
             printf("myra %s\n", MYRA_VERSION);
             return 0;
         }
         if (opt == 'v') verbose = 1;
+        else if (opt == 'r') recurse = 1;
+        else if (opt == 'T' || opt == 'U') {
+            char *end;
+            errno = 0;
+            double v = strtod(optarg, &end);
+            if (errno || end == optarg || *end || !(v > 0) || v > 1e15 ||
+                (opt == 'T' && v != (double)(long long)v)) {
+                myra_note(MYRA_ERROR, "error: %s takes a positive %s\n",
+                          opt == 'T' ? "--budget-tokens" : "--budget-cost",
+                          opt == 'T' ? "whole number of tokens" : "number of dollars");
+                return 2;
+            }
+            *(opt == 'T' ? &budget : &budget_cost) = v;
+        }
         else if (opt == 'A') acp = 1;
         else if (opt == 'M') mcp_config = optarg;
         else if (opt == 'K') {
@@ -403,6 +445,10 @@ int main(int argc, char **argv) {
     }
     if (window && !acp) {
         myra_note(MYRA_ERROR, "error: --context-window needs --acp\n");
+        return 2;
+    }
+    if ((budget || budget_cost) && !recurse) {
+        myra_note(MYRA_ERROR, "error: --budget-tokens and --budget-cost need -r\n");
         return 2;
     }
     if (json && !prompt) {
@@ -482,11 +528,22 @@ int main(int argc, char **argv) {
     a.context_window = window;
     if (json) a.io.text = discard; /* stdout carries only the result line */
     a.save_provider = pname != NULL;
+    int child = recurse ? myra_family_join(&a, modes[perms], prompt != NULL, budget, budget_cost) : 0;
+    if (child < 0) {
+        if (json) json_result(&a, from, p, model, "error");
+        myra_free(&a);
+        cJSON_Delete(servers);
+        return 1;
+    }
+    if (child) save = !no_save; /* under its member id, so --resume opens its transcript */
     /* No SA_RESTART: blocking reads return EINTR, so Ctrl-C takes effect at once. */
     struct sigaction sa = {0};
     sa.sa_handler = on_sigint;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
+    sa.sa_handler = on_term;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
 
     int rc = 0;
     char *first = NULL;
@@ -515,8 +572,17 @@ int main(int argc, char **argv) {
             myra_report_session(&a);
         }
     }
+    if (recurse) { /* a child's answer, read by its parent's -r wait */
+        const char *text = last_text(&a, from);
+        const char *err = MYRA_STARTS_WITH(myra_last_error, "error: ") ? myra_last_error + 7
+                                                                       : myra_last_error;
+        char failed[sizeof myra_last_error + 16];
+        snprintf(failed, sizeof failed, "failed: %s", *err ? err : "the turn failed");
+        myra_family_leave(rc == 130 || myra_terminated ? "cancelled" : rc ? failed
+                          : text ? text : "(no answer)");
+    }
     myra_free(&a);
     cJSON_Delete(servers);
     free(first);
-    return rc;
+    return myra_terminated ? 128 + myra_terminated : rc;
 }

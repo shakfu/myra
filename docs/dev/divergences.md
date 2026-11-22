@@ -12,6 +12,8 @@ Checked against commit `b0a3adb`.
 | Prompt | stderr | stdout | `input()` writes it there |
 | Lone completion | no trailing space | trailing space | `readline` default |
 | Request timeout | 600 s for the whole transfer (`CURLOPT_TIMEOUT`) | 600 s per socket read (`urlopen(timeout=)`) | `urllib` has no whole-request timeout |
+| `-r` parent watch | `myra_poll`, from curl's progress callback and the `shell` loop, checks the parent once a second | a thread checks it once a second and sends the process SIGHUP | the Python agent has no poll hook in its request |
+| `-r` input estimate | the request body's bytes / 3, as `cJSON_PrintUnformatted` writes it | the same, as `json.dumps` writes it: a few percent more | each estimates from what it sends |
 | `--acp` input | stdin is drained from curl's progress callback and the shell loop: `session/cancel` stops a model request within about 1 s; a parse error is answered when stdin is next drained | a reader thread takes stdin: `session/cancel` sends the main thread SIGINT, which stops a request at once; a parse error is answered at once | `urllib` has no progress callback |
 
 ## Undecided

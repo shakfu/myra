@@ -101,6 +101,7 @@ Requests to `openrouter` carry a top-level `"cache_control": {"type": "ephemeral
     ./myra -P local                     # llama-server on :8080; remembered
     ./myra --permissions ask            # approve each write, edit and shell
     ./myra --mcp-config mcp.json        # add MCP servers' tools
+    ./myra -r --budget-tokens 500000    # let the agent start child agents
     ./myra --verbose                    # full tool arguments and results
     ./myra --no-color                   # plain stderr
     ./myra --raw                        # raw markdown on stdout
@@ -192,6 +193,10 @@ Ctrl-C:
 
 - Headless: the same, then exit with status 130.
 
+SIGTERM and SIGHUP stop the turn as Ctrl-C does. Then the REPL, `-p` or `--acp` ends, and myra exits with status 143 or 129.
+
+When myra exits, by any route but SIGKILL, it kills what its `shell` calls left running in the background. Each call's process group gets SIGTERM, then SIGKILL 1 s later. A job that leaves its process group, for example through `setsid`, survives.
+
 When a request exceeds the model's context, older tool outputs are replaced by a placeholder and the request is retried once. If nothing is left to drop, the agent suggests `/clear`. If the turn fails anyway, the outputs are restored.
 
 ### MCP servers: `--mcp-config`
@@ -223,6 +228,29 @@ A `usage_update` ends each turn that the server reported usage for: `used` is th
 
 Each session starts the `--mcp-config` servers, then those listed in `session/new`, in the session's `cwd`. They work as described under `--mcp-config`, with `session/cancel` in place of Ctrl-C. myra declares no `http` or `sse` MCP capability. A new session stops the previous servers.
 
+### Recursive agents: `-r`
+
+`-r` lets the agent start child agents through `shell` and collect their answers:
+
+    myra -r --budget-tokens 500000 -p "review src/ with one child per file"
+
+The system prompt tells the agent these commands:
+
+| Command | Does |
+|-|-|
+| `myra -r spawn --name NAME [-m MODEL] -- TASK` | start a headless child on TASK; prints its id |
+| `myra -r wait NAME_OR_ID [--timeout SECS]` | print the child's answer, waiting up to 100 s by default |
+| `myra -r agents` | list the family |
+| `myra -r shutdown [--grace SECS]` | stop the caller's children and theirs |
+
+- A child gets its parent's provider, model and `--permissions`, and runs in the directory `spawn` ran in. Under `ask`, `spawn` is refused, since a child cannot ask anyone.
+- When a child finishes, a note follows the parent's next tool result. The answer comes only from `wait`, as tool output.
+- A child stops within about a second of its parent's exit.
+- `--budget-tokens N` is required: every request in the family reserves its input and output first, and goes out with that output as `max_tokens`. A request that would cross the budget fails and stops the requesting agent's children. `--budget-cost USD` adds a limit at the rates OpenRouter lists.
+- State is files under `$XDG_STATE_HOME/myra/family/`, removed when the root exits. Each child saves its session under its id, for `--resume`.
+
+Design and limits: `docs/dev/recursion.md`.
+
 ### Desktop UI: `myra-ui`
 
 `make ui` builds and runs `build-ui/ui/myra-ui`, `make test-ui` tests it and `make install-ui` installs it, a window on the same `myralib`, drawn by [CUI](https://github.com/yappologistic/CUI). The CLI build does not need it. Linux also needs the X11 headers (`libx11-dev`).
@@ -252,6 +280,7 @@ Under `$XDG_STATE_HOME/myra/` (default `~/.local/state/myra/`):
 | `<provider>.model`  | the last model used with that provider  |
 | `history`           | REPL input history, mode 0600; last 1000 lines |
 | `sessions/ID.json`  | saved conversations, mode 0600; see "Sessions" |
+| `family/ID/`        | a running `-r` family's registry, ledger, answers and logs, mode 0700 |
 | `ui.theme`, `ui.layout` | `myra-ui`'s light or dark theme and panel layout |
 
 `provider` and the model files are saved only after the server accepts a request, so a mistyped `-P` or `-m` is not kept.
@@ -263,6 +292,7 @@ Besides the provider variables above:
 | Variable               | Effect                                                   |
 |------------------------|----------------------------------------------------------|
 | `MYRA_MAX_OUTPUT`     | tool output cap in bytes (at least 1024), for every provider |
+| `MYRA_KEEP_FAMILY`    | non-empty: a `-r` root leaves its family's files at exit, for inspection; the next root removes them |
 | `MYRA_RETRY_DELAY_MS` | first retry wait; it doubles per retry (default 1000). Tests set it to 1 |
 | `XDG_STATE_HOME`       | where state is saved                                     |
 
@@ -278,7 +308,7 @@ Besides the provider variables above:
 
 - Commands cannot read the terminal. A `sudo` or `ssh` password prompt waits until the timeout.
 
-- A background job must redirect its output (`cmd >log 2>&1 &`), or the call waits for it until the timeout.
+- A background job must redirect its output (`cmd >log 2>&1 &`), or the call waits for it until the timeout. It stops when myra exits.
 
 - `edit` cannot match text that `read` showed as U+FFFD in a file that is not UTF-8. Use `shell`, e.g. `sed` or `iconv`.
 

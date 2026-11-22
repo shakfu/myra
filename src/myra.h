@@ -23,6 +23,14 @@
    atomics are safe in a signal handler too. */
 extern atomic_int myra_interrupted;
 
+/* The signal number, set with myra_interrupted by a SIGTERM or SIGHUP handler: the
+   front end ends once the turn has stopped. */
+extern atomic_int myra_terminated;
+
+/* Kill the process group of every shell call that still has members: SIGTERM, then
+   SIGKILL after 1 s. myra_free calls it. */
+void myra_kill_jobs(void);
+
 /* Called often while a model request or shell command runs, so a front end can
    read its input and set myra_interrupted. NULL: none. */
 extern void (*myra_poll)(void);
@@ -122,8 +130,23 @@ typedef struct {
 } myra_io;
 
 typedef struct myra_mcp myra_mcp; /* mcp.h */
+typedef struct myra_agent myra_agent;
 
+/* Set by a front end that makes the agent a member of a family of agents (the CLI's
+   -r). A NULL member: none. */
 typedef struct {
+    void *ud;
+    const char *prompt;      /* appended to the system prompt; not owned */
+    /* After a step's tool calls: text appended to the last result, malloc'd, or NULL. */
+    char *(*note)(void *ud);
+    /* Before each model request: its output cap in tokens, sent as max_tokens, or -1 to
+       refuse it (with an error note). input estimates the request's input tokens. */
+    long (*reserve)(void *ud, myra_agent *a, long input);
+    /* After each reserved request: its usage object, NULL if it did not complete. */
+    void (*settle)(void *ud, const cJSON *usage);
+} myra_family_hooks;
+
+struct myra_agent {
     const myra_provider *prov;
     char *model;         /* owned */
     const char *api_key; /* NULL or empty: no authorization header */
@@ -141,10 +164,11 @@ typedef struct {
     double context_used; /* prompt plus completion tokens of the last response */
     long context_window; /* the model's, in tokens; 0 unknown */
     myra_io io;
+    myra_family_hooks family;
     myra_mcp *mcp;       /* running MCP servers, newest first */
     char session_id[64]; /* the saved session this conversation is, "" if none */
     cJSON *tools, *messages;
-} myra_agent;
+};
 
 const myra_provider *myra_provider_named(const char *name);
 /* The remembered provider if it can run (a cloud one needs its key set), else the
@@ -167,6 +191,8 @@ void myra_set_model(myra_agent *a, const char *model);
 void myra_report_session(myra_agent *a);
 /* The model's context window from the provider's /models entry; 0 if it gives none. Fetches. */
 long myra_context_window(myra_agent *a);
+/* The model's entry in the provider's /models list, a copy; NULL if none. Fetches. */
+cJSON *myra_model_entry(myra_agent *a);
 /* Print the provider's model ids that contain filter, ignoring case; the current one is starred. */
 void myra_list_models(myra_agent *a, const char *filter);
 

@@ -4,9 +4,15 @@
 
 ### Changed
 
+- SIGTERM and SIGHUP end myra cleanly. The turn stops as for Ctrl-C, and myra exits with 128 + the signal number. Before, myra died at once and left its running `shell` command alive.
+
+- Background jobs started by `shell` are killed when myra exits, so a myra run from another agent's `shell` call no longer leaves orphans when that call is killed.
+
 - `myra_interrupted` is an `atomic_int`, not a `volatile sig_atomic_t`. A front end that runs `myra_ask` on a worker thread and cancels from its UI thread no longer has a data race. `sig_atomic_t` is only defined for signal handlers; a lock-free atomic is valid in both.
 
 ### Added
+
+- `-r`/`--recurse`: recursive agents, ported from minima. Through `shell`, an agent runs `myra -r spawn --name NAME -- TASK` to start a headless child, `wait` to print its answer, `agents` to list the family and `shutdown` to stop its descendants. Children inherit the parent's permissions; `spawn` is refused under `ask`. A finished child is announced in a note after the parent's next tool result, so the parent works on instead of polling, and a child's text never reaches the prompt with the user's authority. `--budget-tokens N` is required: each request reserves against a shared ledger, is sent with its grant as `max_tokens`, and fails once spending leaves too little, stopping the requester's descendants. Design: `docs/dev/recursion.md`.
 
 - ACP: each turn ends with a `usage_update` carrying the context in use, the model's window and the session's cost, so a client such as `minosb` can report what a run spent. The window comes from OpenRouter's `/models` entry, looked up once per process after the first turn that reports usage rather than at `session/new`, so a run that reports none makes no extra request. `--context-window TOKENS` gives it for a server that has none.
 
@@ -39,6 +45,8 @@
 - Rendering, `--raw` and escaping together add 8 KB of code; the Release binary grows 13 KB, to 135 KB.
 
 ### Fixed
+
+- A stopped `shell` call sent SIGKILL to its process group as soon as `sh` exited. Group members still handling SIGTERM got no time to clean up. The 2 s grace now runs until the whole group has exited.
 
 - ACP: `session/request_permission` carries the call's arguments as `rawInput`. It sent only the title, which for `write` and `edit` names the path but not the content, so a client approved a write it could not see.
 

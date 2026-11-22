@@ -48,7 +48,7 @@ static const char *TOOLS_JSON =
     "\"timeout\":{\"type\":\"integer\"}},"
     "\"required\":[\"command\"],\"additionalProperties\":false}}}]";
 
-atomic_int myra_interrupted;
+atomic_int myra_interrupted, myra_terminated;
 void (*myra_poll)(void);
 void (*myra_note_hook)(myra_style style, const char *text);
 int myra_color, myra_escape_out, myra_escape_err;
@@ -475,12 +475,53 @@ static void reap(pid_t pid, int *st) {
     while (waitpid(pid, st, 0) < 0 && errno == EINTR) {}
 }
 
-/* SIGTERM the process group, SIGKILL whatever is left after 2 s. */
+static int group_alive(pid_t g) { return kill(-g, 0) == 0 || errno == EPERM; }
+
+/* SIGTERM the process group, SIGKILL whatever is left after 2 s; 1 s when myra itself
+   is terminating, so a parent's own SIGKILL comes after this one. The wait is for the
+   whole group: a member that handles SIGTERM, such as a nested myra, gets to finish. */
 static void kill_group(pid_t pid, int *st) {
     kill(-pid, SIGTERM);
-    for (double end = now() + 2; waitpid(pid, st, WNOHANG) == 0 && now() < end;) usleep(100000);
+    int reaped = 0; /* sh stays a group member until reaped */
+    for (double end = now() + (myra_terminated ? 1 : 2); now() < end; usleep(20000)) {
+        pid_t w = reaped ? 0 : waitpid(pid, st, WNOHANG);
+        if (w == pid || (w < 0 && errno != EINTR)) reaped = 1;
+        if (reaped && !group_alive(pid)) break;
+    }
     kill(-pid, SIGKILL); /* also children that outlived sh */
-    if (waitpid(pid, st, WNOHANG) == 0) reap(pid, st);
+    if (!reaped) reap(pid, st);
+}
+
+/* The process group of each shell call, kept so background jobs die with myra. */
+static pid_t *jobs;
+static size_t njobs, jobs_cap;
+
+static void add_job(pid_t g) {
+    size_t n = 0;
+    for (size_t i = 0; i < njobs; i++) /* prune empty groups, so the list stays short */
+        if (group_alive(jobs[i])) jobs[n++] = jobs[i];
+    njobs = n;
+    if (njobs == jobs_cap) {
+        pid_t *grown = realloc(jobs, (jobs_cap = jobs_cap ? 2 * jobs_cap : 16) * sizeof *jobs);
+        if (!grown) { perror("realloc"); exit(1); }
+        jobs = grown;
+    }
+    jobs[njobs++] = g;
+}
+
+void myra_kill_jobs(void) {
+    int left = 0;
+    for (size_t i = 0; i < njobs; i++)
+        if (group_alive(jobs[i])) kill(-jobs[i], SIGTERM), left = 1;
+    for (double end = now() + 1; left && now() < end;) {
+        usleep(50000);
+        left = 0;
+        for (size_t i = 0; i < njobs && !left; i++) left = group_alive(jobs[i]);
+    }
+    for (size_t i = 0; left && i < njobs; i++) kill(-jobs[i], SIGKILL);
+    free(jobs);
+    jobs = NULL;
+    njobs = jobs_cap = 0;
 }
 
 /* sh runs in its own process group, so the terminal's Ctrl-C reaches only the agent,
@@ -508,6 +549,7 @@ static char *tool_shell(const char *cmd, int timeout, size_t cap, int *err) {
         _exit(127);
     }
     setpgid(pid, pid); /* also here, so the group exists before any kill */
+    add_job(pid);
     close(fds[1]);
 
     sink s;
@@ -1442,9 +1484,25 @@ static cJSON *call_api(myra_agent *a) {
     if (a->prov->cache_control)
         cJSON_AddItemToObject(req, "cache_control", cJSON_Parse("{\"type\":\"ephemeral\"}"));
     char *body = cJSON_PrintUnformatted(req);
+    long grant = 0;
+    if (a->family.reserve) { /* about 3 bytes of JSON per token: more tokens than most text */
+        grant = a->family.reserve(a->family.ud, a, (long)(strlen(body) / 3 + 1));
+        if (grant < 0) {
+            a->context_full = 0;
+            free(body);
+            cJSON_Delete(req);
+            return NULL;
+        }
+        if (grant) { /* the provider enforces the grant */
+            cJSON_AddNumberToObject(req, "max_tokens", (double)grant);
+            free(body);
+            body = cJSON_PrintUnformatted(req);
+        }
+    }
     cJSON_Delete(req);
     cJSON *resp = request(a, "/chat/completions", body, 1);
     free(body);
+    if (a->family.settle) a->family.settle(a->family.ud, cJSON_GetObjectItem(resp, "usage"));
     /* Saved only once the server accepts them, so a mistyped choice is not kept. */
     if (resp && a->save_provider) {
         myra_store_state("provider", a->prov->name);
@@ -1480,17 +1538,23 @@ char **myra_model_ids(myra_agent *a) {
     return ids;
 }
 
-long myra_context_window(myra_agent *a) {
-    cJSON *resp = request(a, "/models", NULL, 0), *m;
-    double n = 0;
+cJSON *myra_model_entry(myra_agent *a) {
+    cJSON *resp = request(a, "/models", NULL, 0), *m, *entry = NULL;
     cJSON_ArrayForEach(m, cJSON_GetObjectItem(resp, "data")) {
         const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(m, "id"));
         if (id && !strcmp(id, a->model)) {
-            n = get_num(m, "context_length"); /* OpenRouter's field */
+            entry = cJSON_Duplicate(m, 1);
             break;
         }
     }
     cJSON_Delete(resp);
+    return entry;
+}
+
+long myra_context_window(myra_agent *a) {
+    cJSON *m = myra_model_entry(a);
+    double n = get_num(m, "context_length"); /* OpenRouter's field */
+    cJSON_Delete(m);
     return n >= 1 ? (long)n : 0;
 }
 
@@ -1596,6 +1660,18 @@ int myra_step(myra_agent *a, cJSON *resp) {
         cJSON_AddItemToArray(a->messages, r);
         free(content);
         free(out);
+    }
+    char *note = ncalls && a->family.note ? a->family.note(a->family.ud) : NULL;
+    if (note) { /* tool output, so a child's news never carries the user's authority */
+        cJSON *last = cJSON_GetArrayItem(a->messages, cJSON_GetArraySize(a->messages) - 1);
+        const char *content = get_str(last, "content");
+        buf b = {0};
+        buf_add(&b, content, strlen(content));
+        buf_lit(&b, "\n\n");
+        buf_add(&b, note, strlen(note));
+        cJSON_ReplaceItemInObject(last, "content", cJSON_CreateString(b.p));
+        free(b.p);
+        free(note);
     }
     if (myra_interrupted) {
         myra_note(MYRA_WARN, "interrupted\n");
@@ -1750,11 +1826,20 @@ void myra_set_cwd(myra_agent *a) {
     char *prompt = fmt("You are a coding agent. The working directory is %s. Use the read, write, "
                        "edit and shell tools to inspect and change code. Verify changes where you "
                        "can. Be concise.", cwd);
+    if (a->family.prompt) {
+        buf b = {0};
+        buf_add(&b, prompt, strlen(prompt));
+        buf_lit(&b, "\n\n");
+        buf_add(&b, a->family.prompt, strlen(a->family.prompt));
+        free(prompt);
+        prompt = b.p;
+    }
     cJSON_ReplaceItemInObject(cJSON_GetArrayItem(a->messages, 0), "content", cJSON_CreateString(prompt));
     free(prompt);
 }
 
 void myra_free(myra_agent *a) {
+    myra_kill_jobs();
     myra_mcp_stop(a);
     if (a->messages) curl_global_cleanup(); /* paired with a successful myra_init */
     cJSON_Delete(a->messages);

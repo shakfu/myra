@@ -62,11 +62,20 @@ def to_sse(reply):
     return "".join(events).encode()
 
 
+def agent_name(body):
+    """The family member a request comes from, by its system prompt; None outside a family."""
+    msgs = (body or {}).get("messages") or [{}]
+    m = re.search(r'You are agent "([^"]+)"', str(msgs[0].get("content") or ""))
+    return m[1] if m else None
+
+
 class Mock:
-    """Serves queued (status, body) replies and records each request."""
+    """Serves queued (status, body) replies and records each request. A reply whose body
+    has "_for": NAME goes only to family member NAME; members with none take untagged ones."""
 
     def __init__(self):
         self.replies, self.requests = [], []
+        self.lock = threading.Lock()
         mock = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -78,12 +87,18 @@ class Mock:
                 self.answer("GET", None)
 
             def answer(self, method, body):
-                mock.requests.append({"method": method, "path": self.path,
-                                      "headers": {k.lower(): v for k, v in self.headers.items()},
-                                      "body": body})
-                status, reply, *delay = mock.replies.pop(0)  # optional third item: seconds
+                who = agent_name(body)
+                with mock.lock:
+                    mock.requests.append({"method": method, "path": self.path, "agent": who,
+                                          "t": time.monotonic(),
+                                          "headers": {k.lower(): v for k, v in self.headers.items()},
+                                          "body": body})
+                    i = next((i for i, r in enumerate(mock.replies) if r[1].get("_for") == who),
+                             next(i for i, r in enumerate(mock.replies) if "_for" not in r[1]))
+                    status, reply, *delay = mock.replies.pop(i)  # optional third item: seconds
                 time.sleep(delay[0] if delay else 0)
                 reply = dict(reply)
+                reply.pop("_for", None)
                 wants_stream = (body or {}).get("stream") and status == 200
                 plain = reply.pop("_plain", False) or (
                     "_sse" not in reply and not (wants_stream and reply.get("choices")))
@@ -136,16 +151,19 @@ class Api:
                               env={**self.env(cwd, key), **(env or {})}, input=stdin, text=True,
                               capture_output=True, timeout=60, start_new_session=True, check=False)
 
-    def reply(self, text=None, calls=(), stop=None):
-        """calls: (id, name, input dict or raw argument string)."""
+    def reply(self, text=None, calls=(), stop=None, for_=None, delay=None):
+        """calls: (id, name, input dict or raw argument string). for_: the family member
+        it is for. delay: seconds before it is sent."""
         msg = {"role": "assistant", "content": text}
         if calls:
             msg["tool_calls"] = [{"id": i, "type": "function", "function": {
                 "name": n, "arguments": a if isinstance(a, str) else json.dumps(a)}}
                 for i, n, a in calls]
         stop = stop or ("tool_calls" if calls else "stop")
-        self.mock.replies.append(
-            (200, {"choices": [{"index": 0, "message": msg, "finish_reason": stop}]}))
+        body = {"choices": [{"index": 0, "message": msg, "finish_reason": stop}]}
+        if for_:
+            body["_for"] = for_
+        self.mock.replies.append((200, body, delay) if delay else (200, body))
 
     @staticmethod
     def results(req):
@@ -1116,6 +1134,90 @@ def test_sigint_stops_shell_after_output_closes(mock, tmp_path):
     assert p.returncode == 0 and out == "", err
     assert mock.requests[0]["body"]["messages"][-1]["content"] == "first"
     assert len(mock.requests) == 1  # the interrupted turn ends without asking the model again
+
+
+# ---- SIGTERM, SIGHUP and background jobs ----
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
+def test_term_during_shell_kills_it_and_exits(mock, tmp_path, sig):
+    api = Api(mock, "local")
+    api.reply(calls=[("s", "shell", {"command": "sleep 30 & echo $! > pid; wait"})])
+    p = start(api, tmp_path, "--json", "-p", "go")
+    wait_for(lambda: (tmp_path / "pid").exists() and (tmp_path / "pid").read_text().strip())
+    t = time.monotonic()
+    p.send_signal(sig)
+    out, err = p.communicate(timeout=10)
+    assert time.monotonic() - t < 4
+    assert p.returncode == 128 + sig, err
+    assert json.loads(out.splitlines()[-1])["outcome"] == "cancelled"
+    assert pid_gone(tmp_path / "pid")
+    assert len(mock.requests) == 1
+
+
+def test_term_during_request_exits(mock, tmp_path):
+    api = Api(mock, "local")
+    mock.replies.append((200, {"choices": []}, 20))  # the server stalls
+    p = start(api, tmp_path, "-p", "go")
+    wait_for(lambda: mock.requests)
+    t = time.monotonic()
+    p.send_signal(signal.SIGTERM)
+    _, err = p.communicate(timeout=10)
+    assert time.monotonic() - t < 3
+    assert p.returncode == 143, err
+
+
+def test_term_at_the_repl_prompt_exits(mock, tmp_path):
+    api = Api(mock, "local")
+    p = start(api, tmp_path)
+    assert p.stderr.readline() == f"myra {VERSION}\n"
+    assert p.stderr.readline() == "local local\n"  # handler is installed by now
+    time.sleep(0.2)  # into the read
+    p.send_signal(signal.SIGTERM)
+    _, err = p.communicate(timeout=5)
+    assert p.returncode == 143, err
+
+
+def test_term_ends_acp(api, tmp_path):
+    acp = Acp(api, tmp_path).start(tmp_path)
+    time.sleep(0.2)  # idle, waiting for the next message
+    acp.p.send_signal(signal.SIGTERM)
+    acp.p.wait(timeout=5)
+    assert acp.p.returncode == 143
+
+
+def test_background_job_dies_with_myra(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[("s", "shell", {"command": "sleep 30 >/dev/null 2>&1 & echo $! > pid"})])
+    api.reply("done")
+    p = api.run(tmp_path, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert Api.results(mock.requests[1]) == {"s": ("[exit 0]", False)}
+    assert pid_gone(tmp_path / "pid")
+
+
+def test_background_job_ignoring_sigterm_is_killed(mock, tmp_path):
+    api = Api(mock, "local")
+    cmd = "(trap '' TERM; sleep 30) >/dev/null 2>&1 & echo $! > pid"
+    api.reply(calls=[("s", "shell", {"command": cmd})])
+    api.reply("done")
+    t = time.monotonic()
+    p = api.run(tmp_path, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert time.monotonic() - t < 5
+    assert pid_gone(tmp_path / "pid")
+
+
+def test_nested_myra_job_dies_when_its_shell_is_killed(mock, tmp_path):
+    """A myra run from a shell call stops its own shell jobs when that call times out."""
+    api = Api(mock, "local")
+    inner = f"{AGENT} -P local -p inner >/dev/null 2>&1"
+    api.reply(calls=[("s", "shell", {"command": inner, "timeout": 2})])  # outer
+    api.reply(calls=[("t", "shell", {"command": "sleep 30 & echo $! > pid; wait"})])  # inner
+    api.reply("done")  # outer, after the timeout
+    p = api.run(tmp_path, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert Api.results(mock.requests[2])["s"][0].endswith("[timed out after 2s; killed]")
+    assert pid_gone(tmp_path / "pid")
 
 
 # ---- /clear ----
@@ -2622,3 +2724,301 @@ def test_mcp_config_ctrl_c_at_startup_exits(mock, tmp_path, mode):
     assert not later_log.exists()  # the rest are skipped
     assert not mock.requests
     assert json.loads(log.read_text().splitlines()[-1]) == {"eof": True}  # stopped at exit
+
+
+# ---- recursive agents: -r ----
+
+FAMILY = ("-r", "--budget-tokens", "1000000")
+
+
+def family_dirs(cwd):
+    return list((cwd / ".state/myra/family").glob("*")) if (cwd / ".state/myra/family").exists() else []
+
+
+def sh(i, cmd, timeout=None):
+    """A shell call with id i running cmd, with {A} standing for the agent's path."""
+    args = {"command": cmd.replace("{A}", str(AGENT))}
+    if timeout:
+        args["timeout"] = timeout
+    return (i, "shell", args)
+
+
+def test_family_spawn_note_and_wait(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[sh("s", "{A} -r spawn --name counter -- 'count the lines'")])
+    # The next tool batch ends once the child has answered, so its note must follow.
+    api.reply(calls=[sh("t", "until {A} -r agents | grep -q ' done '; do sleep 0.1; done")])
+    api.reply(calls=[sh("w", "{A} -r wait counter")])
+    api.reply("the answer is 42")
+    api.reply("42", for_="counter", delay=1)  # after the spawn call's step has ended
+    p = api.run(tmp_path, *FAMILY, "-p", "delegate")
+    assert p.returncode == 0, p.stderr
+    sys_prompt = mock.requests[0]["body"]["messages"][0]["content"]
+    assert 'You are agent "root"' in sys_prompt and "-r spawn --name NAME" in sys_prompt
+    root = [r for r in mock.requests if r["agent"] == "root"]
+    child = [r for r in mock.requests if r["agent"] == "counter"]
+    assert len(root) == 4 and len(child) == 1
+    assert 'started by "root"' in child[0]["body"]["messages"][0]["content"]
+    assert child[0]["body"]["messages"][1]["content"] == "count the lines"
+    cid = Api.results(root[1])["s"][0].split("\n")[0]
+    assert re.fullmatch(r"\d+-\d+", cid)
+    out, err = Api.results(root[2])["t"]
+    assert not err and f"[myra: child counter ({cid}) has finished; `-r wait counter`" in out
+    assert Api.results(root[3]) == {"w": ("42\n[exit 0]", False)}
+    assert not family_dirs(tmp_path)  # the root removes the family's files
+    assert (tmp_path / f".state/myra/sessions/{cid}.json").exists()  # resumable transcript
+
+
+def test_family_note_comes_once(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[sh("s", "{A} -r spawn --name c -- go")])
+    api.reply(calls=[sh("t", "until {A} -r agents | grep -q ' done '; do sleep 0.1; done")])
+    api.reply(calls=[sh("u", "true")])
+    api.reply("done")
+    api.reply("hi", for_="c", delay=1)
+    p = api.run(tmp_path, *FAMILY, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    root = [r for r in mock.requests if r["agent"] == "root"]
+    assert "has finished" in Api.results(root[2])["t"][0]
+    assert Api.results(root[3]) == {"u": ("[exit 0]", False)}
+
+
+def test_family_grandchild(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[sh("s", "{A} -r spawn --name a -- 'ask b' && {A} -r wait a --timeout 30",
+                        timeout=40)])
+    api.reply("root got it")
+    api.reply(calls=[sh("s", "{A} -r spawn --name b -- 'say 7' && {A} -r wait b --timeout 30",
+                        timeout=40)], for_="a")
+    api.reply("a says 7", for_="a")
+    api.reply("7", for_="b")
+    p = api.run(tmp_path, *FAMILY, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    root = [r for r in mock.requests if r["agent"] == "root"]
+    a = [r for r in mock.requests if r["agent"] == "a"]
+    out = Api.results(root[1])["s"][0]
+    assert out.endswith("a says 7\n[exit 0]")  # no note: wait printed the answer
+    assert Api.results(a[1])["s"][0].endswith("7\n[exit 0]")
+    assert 'started by "a"' in [r for r in mock.requests if r["agent"] == "b"][0][
+        "body"]["messages"][0]["content"]
+
+
+def test_family_child_stops_when_parent_exits(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[sh("s", "{A} -r spawn --name sleeper -- go")])
+    api.reply(calls=[sh("t", "until [ -s pid ]; do sleep 0.1; done")])
+    api.reply("leaving")
+    api.reply(calls=[sh("s", "sleep 30 & echo $! > pid; wait")], for_="sleeper")
+    p = api.run(tmp_path, *FAMILY, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    t = time.monotonic()
+    wait_for(lambda: pid_gone(tmp_path / "pid"))
+    assert time.monotonic() - t < 5
+    assert len([r for r in mock.requests if r["agent"] == "sleeper"]) == 1
+
+
+def test_family_shutdown_stops_descendants(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[sh("s", "{A} -r spawn --name sleeper -- go")])
+    api.reply(calls=[sh("t", "until [ -s pid ]; do sleep 0.1; done; {A} -r shutdown")])
+    api.reply(calls=[sh("w", "{A} -r wait sleeper")])
+    api.reply("done")
+    api.reply(calls=[sh("s", "sleep 30 & echo $! > pid; wait")], for_="sleeper")
+    p = api.run(tmp_path, *FAMILY, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    root = [r for r in mock.requests if r["agent"] == "root"]
+    assert Api.results(root[2])["t"][0].startswith("stopped 1 agent\n[exit 0]")
+    assert Api.results(root[3])["w"] == ("cancelled\n[exit 1]", True)  # no note: it was waited for
+    assert pid_gone(tmp_path / "pid")
+
+
+def test_family_wait_times_out_and_reports_failures(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[sh("s", "{A} -r spawn --name slow -- go"),
+                     sh("w", "{A} -r wait slow --timeout 1"),
+                     sh("x", "{A} -r wait nobody"),
+                     sh("y", "{A} -r wait slow --timeout 30")])
+    api.reply("done")
+    mock.replies.append((400, {"error": {"message": "bad model"}, "_for": "slow"}, 2))
+    p = api.run(tmp_path, *FAMILY, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    r = Api.results([q for q in mock.requests if q["agent"] == "root"][1])
+    assert r["w"] == ("slow is still working after 1 s; run wait again\n[exit 124]", True)
+    assert r["x"][0].startswith("error: no child named nobody")
+    assert r["y"][1] and r["y"][0].startswith("failed: ") and "bad model" in r["y"][0]
+
+
+def test_family_spawn_checks(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[sh("a", "{A} -r spawn --name 'bad name' -- go"),
+                     sh("b", "{A} -r spawn -- go"),
+                     sh("c", "{A} -r spawn --name x"),
+                     sh("d", "{A} -r spawn --name dup -- go && {A} -r spawn --name dup -- go")])
+    api.reply("done")
+    api.reply("hi", for_="dup", delay=3)
+    p = api.run(tmp_path, *FAMILY, "-p", "go")
+    assert p.returncode == 0, p.stderr
+    r = Api.results([q for q in mock.requests if q["agent"] == "root"][1])
+    assert "a name is 1 to 32" in r["a"][0] and r["a"][1]
+    assert "usage: myra -r spawn" in r["b"][0] and "usage: myra -r spawn" in r["c"][0]
+    assert "already has that name" in r["d"][0]
+
+
+def test_family_spawn_refused_under_ask(mock, tmp_path):
+    api = Api(mock, "local")
+    fam = tmp_path / ".state/myra/family/1-1"
+    fam.mkdir(parents=True)
+    (fam / "registry.json").write_text(json.dumps({"members": [
+        {"id": "1-1", "name": "root", "parent": None, "pid": os.getpid(), "provider": "local",
+         "model": "local", "permissions": "ask", "started_at": 0, "ended_at": None}]}))
+    p = subprocess.run([str(AGENT), "-r", "spawn", "--name", "c", "--", "go"], cwd=tmp_path,
+                       env={**api.env(tmp_path), "MYRA_FAMILY": "1-1", "MYRA_SELF": "1-1"},
+                       capture_output=True, text=True, timeout=10)
+    assert p.returncode == 1
+    assert "refused under --permissions ask" in p.stderr
+
+
+def test_family_commands_outside_a_family(mock, tmp_path):
+    api = Api(mock, "local")
+    for cmd in (["agents"], ["wait", "x"], ["spawn", "--name", "x", "--", "go"], ["shutdown"]):
+        p = subprocess.run([str(AGENT), "-r", *cmd], cwd=tmp_path, env=api.env(tmp_path),
+                           capture_output=True, text=True, timeout=10)
+        assert p.returncode == 1 and "not in a family" in p.stderr, cmd
+
+
+def test_family_child_needs_prompt(mock, tmp_path):
+    api = Api(mock, "local")
+    p = subprocess.run([str(AGENT), "-P", "local", "-r"], cwd=tmp_path, input="",
+                       env={**api.env(tmp_path), "MYRA_ID": "1-2", "MYRA_FAMILY": "1-1"},
+                       capture_output=True, text=True, timeout=10)
+    assert p.returncode == 1 and "runs headless" in p.stderr
+
+
+def test_family_spawn_word_is_a_prompt_without_r(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("ok")
+    p = api.run(tmp_path, "-p", "spawn")
+    assert p.returncode == 0 and mock.requests[0]["body"]["messages"][1]["content"] == "spawn"
+
+
+# ---- the family's budget ----
+
+def usage(prompt, completion=0):
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+
+
+def test_budget_flags(mock, tmp_path):
+    api = Api(mock, "local")
+    p = api.run(tmp_path, "-r", "-p", "go")
+    assert p.returncode == 1 and "-r needs --budget-tokens" in p.stderr
+    p = api.run(tmp_path, "--budget-tokens", "1000", "-p", "go")
+    assert p.returncode == 2 and "need -r" in p.stderr
+    for bad in ("0", "-5", "1.5", "x", "inf"):
+        p = api.run(tmp_path, "-r", "--budget-tokens", bad, "-p", "go")
+        assert p.returncode == 2 and "positive whole number" in p.stderr, bad
+    p = api.run(tmp_path, *FAMILY, "--budget-cost", "0", "-p", "go")
+    assert p.returncode == 2 and "positive number of dollars" in p.stderr
+    p = api.run(tmp_path, *FAMILY, "-p", "go", env={"MYRA_ID": "1-2", "MYRA_FAMILY": "1-1"})
+    assert p.returncode == 1 and "takes no --budget-tokens" in p.stderr
+    assert not mock.requests
+
+
+def test_budget_caps_each_request(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("ok")
+    api.reply("ok")
+    api.reply("ok")
+    assert api.run(tmp_path, *FAMILY, "-p", "go").returncode == 0
+    assert mock.requests[0]["body"]["max_tokens"] == 32000  # no model list: the default ceiling
+    assert api.run(tmp_path, "-r", "--budget-tokens", "20000", "-p", "go").returncode == 0
+    assert 4096 <= mock.requests[1]["body"]["max_tokens"] < 18500  # the budget, less the input
+    assert api.run(tmp_path, "-p", "go").returncode == 0
+    assert "max_tokens" not in mock.requests[2]["body"]  # outside a family: no cap
+
+
+def test_budget_crossing_fails_the_request(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply(calls=[sh("s", "true")])
+    mock.replies[-1][1]["usage"] = usage(15000)
+    p = api.run(tmp_path, "-r", "--budget-tokens", "20000", "--json", "-p", "go")
+    assert p.returncode == 1
+    assert "the family's token budget of 20000 is spent: 15000 used" in p.stderr
+    assert json.loads(p.stdout)["outcome"] == "error"
+    assert len(mock.requests) == 1
+
+
+def test_budget_crossing_stops_descendants(mock, tmp_path):
+    api = Api(mock, "local")
+    # One call, so the root holds nothing while the child reserves its first request.
+    api.reply(calls=[sh("s", "{A} -r spawn --name sleeper -- go && until [ -s pid ]; do sleep 0.1; done")])
+    mock.replies[-1][1]["usage"] = usage(1000)
+    api.reply(calls=[sh("t", "true")])
+    mock.replies[-1][1]["usage"] = usage(53000)
+    api.reply(calls=[sh("s", "sleep 30 & echo $! > pid; wait")], for_="sleeper")
+    mock.replies[-1][1]["usage"] = usage(100)
+    p = api.run(tmp_path, "-r", "--budget-tokens", "60000", "-p", "go")
+    assert p.returncode == 1 and "token budget of 60000 is spent" in p.stderr
+    assert pid_gone(tmp_path / "pid")
+    assert len([r for r in mock.requests if r["agent"] == "root"]) == 2
+
+
+def test_budget_waits_for_held_room(mock, tmp_path):
+    api = Api(mock, "local")
+    # The spawn comes 0.5 s later, inside the root's next request.
+    api.reply(calls=[sh("s", "(sleep 0.5; {A} -r spawn --name c -- go) >/dev/null 2>&1 &")])
+    mock.replies[-1][1]["usage"] = usage(1000, 100)
+    # Its hold, about 33,000, leaves the child less than the 4,096 floor until it settles.
+    api.reply(calls=[sh("w", "{A} -r wait c --timeout 30")], delay=2)
+    mock.replies[-1][1]["usage"] = usage(1000, 100)
+    api.reply("done")
+    api.reply("hi", for_="c")
+    mock.replies[-1][1]["usage"] = usage(500, 10)
+    p = api.run(tmp_path, "-r", "--budget-tokens", "36000", "-p", "go")
+    assert p.returncode == 0, p.stderr
+    root = [r for r in mock.requests if r["agent"] == "root"]
+    child = [r for r in mock.requests if r["agent"] == "c"]
+    assert Api.results(root[2])["w"][0].startswith("hi\n[exit 0]")
+    assert child[0]["t"] - root[1]["t"] >= 1.5  # it waited for the root's hold to settle
+    assert child[0]["body"]["max_tokens"] >= 4096
+
+
+def model_list(max_out, prompt="0.000001", completion="0.00001"):
+    return (200, {"data": [{"id": "test/model", "context_length": 100000,
+                            "top_provider": {"max_completion_tokens": max_out},
+                            "pricing": {"prompt": prompt, "completion": completion}}]})
+
+
+def test_budget_uses_openrouters_model_limits(mock, tmp_path):
+    api = Api(mock, "openrouter")
+    mock.replies.append(model_list(5000))
+    api.reply("ok")
+    p = api.run(tmp_path, *FAMILY, "--budget-cost", "5", "-m", "test/model", "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert [r["path"] for r in mock.requests] == ["/api/v1/models", "/api/v1/chat/completions"]
+    assert mock.requests[1]["body"]["max_tokens"] == 5000
+    mock.replies.append(model_list(128000))
+    api.reply("ok")
+    p = api.run(tmp_path, *FAMILY, "-m", "test/model", "-p", "go")
+    assert p.returncode == 0, p.stderr
+    assert mock.requests[3]["body"]["max_tokens"] == 32000  # capped below the model's maximum
+
+
+def test_budget_cost_limit(mock, tmp_path):
+    api = Api(mock, "openrouter")
+    mock.replies.append(model_list(5000))
+    p = api.run(tmp_path, *FAMILY, "--budget-cost", "0.01", "-m", "test/model", "-p", "go")
+    assert p.returncode == 1 and "the family's cost budget of $0.01 is spent" in p.stderr
+    assert len(mock.requests) == 1  # the model list; no chat request
+
+
+def test_family_keep_leaves_the_files(mock, tmp_path):
+    api = Api(mock, "local")
+    api.reply("ok")
+    p = api.run(tmp_path, *FAMILY, "-p", "go", env={"MYRA_KEEP_FAMILY": "1"})
+    assert p.returncode == 0, p.stderr
+    [d] = family_dirs(tmp_path)
+    root = json.loads((d / "registry.json").read_text())["members"][0]
+    assert root["name"] == "root" and root["ended_at"] is not None
+    api.reply("ok")
+    assert api.run(tmp_path, *FAMILY, "-p", "go").returncode == 0
+    assert not family_dirs(tmp_path)  # the next root removed it, and its own

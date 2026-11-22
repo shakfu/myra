@@ -95,8 +95,10 @@ static void take_lines(void) {
 /* Read what stdin has; wait for it when block is set. */
 static void fill(int block) {
     if (in.eof) return;
+    if (myra_terminated) { in.eof = 1; return; } /* SIGTERM: end as at EOF */
     struct pollfd p = {.fd = STDIN_FILENO, .events = POLLIN};
-    if (poll(&p, 1, block ? -1 : 0) != 1) return;
+    /* a second at a time, so a signal just before poll is seen soon after */
+    if (poll(&p, 1, block ? 1000 : 0) != 1) return;
     char buf[65536];
     ssize_t k = read(STDIN_FILENO, buf, sizeof buf);
     if (k < 0 && errno == EINTR) return;

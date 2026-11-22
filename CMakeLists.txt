@@ -60,7 +60,7 @@ target_compile_definitions(myralib PUBLIC _DEFAULT_SOURCE _DARWIN_C_SOURCE
 target_compile_options(myralib PRIVATE ${WARNINGS})
 target_link_libraries(myralib PUBLIC cjson CURL::libcurl)
 
-add_executable(myra src/main.c src/acp.c)
+add_executable(myra src/main.c src/acp.c src/family.c)
 target_compile_options(myra PRIVATE ${WARNINGS})
 target_link_libraries(myra PRIVATE myralib linenoise)
 

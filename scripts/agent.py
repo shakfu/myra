@@ -16,7 +16,6 @@ import http.client
 import json
 import math
 import os
-import re
 import select
 import shlex
 import signal
@@ -2123,9 +2122,8 @@ class AcpServer:
                         return self.queue.pop(i)
                 if self.eof or terminated:
                     return None
-                with interruptible():
-                    with suppress(KeyboardInterrupt):  # SIGTERM, or Ctrl-C: rechecked above
-                        self.cond.wait()
+                with interruptible(), suppress(KeyboardInterrupt):  # SIGTERM, or Ctrl-C: rechecked above
+                    self.cond.wait()
 
     def call(self, method: str, params: dict) -> dict | None:
         """Send a request to the client and wait for its response; None at EOF."""
@@ -2911,7 +2909,7 @@ def family_agents(argv: list[str]) -> int:
         status = ("running" if running(m) else "exited" if answer is None
                   else "failed" if answer.startswith("failed: ")
                   else "cancelled" if answer == "cancelled" else "done")
-        print(f"{str(m.get('name', '?')):<32} {role:<7} {status:<9} {str(m.get('model', '?')):<24} {mid}")
+        print(f"{m.get('name', '?')!s:<32} {role:<7} {status:<9} {m.get('model', '?')!s:<24} {mid}")
     return 0
 
 

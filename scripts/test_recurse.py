@@ -32,6 +32,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.abspath(os.environ.get("BIN", os.path.join(ROOT, "build", "myra")))
@@ -147,7 +148,7 @@ def main():
     print(f"scenario: {SCENARIO}, budget: {BUDGET} tokens\n")
     try:
         out = subprocess.run(cmd, cwd=root, env=env, capture_output=True, text=True,
-                             timeout=TIMEOUT)
+                             timeout=TIMEOUT, check=False)
     except subprocess.TimeoutExpired:
         sys.exit(f"error: the root ran past {TIMEOUT}s; see {run}")
     with open(os.path.join(run, "root.log"), "w") as f:
@@ -193,7 +194,7 @@ def main():
 
     for m in children:
         path = os.path.join(family, f"{m['id']}.answer")
-        got = open(path).read().strip() if os.path.exists(path) else None
+        got = Path(path).read_text().strip() if os.path.exists(path) else None
         check(got is not None, f"child {m['name']} wrote an answer")
         print(f"      {m['name']} ({m['model']}, {m['permissions']}): {got!r}")
         check(os.path.exists(os.path.join(sessions, f"{m['id']}.json")),

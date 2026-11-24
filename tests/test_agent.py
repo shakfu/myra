@@ -2799,7 +2799,7 @@ def test_family_grandchild(mock, tmp_path):
     out = Api.results(root[1])["s"][0]
     assert out.endswith("a says 7\n[exit 0]")  # no note: wait printed the answer
     assert Api.results(a[1])["s"][0].endswith("7\n[exit 0]")
-    assert 'started by "a"' in [r for r in mock.requests if r["agent"] == "b"][0][
+    assert 'started by "a"' in next(r for r in mock.requests if r["agent"] == "b")[
         "body"]["messages"][0]["content"]
 
 
@@ -2873,7 +2873,7 @@ def test_family_spawn_refused_under_ask(mock, tmp_path):
          "model": "local", "permissions": "ask", "started_at": 0, "ended_at": None}]}))
     p = subprocess.run([str(AGENT), "-r", "spawn", "--name", "c", "--", "go"], cwd=tmp_path,
                        env={**api.env(tmp_path), "MYRA_FAMILY": "1-1", "MYRA_SELF": "1-1"},
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, timeout=10, check=False)
     assert p.returncode == 1
     assert "refused under --permissions ask" in p.stderr
 
@@ -2882,7 +2882,7 @@ def test_family_commands_outside_a_family(mock, tmp_path):
     api = Api(mock, "local")
     for cmd in (["agents"], ["wait", "x"], ["spawn", "--name", "x", "--", "go"], ["shutdown"]):
         p = subprocess.run([str(AGENT), "-r", *cmd], cwd=tmp_path, env=api.env(tmp_path),
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10, check=False)
         assert p.returncode == 1 and "not in a family" in p.stderr, cmd
 
 
@@ -2890,7 +2890,7 @@ def test_family_child_needs_prompt(mock, tmp_path):
     api = Api(mock, "local")
     p = subprocess.run([str(AGENT), "-P", "local", "-r"], cwd=tmp_path, input="",
                        env={**api.env(tmp_path), "MYRA_ID": "1-2", "MYRA_FAMILY": "1-1"},
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, timeout=10, check=False)
     assert p.returncode == 1 and "runs headless" in p.stderr
 
 

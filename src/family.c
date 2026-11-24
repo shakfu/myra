@@ -445,7 +445,8 @@ static void prune_families(void) {
     for (struct dirent *e; (e = readdir(d));) {
         if (!valid_id(e->d_name)) continue;
         char dir[PATH_MAX];
-        snprintf(dir, sizeof dir, "%s%s", base, e->d_name);
+        int n = snprintf(dir, sizeof dir, "%s%s", base, e->d_name);
+        if (n < 0 || (size_t)n >= sizeof dir) continue;  /* truncated: would prune the wrong dir */
         cJSON *r = load_registry(dir);
         cJSON *root = member(r, e->d_name);
         if (r && (!root || !running(root))) {

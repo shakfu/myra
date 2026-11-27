@@ -998,7 +998,7 @@ static int host(int argc, char **argv) {
             fflush(stdout);
             continue;
         }
-        char id[64]; /* the family id and a count: unique, though every add has this pid */
+        char id[sizeof me.fid + 12]; /* fid, '-', an int: unique, though every add has this pid */
         snprintf(id, sizeof id, "%s-%d", me.fid, ++added);
         int fd = lock_family(me.dir);
         cJSON *r = fd < 0 ? NULL : load_registry(me.dir);

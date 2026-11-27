@@ -1052,6 +1052,7 @@ static int run_plan(const char *argv0, const char *path, size_t jobs, int json) 
     free(tasks);
     free_task(&combine);
     free_plan(&p);
+    the_plan = NULL; /* p dies on return */
     return atomic_load(&stopping) ? 130 : failed;
 }
 

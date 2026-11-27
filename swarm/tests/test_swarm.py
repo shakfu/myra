@@ -102,15 +102,17 @@ def test_finishing_agent_leaves_siblings_jobs(swarm, tmp_path):
 
 @pytest.mark.xfail(strict=True, reason="phase 3: shell children inherit every open fd")
 def test_shell_child_inherits_no_sibling_fds(swarm):
-    # b's request holds a socket open while a's shell starts. The probe opens nothing
-    # itself; bash still shows a descriptor of its own, so a bare sh run sets the baseline.
+    # b's shell pipe is open while a's probe runs; libcurl 8.18 sets FD_CLOEXEC on its
+    # sockets, so only the pipe leaks there. b ends first: a's myra_free would kill its sleep.
+    # The probe opens nothing itself; bash still shows a descriptor of its own, so a bare sh
+    # run sets the baseline.
     probe = ("exec 2>/dev/null; fd=3; while [ $fd -lt 64 ]; do (exec <&$fd) && echo open $fd; "
              "fd=$((fd+1)); done")
     baseline = subprocess.run(["/bin/sh", "-c", probe], capture_output=True, text=True,
                               check=False).stdout.split("\n")
     a, b = swarm([
-        {"prompt": prompt(say="a", delay=0.3, calls=[["shell", {"command": probe}]])},
-        {"prompt": prompt(say="b", delay=1.5)},
+        {"prompt": prompt(say="a", delay=1.0, calls=[["shell", {"command": probe}]])},
+        {"prompt": prompt(say="b", calls=[["shell", {"command": "sleep 1.5"}]])},
     ])
     assert a["ok"] and b["ok"], (a, b)
     opened = [line for line in a["text"].split("\n") if line.startswith("open ")]

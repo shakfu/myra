@@ -243,6 +243,7 @@ void myra_kill_jobs(void) {
 static char *tool_shell(const char *cmd, int timeout, size_t cap, int *err) {
     int fds[2];
     if (pipe(fds) < 0) { *err = 1; return myra__fmt("pipe failed: %s", strerror(errno)); }
+    long max_fd = sysconf(_SC_OPEN_MAX);
     pid_t pid = fork();
     if (pid < 0) {
         close(fds[0]);
@@ -259,6 +260,7 @@ static char *tool_shell(const char *cmd, int timeout, size_t cap, int *err) {
         close(fds[0]);
         close(fds[1]);
         if (nul >= 0) close(nul);
+        close_from_3(max_fd);
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }

@@ -339,6 +339,7 @@ static int start(myra_agent *a, const char *name, const char *command, char *con
     buf_lit(&failed, ": cannot run ");
     buf_add(&failed, command, strlen(command));
     buf_lit(&failed, ": ");
+    long max_fd = sysconf(_SC_OPEN_MAX);
 
     int to[2], from[2];
     pid_t pid = -1;
@@ -353,6 +354,7 @@ static int start(myra_agent *a, const char *name, const char *command, char *con
         dup2(to[0], 0);
         dup2(from[1], 1);
         close(to[0]), close(to[1]), close(from[0]), close(from[1]);
+        close_from_3(max_fd);
         environ = envp;
         execvp(command, argv);
         const char *why = strerror(errno);

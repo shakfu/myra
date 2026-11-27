@@ -100,10 +100,9 @@ def test_finishing_agent_leaves_siblings_jobs(swarm, tmp_path):
     assert long["ok"] and (tmp_path / "alive").exists(), long
 
 
-@pytest.mark.xfail(strict=True, reason="phase 3: shell children inherit every open fd")
 def test_shell_child_inherits_no_sibling_fds(swarm):
-    # b's shell pipe is open while a's probe runs; libcurl 8.18 sets FD_CLOEXEC on its
-    # sockets, so only the pipe leaks there. b ends first: a's myra_free would kill its sleep.
+    # b's shell pipe, and before libcurl 8.18 its socket, are open while a's probe runs.
+    # b ends first: a's myra_free would kill its sleep.
     # The probe opens nothing itself; bash still shows a descriptor of its own, so a bare sh
     # run sets the baseline.
     probe = ("exec 2>/dev/null; fd=3; while [ $fd -lt 64 ]; do (exec <&$fd) && echo open $fd; "

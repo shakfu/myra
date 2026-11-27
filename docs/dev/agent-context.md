@@ -20,10 +20,7 @@ With two agents in one process:
 | `myra_last_error` | `lib/agent.c:23` | Agent B's error overwrites A's before A's thread reads it: 14 of 2,560 agents failing at once |
 | Process cwd | `myra__absolute` (`lib/text.c:42`), `myra__outside_cwd` (`lib/agent.c:46`), `myra_set_cwd`, session load/save (`lib/state.c:106`, `:129`), `shell` and MCP children | One cwd for all agents. `chdir` in ACP `session/new` (`cli/acp.c:343`) and `myra-ui` (`ui/main.c:55`) moves every agent |
 | `jobs` | `lib/tools.c:204` | `myra_free` on one agent SIGTERMs every agent's process groups: background jobs, and also `shell` calls still running (`[exit 143]`). A mutex guards the list since 2026-11-27; before it, `add_job` could corrupt the heap |
-| `shell` pipe without `FD_CLOEXEC` | `lib/tools.c:239` | Agent B forks while A's `shell` runs, so B's child inherits A's write end. A reads until EOF, so it waits until B's child exits or A's timeout fires (120 s by default). Measured: `echo` calls held 0.56-0.68 s by a sibling's `sleep 1` |
-| Every open fd reaches `shell` children | `tool_shell`, `start` in `mcp.c` | A `shell` child inherits siblings' curl sockets and `shell` pipes, so model-chosen commands can write to or hold another agent's API connection. Seen on macOS; curl's sockets on Linux are unchecked |
 | cJSON's `global_error` | `vendor/cjson/cJSON.c:92`, written by every parse (`:1148`) | A data race whenever two agents parse at once. ThreadSanitizer reports it on every run |
-| MCP pipes get `FD_CLOEXEC` only after `fork` | `lib/mcp.c:370` | Same leak, in the window between `pipe` and `fcntl` |
 | MCP child calls `strerror` and `execvp` | `lib/mcp.c:357-358` | Neither is on POSIX's async-signal-safe list. After `fork` in a threaded process, the child may only call functions on that list ([fork](https://pubs.opengroup.org/onlinepubs/9799919799/functions/fork.html)) |
 | `sigaction(SIGPIPE)` save and restore | `lib/mcp.c:83-96` | Swaps a process-wide disposition, so it races with other threads and with the host |
 | curl signals | no `CURLOPT_NOSIGNAL` | libcurl requires `CURLOPT_NOSIGNAL` in threaded programs ([threadsafe](https://curl.se/libcurl/c/threadsafe.html)) |
@@ -110,6 +107,7 @@ Each phase passes `make test`, `make asan` and `make test-ui` alone.
    - Until phase 3, `shell` and MCP children still use the process cwd, so the child does a `chdir(a->cwd)` (async-signal-safe).
 3. **Children.**
    - Switch to `posix_spawn` as above, with a per-agent `jobs` list.
+   - Since 2026-11-27, `shell` and MCP children close fds 3 and up after `fork` (`close_from_3` in `lib/util.h`), so they inherit no sibling's sockets or pipes. `posix_spawn` replaces it.
    - Drop the `SIGPIPE` save and restore in `mcp.c`. The CLI sets `SIG_IGN`.
 4. **curl.** Set `CURLOPT_NOSIGNAL`, run init through `pthread_once`, and read `base_url` and `retry_delay_ms` once in `myra_init`.
 
@@ -129,7 +127,7 @@ Phase 1 alone fixes the shared stop button and lets `myra-ui` drop `the_app`. Ph
 | `each_agent_has_its_own_cwd` | fails: both files land in one directory | 2 | strict |
 | `finishing_agent_leaves_siblings_running_call` | fails: `[exit 143]` | 3 | strict |
 | `finishing_agent_leaves_siblings_jobs` | fails: the background job is killed | 3 | strict |
-| `shell_child_inherits_no_sibling_fds` | fails: a sibling's socket is open in the child. The probe duplicates fds 3-63 and compares with a bare `/bin/sh` run, since bash shows a descriptor of its own; an earlier `ls /dev/fd` version failed on macOS even without a leak | 3 | strict |
+| `shell_child_inherits_no_sibling_fds`: a sibling's `shell` runs during the probe | passes. The probe duplicates fds 3-63 and compares with a bare `/bin/sh` run, since bash shows a descriptor of its own; an earlier `ls /dev/fd` version failed on macOS even without a leak | 3 | - |
 
 Strict tests were stable in 8 of 8 runs on macOS, 2026-11-27. The baseline passes only because it avoids `shell`. With `shell`, a finishing agent killed a sibling's `cat` in 2 of 3 runs.
 

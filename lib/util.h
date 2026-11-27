@@ -9,6 +9,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 /* ---- growable buffer ---- */
 
@@ -46,6 +49,15 @@ static inline int slurp(const char *path, buf *b) {
     fclose(f);
     if (!b->p) buf_lit(b, "");
     return err ? -1 : 0;
+}
+
+/* In a child between fork and exec: close fds 3 and up, so it gets no sibling agent's
+   sockets or pipes. max is sysconf(_SC_OPEN_MAX), read before fork: sysconf may lock. */
+static inline void close_from_3(long max) {
+#ifdef SYS_close_range
+    if (syscall(SYS_close_range, 3U, ~0U, 0U) == 0) return; /* Linux 5.9+; else loop */
+#endif
+    for (long fd = 3; fd < max; fd++) close((int)fd);
 }
 
 static inline int write_all(int fd, const char *s, size_t n) {

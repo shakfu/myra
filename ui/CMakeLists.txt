@@ -22,10 +22,16 @@ target_include_directories(transcript PUBLIC .)
 target_compile_options(transcript PRIVATE ${WARNINGS})
 target_link_libraries(transcript PUBLIC Threads::Threads)
 
-add_executable(myra-ui main.c view.c worker.c)
+# The window, on myralib's public API only. Not installed: app.h is not a stable API.
+add_library(myraui STATIC app.c view.c worker.c)
+target_include_directories(myraui PUBLIC .)
+target_compile_options(myraui PRIVATE ${WARNINGS})
+target_link_libraries(myraui PUBLIC cui myralib transcript)
+
+add_executable(myra-ui main.c)
 target_compile_options(myra-ui PRIVATE ${WARNINGS})
-target_link_libraries(myra-ui PRIVATE cui myralib transcript)
-install(TARGETS myra-ui RUNTIME DESTINATION bin)
+target_link_libraries(myra-ui PRIVATE myraui)
+install(TARGETS myra-ui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT bin)
 
 add_executable(ui_transcript tests/test_transcript.c)
 target_compile_options(ui_transcript PRIVATE ${WARNINGS})

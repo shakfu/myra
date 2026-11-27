@@ -1,8 +1,9 @@
-/* myra.h - myralib: providers, the four tools, and the chat-completions tool loop. */
+/* myra.h - myralib, installed as libmyra: providers, pluggable tools with the coding
+   agent's four, and the chat-completions tool loop. */
 #ifndef MYRA_H
 #define MYRA_H
 
-#include <cJSON.h>
+#include "cJSON.h" /* quoted: installed beside this header */
 #include <signal.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -35,54 +36,17 @@ void myra_kill_jobs(void);
    read its input and set myra_interrupted. NULL: none. */
 extern void (*myra_poll)(void);
 
-/* Color stderr messages with ANSI codes. The CLI sets it for a terminal. */
-extern int myra_color;
 typedef enum { MYRA_PLAIN, MYRA_TOOL, MYRA_ERROR, MYRA_WARN, MYRA_DIM, MYRA_BOLD } myra_style;
-/* fprintf to stderr, colored by style when myra_color is set. */
+/* Format a note (progress, warnings, errors) and pass it to myra_note_hook. Without a
+   hook it is dropped; an error is still kept in myra_last_error. libmyra-term's hook
+   prints notes on stderr (myra/term.h). */
 void myra_note(myra_style style, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-/* When set, myra_note passes each formatted, unescaped note here instead of stderr.
-   For a front end without a terminal; it may be called from the agent's thread. */
+/* Receives each formatted, unescaped note. It may be called from the agent's thread. */
 extern void (*myra_note_hook)(myra_style style, const char *text);
 /* The text of the last MYRA_ERROR note, trailing newline dropped; "" if none. */
 extern char myra_last_error[1024];
 /* s with each invalid UTF-8 byte replaced by U+FFFD; malloc'd. */
 char *myra_utf8(const char *s);
-
-/* Show control characters in caret notation on stdout and stderr, so model and tool
-   output cannot drive the terminal. The CLI sets each when that stream is a terminal.
-   The permission prompt always escapes. */
-extern int myra_escape_out, myra_escape_err;
-
-typedef struct {
-    int cr; /* a held '\r', dropped if '\n' follows */
-} myra_esc;
-/* s with C0 controls, DEL and C1 as ^X, ^? and M-^X; malloc'd. nl: '\n', '\t' and '\r'
-   too. With state e, a trailing '\r' is held for the next call, and s NULL flushes it;
-   with e NULL, s is complete. s must hold whole UTF-8 characters. */
-char *myra_escape(myra_esc *e, const char *s, int nl);
-
-/* Render replies as markdown with ANSI styles. The CLI sets it when stdout is a
-   terminal, unless --raw or NO_COLOR. */
-extern int myra_markdown;
-
-/* Streaming markdown renderer: headings, bold, italic, inline code, fenced code,
-   bullets, quotes and rules. Zero it before first use. */
-typedef struct {
-    char line[256];      /* the start of a line, held until its block kind is known */
-    size_t n;
-    int mid;             /* past the start of the line */
-    int block;           /* the current line's kind */
-    char fence;          /* inside a code block opened by fence_n of this character */
-    size_t fence_n;
-    int em, code;        /* open emphasis (bold, italic) and inline code */
-    char pend, prev;     /* pend: a held '*', '_' or '\\' run; prev: last character */
-    int pend_n;
-    int style;           /* the SGR styles set on out */
-} myra_md;
-/* Render s, holding back what the next characters decide. */
-void myra_md_feed(myra_md *m, const char *s, FILE *out);
-/* Flush what is held, end a started line, and zero m. */
-void myra_md_end(myra_md *m, FILE *out);
 
 /* Token counts and cost, as the server reports them. */
 typedef struct {
@@ -109,11 +73,12 @@ typedef struct {
 extern const myra_provider MYRA_PROVIDERS[];
 extern const size_t MYRA_NPROVIDERS;
 
-/* Hooks that replace the terminal and the local filesystem, for a front end that
-   owns both (ACP mode). A NULL member keeps the default behaviour. */
+/* How a front end sees and steers a turn, and file access it may serve itself (ACP
+   mode). A NULL member keeps the default: output is dropped, files are local. */
 typedef struct {
     void *ud;
-    void (*text)(void *ud, const char *s); /* reply text, as it streams */
+    void (*text)(void *ud, const char *s); /* reply text, as it streams; NULL: dropped */
+    void (*text_end)(void *ud);            /* the reply text that text received is complete */
     /* A tool call starts; pending: it waits for allow before it runs. input is the
        call's parsed arguments, valid only during the call. */
     void (*tool)(void *ud, const char *name, const char *detail, const cJSON *input, int pending);
@@ -123,7 +88,8 @@ typedef struct {
     char *(*read)(void *ud, const char *path, char **why);
     /* Write content to absolute path: NULL on success, else why, malloc'd. */
     char *(*write)(void *ud, const char *path, const char *content);
-    /* Whether a mutating tool may run, asked where --permissions would ask. 1 allows. */
+    /* Whether a mutating tool may run, asked where --permissions would ask. 1 allows,
+       0 denies, -1: no one can answer. NULL: denied, as for -1. */
     int (*allow)(void *ud, const char *name, const char *detail, int outside);
     /* Reasoning text, as it streams: the reasoning or reasoning_content delta. */
     void (*reasoning)(void *ud, const char *s);
@@ -131,6 +97,28 @@ typedef struct {
 
 typedef struct myra_mcp myra_mcp; /* mcp.h */
 typedef struct myra_agent myra_agent;
+
+/* How a tool's calls are confined, which decides when --permissions asks. */
+typedef enum {
+    MYRA_TOOL_READS,  /* changes nothing: never asks, runs under read-only */
+    MYRA_TOOL_WRITES, /* changes the file its string argument "path" names: asks per
+                         permissions, and auto asks outside the working directory */
+    MYRA_TOOL_RUNS,   /* may change anything, as shell: asks per permissions, as if inside */
+} myra_tool_access;
+
+/* A tool the model can call. The strings are not copied: they must outlive the agent. */
+typedef struct myra_tool {
+    const char *name, *description;
+    const char *parameters; /* JSON Schema of its arguments: an object */
+    const char *detail;     /* the string argument shown for a call; NULL: all, as JSON */
+    myra_tool_access access;
+    /* Run a call whose required arguments are present with their schema's type, once
+       permission is granted. A malloc'd result; *err is 1 on entry, 0 for success. */
+    char *(*run)(myra_agent *a, const struct myra_tool *t, cJSON *input, int *err);
+    void *ud;
+} myra_tool;
+
+typedef struct myra_tool_entry myra_tool_entry; /* a registered tool */
 
 /* Set by a front end that makes the agent a member of a family of agents (the CLI's
    -r). A NULL member: none. */
@@ -166,8 +154,13 @@ struct myra_agent {
     myra_io io;
     myra_family_hooks family;
     myra_mcp *mcp;       /* running MCP servers, newest first */
+    /* The system prompt; "{cwd}" becomes the working directory. Not owned. NULL: none,
+       besides the family's. myra_add_coding_tools sets the coding agent's. */
+    const char *system;
+    myra_tool_entry *registry; /* tools offered, in order */
+    size_t ntools;
     char session_id[64]; /* the saved session this conversation is, "" if none */
-    cJSON *tools, *messages;
+    cJSON *tools, *messages; /* tools: registered tools and MCP tools, as sent */
 };
 
 const myra_provider *myra_provider_named(const char *name);
@@ -175,8 +168,15 @@ const myra_provider *myra_provider_named(const char *name);
    first cloud provider whose key is set, else NULL. */
 const myra_provider *myra_provider_default(void);
 
-/* model NULL means the remembered one, else the provider default. -1 if the key is unset. */
+/* model NULL means the remembered one, else the provider default. -1 if the key is unset.
+   The agent has no tools: add them with myra_add_tool or myra_add_coding_tools. */
 int myra_init(myra_agent *a, const myra_provider *p, const char *model, myra_permissions perms);
+
+/* Offer t to the model. -1 with an error note if it has no name or run, its name is
+   taken, or its parameters are not a JSON object. */
+int myra_add_tool(myra_agent *a, const myra_tool *t);
+/* The coding agent: read, write, edit and shell, and its system prompt. */
+void myra_add_coding_tools(myra_agent *a);
 void myra_free(myra_agent *a);
 
 /* Run one user turn. -1 on failure, with history rolled back to before the turn. */
@@ -193,8 +193,6 @@ void myra_report_session(myra_agent *a);
 long myra_context_window(myra_agent *a);
 /* The model's entry in the provider's /models list, a copy; NULL if none. Fetches. */
 cJSON *myra_model_entry(myra_agent *a);
-/* Print the provider's model ids that contain filter, ignoring case; the current one is starred. */
-void myra_list_models(myra_agent *a, const char *filter);
 
 /* The provider's model ids, NULL-terminated; NULL if the request failed. Fetches. */
 char **myra_model_ids(myra_agent *a);
@@ -217,7 +215,7 @@ int myra_session_save(myra_agent *a);
 
 /* Consume one chat-completions response: -1 failed, 0 done, 1 tools ran. */
 int myra_step(myra_agent *a, cJSON *resp);
-/* Returns a malloc'd result; *err is set on failure. */
+/* Run a registered or MCP tool. Returns a malloc'd result; *err is set on failure. */
 char *myra_run_tool(myra_agent *a, const char *name, cJSON *input, int *err);
 /* $XDG_STATE_HOME/myra/<name>, default ~/.local/state/myra/<name>; NULL without either
    variable. make_dir creates the parent directory. */
@@ -225,7 +223,5 @@ char *myra_state_path(const char *name, int make_dir);
 /* Read and write that file's first line. */
 char *myra_load_state(const char *name);
 void myra_store_state(const char *name, const char *value);
-/* If line is "name" or "name args", return args with leading spaces skipped; else NULL. */
-const char *myra_command(const char *line, const char *name);
 
 #endif

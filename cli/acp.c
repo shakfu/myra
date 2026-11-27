@@ -6,7 +6,7 @@
    One thread: while a turn runs, myra_poll drains stdin, so session/cancel is seen
    during a model request or shell command; other messages wait in a queue. */
 #include "acp.h"
-#include "mcp.h"
+#include "myra/mcp.h"
 
 #include <errno.h>
 #include <poll.h>

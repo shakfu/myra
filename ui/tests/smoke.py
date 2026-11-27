@@ -11,6 +11,12 @@ import tempfile
 from pathlib import Path
 
 ui = sys.argv[1]
+# A failed myra_init comes before any window, and must still say why.
+env = {k: v for k, v in os.environ.items() if k != "OPENROUTER_API_KEY"}
+p = subprocess.run([ui, "-P", "openrouter"], env=env, capture_output=True, text=True,
+                   timeout=10, check=False)
+assert p.returncode == 1 and "OPENROUTER_API_KEY" in p.stderr, (p.returncode, p.stderr)
+
 if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
     sys.exit(77)
 

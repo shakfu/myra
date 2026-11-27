@@ -1,11 +1,12 @@
 /* unit.c - myralib unit tests. Usage: unit NAME. Each case runs in a fresh temp dir. */
-#include "myra.h"
+#include "myra/term.h"
 
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -27,7 +28,11 @@
 
 static myra_agent A;
 
-static int local_agent(void) { return myra_init(&A, myra_provider_named("local"), NULL, MYRA_AUTO); }
+static int local_agent(void) {
+    if (myra_init(&A, myra_provider_named("local"), NULL, MYRA_AUTO) < 0) return -1;
+    myra_add_coding_tools(&A);
+    return 0;
+}
 
 static void put(const char *path, const char *s) {
     FILE *f = fopen(path, "wb");
@@ -885,7 +890,7 @@ static int serve_once(const char *sse, pid_t *child) {
     if (s < 0 || bind(s, (struct sockaddr *)&sa, sizeof sa) < 0 || listen(s, 1) < 0 ||
         getsockname(s, (struct sockaddr *)&sa, &len) < 0)
         return -1;
-    if ((*child = fork()) == 0) {
+    if ((*child = fork()) == 0) { /* the request is left in ./request */
         int c = accept(s, NULL, NULL);
         char req[65536];
         size_t n = 0;
@@ -896,6 +901,7 @@ static int serve_once(const char *sse, pid_t *child) {
             char *end = strstr(req, "\r\n\r\n"), *cl = strstr(req, "Content-Length:"); /* curl's spelling */
             if (end && cl && n >= (size_t)(end + 4 - req) + (size_t)atol(cl + 15)) break;
         }
+        put("request", req);
         const char *head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                            "Connection: close\r\n\r\n";
         if (write(c, head, strlen(head)) < 0 || write(c, sse, strlen(sse)) < 0) _exit(1);
@@ -929,6 +935,263 @@ TEST(reasoning_hook_streams_both_fields) {
     waitpid(child, &st, 0);
     CHECK(rc == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0);
     CHECK(!strcmp(thought, "think hard") && !strcmp(said, "done"));
+    return 0;
+}
+
+/* ---- the core prints nothing; libmyra-term prints ---- */
+
+/* Point fd at a fresh file; restore with unredirect, which returns what was written. */
+static int redirect(int fd, const char *path) {
+    fflush(NULL);
+    int saved = dup(fd), f = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    dup2(f, fd);
+    close(f);
+    return saved;
+}
+
+static char *unredirect(int fd, int saved, const char *path) {
+    fflush(NULL);
+    dup2(saved, fd);
+    close(saved);
+    return get(path);
+}
+
+TEST(core_prints_nothing_without_hooks) {
+    int out = redirect(STDOUT_FILENO, "out"), err = redirect(STDERR_FILENO, "err");
+    myra_note(MYRA_ERROR, "failed %d\n", 8);
+    int rc = step("{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},"
+                  "\"finish_reason\":\"stop\"}]}");
+    CHECK(!strcmp(unredirect(STDERR_FILENO, err, "err"), ""));
+    CHECK(!strcmp(unredirect(STDOUT_FILENO, out, "out"), ""));
+    CHECK(rc == 0 && !strcmp(myra_last_error, "failed 8")); /* still recorded */
+    return 0;
+}
+
+static int text_ends;
+static void count_end(void *ud) { (void)ud, text_ends++; }
+
+TEST(text_end_follows_a_reply) {
+    A.io.text = capture_text;
+    A.io.text_end = count_end;
+    CHECK(step("{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"one\"},"
+               "\"finish_reason\":\"stop\"}]}") == 0);
+    CHECK(text_ends == 1 && !strcmp(said, "one"));
+    CHECK(step("{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"\"},"
+               "\"finish_reason\":\"stop\"}]}") == 0);
+    CHECK(text_ends == 1); /* no text, no end */
+    pid_t child;
+    int port = serve_once("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"two\"}}]}\n\n"
+                          "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                          "data: [DONE]\n\n", &child);
+    CHECK(port > 0);
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/v1", port);
+    setenv("LOCAL_BASE_URL", url, 1);
+    int rc = myra_ask(&A, "hi");
+    waitpid(child, NULL, 0);
+    CHECK(rc == 0 && text_ends == 2 && !strcmp(said, "onetwo")); /* once, after the stream */
+    return 0;
+}
+
+static int answer;
+static int answer_allow(void *ud, const char *name, const char *detail, int outside) {
+    (void)ud, (void)name, (void)detail, (void)outside;
+    return answer;
+}
+
+TEST(allow_answers) {
+    A.permissions = MYRA_ASK;
+    A.io.allow = answer_allow;
+    int err;
+    const char *want[] = {"denied: no terminal to confirm; --permissions auto skips asking",
+                          "denied by user", "wrote f"};
+    for (answer = -1; answer <= 1; answer++) {
+        char *out = tool("write", "{\"path\":\"f\",\"content\":\"x\"}", &err);
+        CHECK(!strcmp(out, want[answer + 1]) && err == (answer < 1));
+        free(out);
+    }
+    return 0;
+}
+
+TEST(term_cuts_tool_lines_off_a_terminal) {
+    static myra_term t; /* zero: plain, unescaped, one line per call */
+    myra_term_notes(&t);
+    char detail[300];
+    memset(detail, 'x', sizeof detail - 1);
+    detail[sizeof detail - 1] = 0;
+    int err = redirect(STDERR_FILENO, "err");
+    myra_note(MYRA_TOOL, "[tool] shell %s\n", detail);
+    myra_note(MYRA_TOOL, "[tool] shell short ...\n");
+    myra_note(MYRA_PLAIN, "%s\n", detail); /* only tool lines are cut */
+    t.verbose = 1;
+    myra_note(MYRA_TOOL, "[tool] shell %s\n", detail);
+    char *got = unredirect(STDERR_FILENO, err, "err");
+    myra_note_hook = NULL;
+    char *nl = strchr(got, '\n');
+    CHECK(nl && nl - got == 100 && !memcmp(nl - 4, " ...", 4)); /* 100: no terminal width */
+    CHECK(!strncmp(nl + 1, "[tool] shell short ...\n", 23));
+    CHECK(strlen(got) == 100 + 1 + 23 + 300 + 313); /* the rest in full */
+    return 0;
+}
+
+/* ---- pluggable tools ---- */
+
+/* The coding tools as myra sent them before tools were pluggable: the same bytes. */
+static const char *CODING_TOOLS_JSON =
+    "[{\"type\":\"function\",\"function\":{\"name\":\"read\","
+    "\"description\":\"Read a text file and return its contents.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},"
+    "\"required\":[\"path\"],\"additionalProperties\":false}}},"
+    "{\"type\":\"function\",\"function\":{\"name\":\"write\","
+    "\"description\":\"Create or overwrite a file with the given content.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
+    "\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],"
+    "\"additionalProperties\":false}}},"
+    "{\"type\":\"function\",\"function\":{\"name\":\"edit\","
+    "\"description\":\"Replace old_string with new_string in a file. "
+    "old_string must occur exactly once.\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+    "\"path\":{\"type\":\"string\"},\"old_string\":{\"type\":\"string\"},"
+    "\"new_string\":{\"type\":\"string\"}},\"required\":[\"path\",\"old_string\",\"new_string\"],"
+    "\"additionalProperties\":false}}},"
+    "{\"type\":\"function\",\"function\":{\"name\":\"shell\","
+    "\"description\":\"Run a command with /bin/sh in the working directory. "
+    "Returns combined stdout and stderr and the exit status. stdin is /dev/null. "
+    "The command and its children are killed after timeout seconds (default 120, max 600). "
+    "Background jobs must redirect their output, or the call waits for them.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},"
+    "\"timeout\":{\"type\":\"integer\"}},"
+    "\"required\":[\"command\"],\"additionalProperties\":false}}}]";
+
+TEST(coding_tools_are_sent_unchanged) {
+    char *json = cJSON_PrintUnformatted(A.tools);
+    cJSON *want = cJSON_Parse(CODING_TOOLS_JSON);
+    char *want_json = cJSON_PrintUnformatted(want);
+    int same = !strcmp(json, want_json);
+    free(json), free(want_json);
+    cJSON_Delete(want);
+    CHECK(same);
+    return 0;
+}
+
+static int echo_runs;
+static char *run_echo(myra_agent *a, const myra_tool *t, cJSON *input, int *err) {
+    (void)a;
+    echo_runs++;
+    *err = 0;
+    char out[256];
+    snprintf(out, sizeof out, "%s:%s:%s", (const char *)t->ud, t->name,
+             cJSON_GetStringValue(cJSON_GetObjectItem(input, "text")));
+    return strdup(out);
+}
+
+static const myra_tool ECHO = {
+    "echo", "Say text back.",
+    "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},"
+    "\"times\":{\"type\":\"integer\"}},\"required\":[\"text\",\"times\"]}",
+    "text", MYRA_TOOL_READS, run_echo, "ud"};
+
+TEST(an_added_tool_is_offered_and_runs) {
+    CHECK(myra_add_tool(&A, &ECHO) == 0);
+    cJSON *fn = cJSON_GetObjectItem(cJSON_GetArrayItem(A.tools, 4), "function");
+    CHECK(!strcmp(field(fn, "name"), "echo") && !strcmp(field(fn, "description"), "Say text back."));
+    CHECK(cJSON_IsObject(cJSON_GetObjectItem(fn, "parameters")));
+    A.io.tool = capture_tool;
+    int err;
+    char *out = tool("echo", "{\"text\":\"hi\",\"times\":2}", &err);
+    CHECK(!err && !strcmp(out, "ud:echo:hi") && echo_runs == 1);
+    CHECK(!strncmp(hooked, "echo|hi|", 8)); /* detail is the text argument */
+    free(out);
+    return 0;
+}
+
+TEST(tool_arguments_are_checked_before_it_runs) {
+    CHECK(myra_add_tool(&A, &ECHO) == 0);
+    const char *bad[] = {"{\"text\":\"hi\"}", "{\"text\":3,\"times\":2}",
+                         "{\"text\":\"hi\",\"times\":\"2\"}", "{\"text\":\"hi\",\"times\":2.5}",
+                         "[]"};
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        int err;
+        char *out = tool("echo", bad[i], &err);
+        CHECK(err && !strcmp(out, "unknown tool or missing arguments: echo"));
+        free(out);
+    }
+    CHECK(echo_runs == 0);
+    return 0;
+}
+
+TEST(tools_with_a_taken_name_or_bad_schema_are_refused) {
+    myra_tool dup = ECHO, bad = ECHO, unnamed = ECHO, empty = ECHO, norun = ECHO;
+    dup.name = "read";
+    bad.name = "bad", bad.parameters = "[1]";
+    unnamed.name = NULL, empty.name = "", norun.name = "norun", norun.run = NULL;
+    CHECK(myra_add_tool(&A, &dup) == -1 && strstr(myra_last_error, "the name is taken"));
+    CHECK(myra_add_tool(&A, &bad) == -1 && strstr(myra_last_error, "not a JSON object"));
+    CHECK(myra_add_tool(&A, &unnamed) == -1 && strstr(myra_last_error, "(unnamed): it needs"));
+    CHECK(myra_add_tool(&A, &empty) == -1 && strstr(myra_last_error, "(unnamed): it needs"));
+    CHECK(myra_add_tool(&A, &norun) == -1 && strstr(myra_last_error, "norun: it needs"));
+    CHECK(cJSON_GetArraySize(A.tools) == 4 && A.ntools == 4);
+    int err;
+    char *out = tool("bad", "{}", &err);
+    CHECK(err && !strcmp(out, "unknown tool or missing arguments: bad"));
+    free(out);
+    return 0;
+}
+
+TEST(read_only_runs_only_reading_tools) {
+    A.permissions = MYRA_READ_ONLY;
+    CHECK(myra_add_tool(&A, &ECHO) == 0);
+    myra_tool runs = ECHO, writes = ECHO;
+    runs.name = "runner", runs.access = MYRA_TOOL_RUNS;
+    writes.name = "writer", writes.access = MYRA_TOOL_WRITES;
+    CHECK(myra_add_tool(&A, &runs) == 0 && myra_add_tool(&A, &writes) == 0);
+    int err;
+    char *out = tool("echo", "{\"text\":\"x\",\"times\":1}", &err);
+    CHECK(!err && echo_runs == 1);
+    free(out);
+    for (int i = 0; i < 2; i++) {
+        out = tool(i ? "writer" : "runner", "{\"text\":\"x\",\"times\":1}", &err);
+        CHECK(err && !strcmp(out, "denied: the agent runs with --permissions read-only"));
+        free(out);
+    }
+    CHECK(echo_runs == 1);
+    return 0;
+}
+
+TEST(an_agent_without_tools_sends_none) {
+    CHECK(myra_init(&A, myra_provider_named("local"), NULL, MYRA_AUTO) == 0);
+    CHECK(cJSON_GetArraySize(A.tools) == 0 && !strcmp(field(msg(0), "content"), ""));
+    int err;
+    char *out = tool("shell", "{\"command\":\"true\"}", &err);
+    CHECK(err && !strcmp(out, "unknown tool or missing arguments: shell")); /* not offered, not run */
+    free(out);
+    pid_t child;
+    int port = serve_once("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n"
+                          "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                          "data: [DONE]\n\n", &child);
+    CHECK(port > 0);
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/v1", port);
+    setenv("LOCAL_BASE_URL", url, 1);
+    int rc = myra_ask(&A, "hi");
+    waitpid(child, NULL, 0);
+    char *req = get("request");
+    CHECK(rc == 0 && req && strstr(req, "\"messages\"") && !strstr(req, "\"tools\""));
+    return 0;
+}
+
+TEST(system_prompt_takes_the_cwd) {
+    char cwd[4096];
+    CHECK(getcwd(cwd, sizeof cwd));
+    A.system = "Agent in {cwd}, twice: {cwd}";
+    A.family.prompt = "Family.";
+    myra_set_cwd(&A);
+    char want[4300];
+    snprintf(want, sizeof want, "Agent in %s, twice: {cwd}\n\nFamily.", cwd); /* the first only */
+    CHECK(!strcmp(field(msg(0), "content"), want));
+    A.system = NULL;
+    myra_set_cwd(&A);
+    CHECK(!strcmp(field(msg(0), "content"), "Family."));
+    A.family.prompt = NULL;
     return 0;
 }
 
@@ -996,6 +1259,17 @@ static const struct { const char *name; int (*fn)(void); int needs_agent; } TEST
     T(note_hook_replaces_stderr, 0),
     T(tool_hook_receives_input, 1),
     T(reasoning_hook_streams_both_fields, 1),
+    T(core_prints_nothing_without_hooks, 1),
+    T(text_end_follows_a_reply, 1),
+    T(allow_answers, 1),
+    T(term_cuts_tool_lines_off_a_terminal, 0),
+    T(coding_tools_are_sent_unchanged, 1),
+    T(an_added_tool_is_offered_and_runs, 1),
+    T(tool_arguments_are_checked_before_it_runs, 1),
+    T(tools_with_a_taken_name_or_bad_schema_are_refused, 1),
+    T(read_only_runs_only_reading_tools, 1),
+    T(an_agent_without_tools_sends_none, 0),
+    T(system_prompt_takes_the_cwd, 1),
     T(command_parsing, 0),
     T(escape_controls, 0),
     T(markdown_inline, 0),

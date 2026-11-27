@@ -17,7 +17,11 @@ test: all
 	ctest --test-dir $(BUILD) --output-on-failure -j 8
 
 install: all
-	cmake --install $(BUILD) --prefix $(PREFIX) --strip
+	cmake --install $(BUILD) --prefix $(PREFIX) --component bin --strip
+
+# libmyra, its headers and its CMake package, to PREFIX: find_package(myra), link myra::myra.
+install-lib: all
+	cmake --install $(BUILD) --prefix $(PREFIX) --component dev
 
 # Same, in a separate tree with AddressSanitizer and UBSan.
 asan:
@@ -36,17 +40,17 @@ ui:
 install-ui:
 	$(MAKE) install BUILD=build-ui CMAKE_ARGS=-DMYRA_UI=ON LINK=
 
-# clang's static analyzer on our C, and ruff (pinned: new versions add rules) on the Python.
+# clang's static analyzer on our C in lib/, term/, cli/, swarm/ and ui/, and ruff (pinned: new versions add rules) on the Python.
 lint:
-	for f in src/*.c; do \
+	for f in lib/*.c term/*.c cli/*.c swarm/*.c; do \
 	  clang --analyze -Xclang -analyzer-werror -std=c11 -D_DEFAULT_SOURCE -DMYRA_VERSION='""' \
-	    -Isrc -Ivendor/cjson -Ivendor/linenoise/include -o /dev/null $$f || exit 1; \
+	    -Iinclude -Ilib -Ivendor/cjson -Ivendor/linenoise/include -o /dev/null $$f || exit 1; \
 	done
 	for f in ui/*.c; do \
 	  clang --analyze -Xclang -analyzer-werror -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DMYRA_VERSION='""' \
-	    -Isrc -Iui -Ivendor/cjson -Ivendor/cui -o /dev/null $$f || exit 1; \
+	    -Iinclude -Iui -Ivendor/cjson -Ivendor/cui -o /dev/null $$f || exit 1; \
 	done
-	uvx ruff@0.16.8 check scripts tests ui/tests
+	uvx ruff@0.16.8 check scripts tests ui/tests swarm/tests
 
 # Replace vendor/cui/ with release VERSION of CUI. Files land only if all three
 # download and the header names VERSION; review with git diff, then make test-ui.
@@ -66,7 +70,7 @@ clean:
 	rm -rf build build-asan build-ui
 	rm -f myra
 
-.PHONY: all test asan test-ui ui lint install install-ui vendor-cui clean
+.PHONY: all test asan test-ui ui lint install install-lib install-ui vendor-cui clean
 
 # cmake writes CMakeCache.txt before it fails; without this a failed configure
 # leaves a cache behind and the next make skips configure and reports a missing Makefile.

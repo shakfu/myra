@@ -42,6 +42,7 @@ Missing libcurl stops configure with `Could NOT find CURL`. A missing optional d
     make ui           # build and run myra-ui; ARGS='-P local' passes options
     make install      # stripped, to PREFIX/bin; PREFIX=~/.local by default
     make install-ui   # the same for myra and myra-ui, built in build-ui/
+    make install-lib  # libmyra.a, include/myra/ and a CMake package, to PREFIX
     make vendor-cui VERSION=1.x.y   # replace vendor/cui/ with that CUI release
     make clean
     make BUILD=out TYPE=Debug CMAKE_ARGS=-DMYRA_SANITIZE=ON   # overrides
@@ -52,14 +53,18 @@ Layout:
 
 | Path                  | Contains                                                         |
 |-----------------------|------------------------------------------------------------------|
-| `src/myra.{h,c}`      | `myralib`: providers, tools, remembered state, streaming, the tool loop |
-| `src/mcp.{h,c}`       | `myralib`: stdio MCP client                                      |
-| `src/main.c`          | the CLI: options, provider choice, headless mode, REPL, completion |
-| `src/acp.{h,c}`       | `--acp`: the Agent Client Protocol server                        |
+| `include/myra/`       | public headers: `myra.h` (agent, tools, loop), `mcp.h` (MCP client), `term.h` (terminal front end) |
+| `lib/`                | `myralib` (`libmyra.a`). Prints nothing. `agent.c`: lifecycle, tool registry, permission; `loop.c`: a turn; `api.c`: providers, HTTP and streaming; `tools.c`: the coding tools; `state.c`: remembered state and sessions; `text.c`: shared helpers; `mcp.c`: MCP client |
+| `term/`               | `libmyra-term`: escaping, markdown, notes on stderr, replies on stdout, the `/dev/tty` prompt, as `myralib` hooks |
+| `cli/main.c`          | `myra`, the agent executable: options, provider choice, headless mode, REPL, completion |
+| `cli/acp.{h,c}`       | `--acp`: the Agent Client Protocol server                        |
+| `cli/family.{h,c}`    | `-r`: recursive agents                                           |
+| `swarm/`              | `myra-swarm`: an agent per part of a markdown plan, in parallel, as child processes or threads; ctest `swarm` |
+| `tests/consumer/`     | a program built against an installed `libmyra`; ctest `install.consumer` |
 | `tests/unit.c`        | `myralib` unit tests; each `TEST(name)` is a ctest `unit.<name>` |
 | `tests/test_agent.py` | end-to-end tests against a mock server; ctest `e2e`, needs `uv`  |
 | `scripts/agent.py`    | myra in Python 3.11+, stdlib only; same options and state. ctest `e2e-py` runs the suite against it |
-| `ui/`                 | `myra-ui`, a desktop front end on `myralib` and CUI; ctest `ui.*` |
+| `ui/`                 | `libmyra-ui`, the CUI window (`app.h`, `ui_run`), and `myra-ui`, its executable (`main.c`); ctest `ui.*` |
 
 CMake writes `build/compile_commands.json`, which clangd finds automatically.
 
@@ -269,6 +274,49 @@ The window has:
 - a command palette (Cmd+K on macOS, Ctrl+K elsewhere); Esc stops a turn
 
 Panels dock and rearrange by dragging their tabs. Closing the window during a turn interrupts it and waits for it to end, so a running `write` or `shell` finishes first.
+
+### Parallel agents: `myra-swarm`
+
+`myra-swarm PLAN.md` splits one objective across agents. The plan has one `#` heading, the objective, and a `##` heading per part. Text under a heading gives it context. One agent works on each part, all at once unless `-j N` limits them. When all have finished, one more agent combines their answers. stdout gets a markdown report: the combined answer, then each part's answer. `--json` prints the same as one object. Progress goes to stderr. Each part's agent sees the objective, its own part and the other parts' titles.
+
+    # Why does the release build take 9 minutes?
+
+    CI on main, since commit 49691ed.
+
+    ## Compile time
+    Which targets dominate? Use the build logs in build/.
+
+    ## Tests
+    Which ctest entries take longest, and do they need to run serially?
+
+    ## Fix
+    depends: Compile time, Tests
+    Propose the three changes that save the most time.
+
+    myra-swarm -P openrouter plan.md > report.md
+
+A part's `depends: TITLE, ...` line starts it only after those parts finish, and puts their answers in its prompt. If a dependency fails, the part is skipped. Titles must match exactly. Unknown titles, cycles and duplicate titles are refused before anything runs. Each part is asked for an answer under 400 words, which bounds what the combining agent reads; `--words N` changes the limit, and `--words 0` drops it. The limit is a request, not enforced.
+
+`--mode processes`, the default, runs each agent as a child `myra -p --json` (found in `PATH`, or named by `--myra PATH`). Agents then share nothing but the working directory. `--mode threads` runs each on a thread of `myra-swarm` itself, on `myralib`. There they share its process-wide state, with the bugs `docs/dev/agent-context.md` lists; it exists to test the library. In processes mode a prompt is one argument, so it is capped at 120 KiB, below Linux's 128 KiB per argument.
+
+`--budget-tokens N` (and optionally `--budget-cost USD`) caps what all the agents together spend, in processes mode only. `myra-swarm` starts `myra -r host`, and each agent runs as a member of that family, reserving every request against one shared ledger. A request that would cross the budget fails, and so does its agent. Members also get the family's system prompt, so a part can start sub-agents of its own under the same budget (see "Recursive agents").
+
+The agents share the working directory and the `--permissions` mode (default `auto`; `ask` is refused, since there is no one to ask). Exit status 1 means some part or the combination failed; the report says which. Ctrl-C stops every agent and skips the combination. It is built by `make` as `build/swarm/myra-swarm` and not installed. `--tasks` runs JSON-line tasks instead, for the tests in `swarm/tests/`, which run every case in both modes.
+
+### Library: `libmyra`
+
+`myra` and `myra-ui` are executables on `myralib`. `make install-lib` installs it for other programs: `libmyra.a`, `libmyra-term.a`, the headers in `PREFIX/include/myra/`, and a CMake package. The archive bundles cJSON; include it as `<myra/cJSON.h>`. The API is in `include/myra/myra.h`; it may change in any 0.x minor release.
+
+    find_package(myra 0.2 REQUIRED)   # CMAKE_PREFIX_PATH=~/.local
+    target_link_libraries(app PRIVATE myra::myra)   # or myra::term, for a terminal
+
+    #include <myra/myra.h>
+
+`myralib` prints nothing. A front end sees a turn through `myra_io` hooks and `myra_note_hook`; without them, reply text and notes are dropped, and `myra_last_error` keeps the last error. A permission question with no `allow` hook is denied. `libmyra-term` (`myra/term.h`) supplies terminal hooks: `myra_term_notes` prints notes on stderr, and `myra_term_attach` prints replies on stdout and asks on `/dev/tty`.
+
+An agent starts with no tools. `myra_add_coding_tools` gives it `read`, `write`, `edit` and `shell` and the coding agent's system prompt; `myra_add_tool` adds any other. A `myra_tool` names its JSON Schema, the argument shown for a call, and an access class, `MYRA_TOOL_READS`, `_WRITES` or `_RUNS`. The access class decides when `--permissions` asks. The core checks required arguments before `run` is called. The model sees only registered tools, and a call to any other name is refused.
+
+The bundled cJSON symbols clash with a second cJSON linked into the same program.
 
 ## Saved state
 

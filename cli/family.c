@@ -465,6 +465,44 @@ static void prune_families(void) {
     closedir(d);
 }
 
+/* Create family fid, with root member fid as this process; -1 with an error note. */
+static int found(const char *fid, char *dir, size_t n, double budget, double budget_cost,
+                 const char *provider, const char *model, const char *perms) {
+    prune_families();
+    if (family_dir(dir, n, fid, 1) < 0 || mkdir(dir, 0700) < 0) {
+        myra_note(MYRA_ERROR, "error: -r: cannot create the family directory: %s\n",
+                  strerror(errno));
+        return -1;
+    }
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddNumberToObject(r, "budget_tokens", budget);
+    if (budget_cost > 0) cJSON_AddNumberToObject(r, "budget_cost", budget_cost);
+    else cJSON_AddNullToObject(r, "budget_cost");
+    cJSON *ms = cJSON_AddArrayToObject(r, "members");
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddStringToObject(m, "id", fid);
+    cJSON_AddStringToObject(m, "name", "root");
+    cJSON_AddNullToObject(m, "parent");
+    cJSON_AddNumberToObject(m, "pid", getpid());
+    cJSON_AddStringToObject(m, "provider", provider);
+    cJSON_AddStringToObject(m, "model", model);
+    cJSON_AddStringToObject(m, "permissions", perms);
+    cJSON_AddNumberToObject(m, "started_at", (double)time(NULL));
+    cJSON_AddNullToObject(m, "ended_at");
+    cJSON_AddItemToArray(ms, m);
+    int fd = lock_family(dir);
+    int rc = fd < 0 || save_registry(dir, r) < 0;
+    unlock_family(fd);
+    cJSON_Delete(r);
+    if (rc) myra_note(MYRA_ERROR, "error: -r: cannot write the family registry\n");
+    return rc ? -1 : 0;
+}
+
+static void set_str(cJSON *o, const char *key, const char *v) {
+    if (cJSON_GetObjectItem(o, key)) cJSON_ReplaceItemInObject(o, key, cJSON_CreateString(v));
+    else cJSON_AddStringToObject(o, key, v);
+}
+
 int myra_family_join(myra_agent *a, const char *perms, int headless, double budget,
                      double budget_cost) {
     char exe[PATH_MAX];
@@ -501,6 +539,10 @@ int myra_family_join(myra_agent *a, const char *perms, int headless, double budg
             me.budget = num(r, "budget_tokens");
             me.budget_cost = num(r, "budget_cost");
             set_num(m, "pid", getpid());
+            /* What it runs: a member that host added has no provider or model yet, and
+               spawn copies them to this member's children. */
+            set_str(m, "provider", a->prov->name);
+            set_str(m, "model", a->model);
             save_registry(me.dir, r);
             me.parent_pid = member_pid(p);
             snprintf(name, sizeof name, "%s", str(m, "name") ? str(m, "name") : "?");
@@ -530,38 +572,11 @@ int myra_family_join(myra_agent *a, const char *perms, int headless, double budg
             return -1;
         }
         me.budget = budget, me.budget_cost = budget_cost;
-        prune_families();
         new_id(me.fid);
         snprintf(me.self, sizeof me.self, "%s", me.fid);
-        if (family_dir(me.dir, sizeof me.dir, me.fid, 1) < 0 || mkdir(me.dir, 0700) < 0) {
-            myra_note(MYRA_ERROR, "error: -r: cannot create the family directory: %s\n",
-                      strerror(errno));
+        if (found(me.fid, me.dir, sizeof me.dir, budget, budget_cost, a->prov->name, a->model,
+                  perms) < 0)
             return -1;
-        }
-        cJSON *r = cJSON_CreateObject();
-        cJSON_AddNumberToObject(r, "budget_tokens", budget);
-        if (budget_cost > 0) cJSON_AddNumberToObject(r, "budget_cost", budget_cost);
-        else cJSON_AddNullToObject(r, "budget_cost");
-        cJSON *ms = cJSON_AddArrayToObject(r, "members");
-        cJSON *m = cJSON_CreateObject();
-        cJSON_AddStringToObject(m, "id", me.self);
-        cJSON_AddStringToObject(m, "name", "root");
-        cJSON_AddNullToObject(m, "parent");
-        cJSON_AddNumberToObject(m, "pid", getpid());
-        cJSON_AddStringToObject(m, "provider", a->prov->name);
-        cJSON_AddStringToObject(m, "model", a->model);
-        cJSON_AddStringToObject(m, "permissions", perms);
-        cJSON_AddNumberToObject(m, "started_at", (double)time(NULL));
-        cJSON_AddNullToObject(m, "ended_at");
-        cJSON_AddItemToArray(ms, m);
-        int fd = lock_family(me.dir);
-        int rc = fd < 0 || save_registry(me.dir, r) < 0;
-        unlock_family(fd);
-        cJSON_Delete(r);
-        if (rc) {
-            myra_note(MYRA_ERROR, "error: -r: cannot write the family registry\n");
-            return -1;
-        }
     }
     setenv("MYRA_FAMILY", me.fid, 1);
     setenv("MYRA_SELF", me.self, 1);
@@ -611,7 +626,7 @@ void myra_family_leave(const char *answer) {
 
 /* ---- subcommands ---- */
 
-static const char *const COMMANDS[] = {"spawn", "wait", "agents", "shutdown"};
+static const char *const COMMANDS[] = {"spawn", "wait", "agents", "shutdown", "host"};
 
 int myra_family_is_command(int argc, char **argv) {
     if (argc < 3 || (strcmp(argv[1], "-r") && strcmp(argv[1], "--recurse"))) return 0;
@@ -928,7 +943,92 @@ static int stop_members(const char *dir, const char *of, int grace) {
     return n;
 }
 
+/* The whole of s as a number, else NaN, which every check refuses. */
+static double number_arg(const char *s) {
+    char *end;
+    double v = strtod(s, &end);
+    return end == s || *end ? NAN : v;
+}
+
+/* myra -r host: a family whose root is this process; one reply line per stdin line
+   (docs/dev/recursion.md, "Subcommands"). */
+static int host(int argc, char **argv) {
+    static const char *const modes[] = {"auto", "ask", "all", "read-only"};
+    double budget = 0, budget_cost = 0;
+    const char *perms = "auto", *provider = "", *model = "";
+    for (int i = 1; i < argc; i++) {
+        const char *v = i + 1 < argc ? argv[i + 1] : NULL;
+        if (v && !strcmp(argv[i], "--budget-tokens")) budget = number_arg(argv[++i]);
+        else if (v && !strcmp(argv[i], "--budget-cost")) budget_cost = number_arg(argv[++i]);
+        else if (v && !strcmp(argv[i], "--permissions")) perms = argv[++i];
+        else if (v && !strcmp(argv[i], "-P")) provider = argv[++i];
+        else if (v && !strcmp(argv[i], "-m")) model = argv[++i];
+        else {
+            myra_note(MYRA_ERROR, "usage: myra -r host --budget-tokens N [--budget-cost USD] "
+                                  "[--permissions MODE] [-P PROVIDER] [-m MODEL]\n");
+            return 2;
+        }
+    }
+    int known = 0;
+    for (size_t i = 0; i < sizeof modes / sizeof *modes; i++) known |= !strcmp(perms, modes[i]);
+    /* main's limits for -r --budget-tokens; NaN fails every comparison */
+    int tokens_ok = budget > 0 && budget <= 1e15 && budget == floor(budget);
+    int cost_ok = budget_cost >= 0 && budget_cost <= 1e15;
+    if (!tokens_ok || !cost_ok || !known) {
+        myra_note(MYRA_ERROR, !tokens_ok ? "error: host needs --budget-tokens N, a whole number, 0 < N <= 1e15\n"
+                              : !known ? "error: host: unknown --permissions mode\n"
+                                       : "error: host: --budget-cost takes dollars, 0 to 1e15\n");
+        return 2;
+    }
+    signal(SIGINT, SIG_IGN); /* it lives as long as its stdin; Ctrl-C is for the members */
+    new_id(me.fid);
+    snprintf(me.self, sizeof me.self, "%s", me.fid);
+    if (found(me.fid, me.dir, sizeof me.dir, budget, budget_cost, provider, model, perms) < 0)
+        return 1;
+    printf("%s\n", me.fid);
+    fflush(stdout);
+    char *line = NULL;
+    size_t cap = 0;
+    for (int added = 0; getline(&line, &cap, stdin) >= 0;) { /* whole lines: one reply each */
+        line[strcspn(line, "\r\n")] = 0;
+        const char *name = MYRA_STARTS_WITH(line, "add ") ? line + 4 : NULL;
+        if (!name || !valid_name(name)) {
+            printf("error: %s\n", name ? "a name is 1 to 32 of A-Z, a-z, 0-9, '-' and '_'"
+                                       : "host takes one command: add NAME");
+            fflush(stdout);
+            continue;
+        }
+        char id[64]; /* the family id and a count: unique, though every add has this pid */
+        snprintf(id, sizeof id, "%s-%d", me.fid, ++added);
+        int fd = lock_family(me.dir);
+        cJSON *r = fd < 0 ? NULL : load_registry(me.dir);
+        if (r) {
+            cJSON *m = cJSON_CreateObject();
+            cJSON_AddStringToObject(m, "id", id);
+            cJSON_AddStringToObject(m, "name", name);
+            cJSON_AddStringToObject(m, "parent", me.self);
+            cJSON_AddNumberToObject(m, "pid", 0);
+            cJSON_AddStringToObject(m, "provider", provider);
+            cJSON_AddStringToObject(m, "model", model);
+            cJSON_AddStringToObject(m, "permissions", perms);
+            cJSON_AddNumberToObject(m, "started_at", (double)time(NULL));
+            cJSON_AddNullToObject(m, "ended_at");
+            cJSON_AddItemToArray(cJSON_GetObjectItem(r, "members"), m);
+        }
+        int ok = r && save_registry(me.dir, r) == 0;
+        unlock_family(fd);
+        cJSON_Delete(r);
+        if (ok) printf("%s\n", id);
+        else printf("error: cannot write the family registry\n");
+        fflush(stdout);
+    }
+    free(line);
+    myra_family_leave(NULL); /* the root's leave: marks it ended and removes the family */
+    return 0;
+}
+
 int myra_family_command(int argc, char **argv) {
+    if (!strcmp(argv[0], "host")) return host(argc, argv);
     if (!strcmp(argv[0], "spawn")) return spawn(argc, argv);
     if (!strcmp(argv[0], "wait")) return wait_cmd(argc, argv);
     if (!strcmp(argv[0], "agents")) return agents(argc, argv);

@@ -1,6 +1,6 @@
 # Recursive agents
 
-`-r`/`--recurse` lets an agent start child agents and collect their answers. It is local fork/join, in `src/family.c` and the `recursive agents` section of `scripts/agent.py`. It is off by default; without `-r`, none of this runs.
+`-r`/`--recurse` lets an agent start child agents and collect their answers. It is local fork/join, in `cli/family.c` and the `recursive agents` section of `scripts/agent.py`. It is off by default; without `-r`, none of this runs.
 
 It ports minima's `--recurse` (`~/projects/personal/minima/docs/dev/recursion.md`), built 2026-11-22. [Differences from minima](#differences-from-minima) lists what changed.
 
@@ -48,6 +48,7 @@ Recognised only as `myra -r SUBCOMMAND` at the start of the command line, so `my
 | `myra -r wait NAME_OR_ID [--timeout SECS]` | Prints the child's answer, waiting for it. Default 100 s. |
 | `myra -r agents` | Lists the family: `name role status model id`. |
 | `myra -r shutdown [--grace SECS]` | Stops the caller's descendants. Default grace 5 s. |
+| `myra -r host --budget-tokens N [--budget-cost USD] [--permissions MODE] [-P PROVIDER] [-m MODEL]` | Founds a family whose root is this process, for a program that starts the members itself. |
 
 - **`spawn`**
   - NAME is 1 to 32 of `[A-Za-z0-9_-]`, unique among the caller's running children.
@@ -60,6 +61,11 @@ Recognised only as `myra -r SUBCOMMAND` at the start of the command line, so `my
   - Marks the child waited, so no "finished" note follows.
 - **`agents`**: `role` is `self`, `parent`, `child`, `sibling` or `-`. `status` is `running`, `done`, `failed`, `cancelled` or `exited` (ended without an answer).
 - **`shutdown`**: run outside any agent, with `MYRA_FAMILY` set, it acts as the root: it stops every member but the root.
+- **`host`** (used by `myra-swarm --budget-tokens`)
+  - Prints the family id, then answers each `add NAME` line on stdin with a new member's id, or a line starting `error: `. Ids are the family id and a count, since every `add` has the host's pid.
+  - The program starts each member as `myra -r -p ...` with `MYRA_FAMILY` and `MYRA_ID` set. Its join records the provider and model it runs, which `spawn` copies to its children.
+  - The root is the host process, so members stop when it exits, as with any root. EOF on stdin ends the family and removes its files, so a program that dies ends it too. It ignores SIGINT.
+  - Values with trailing text, such as `12abc`, are errors.
 
 The subcommands find the family through `MYRA_FAMILY` and the caller through `MYRA_SELF`. Outside a family they fail with `not in a family`.
 

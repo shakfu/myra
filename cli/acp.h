@@ -2,7 +2,7 @@
 #ifndef MYRA_ACP_H
 #define MYRA_ACP_H
 
-#include "myra.h"
+#include "myra/myra.h"
 
 /* Serve ACP on stdin and stdout until stdin closes. config: MCP servers to start with
    each session, as myra_mcp_load returns, or NULL. */

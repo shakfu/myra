@@ -1,9 +1,10 @@
-/* app.h - myra-ui's state, shared by the worker (worker.c) and the frame (view.c). */
+/* app.h - libmyra-ui: myra-ui's window, and its state, shared by the worker (worker.c)
+   and the frame (view.c). The myra-ui executable (main.c) parses options and calls ui_run. */
 #ifndef MYRA_UI_APP_H
 #define MYRA_UI_APP_H
 
 #include "cui.h"
-#include "myra.h"
+#include "myra/myra.h"
 #include "transcript.h"
 
 #include <pthread.h>
@@ -52,6 +53,11 @@ typedef struct {
     char layout[1024];      /* the dock layout last saved */
     double layout_changed;  /* when it last changed, 0 when saved */
 } app;
+
+/* app.c. Before calling: myra_init s->agent, and set s->permissions, s->cwd, s->browse
+   and optionally s->draft, the first message. Runs the window until it closes, then
+   frees s->agent. Returns cui_app_run's result. */
+int ui_run(app *s);
 
 /* worker.c */
 void worker_install(app *s);  /* myra_io hooks and the note hook */

@@ -4,6 +4,16 @@
 
 ### Changed
 
+- Tools are pluggable. `myra_add_tool` registers a `myra_tool` with an access class: reads, writes or runs. The class decides when `--permissions` asks, so policy stays in the core. `myra_init` registers no tools. `myra_add_coding_tools` adds the four coding tools and their system prompt. The model is offered only registered tools, and dispatch refuses other names. `docs/dev/research-agent.md` option B needs this. The system prompt is `myra_agent.system`. Its `{cwd}` is a placeholder, not a format string. A prompt cannot inject format directives. The coding tools' JSON is unchanged.
+
+- `src/myra.c` (1,876 lines) is split by concern into six files under `lib/`. Shared internal functions are named `myra__*`, since a static archive exports every non-static name.
+
+- `myralib` prints nothing. Terminal output moved to a new library, `libmyra-term` (`term/`, `myra/term.h`). It holds escaping, the markdown renderer, notes, replies and the `/dev/tty` permission prompt. Without hooks, the core drops replies and notes. It no longer writes to the host's stdout or stderr. The globals `myra_color`, `myra_markdown`, `myra_escape_out` and `myra_escape_err` are now fields of `myra_term`. `myra_list_models` is now `myra_term_list_models`. `myra_io` gains `text_end`, so a renderer can flush at a reply's end. `allow` may return -1 when no one can answer.
+
+- `myra-ui` is now `libmyra-ui`, entered through `ui_run`, plus a `main.c` that parses options. `libmyra-ui` uses only `myralib`'s public headers.
+
+- A mutex guards the `shell` jobs list. Agents on several threads could realloc and free it at once, corrupting the heap. `myralib` now links `Threads::Threads`.
+
 - SIGTERM and SIGHUP end myra cleanly. The turn stops as for Ctrl-C, and myra exits with 128 + the signal number. Before, myra died at once and left its running `shell` command alive.
 
 - Background jobs started by `shell` are killed when myra exits, so a myra run from another agent's `shell` call no longer leaves orphans when that call is killed.
@@ -11,6 +21,12 @@
 - `myra_interrupted` is an `atomic_int`, not a `volatile sig_atomic_t`. A front end that runs `myra_ask` on a worker thread and cancels from its UI thread no longer has a data race. `sig_atomic_t` is only defined for signal handlers; a lock-free atomic is valid in both.
 
 ### Added
+
+- `myra-swarm PLAN.md` (`swarm/`, not installed) runs an agent per `##` part of a plan. One more agent then combines their answers for the `#` objective (README, "Parallel agents"). `depends: TITLE, ...` orders parts. `--words N` caps each answer, so the combiner's input grows with the part count. `--mode processes`, the default, runs each agent as a child `myra -p --json`. Agents then share nothing. `--mode threads` runs them on `myralib` in one process, to test the library (`docs/dev/agent-context.md`). `--budget-tokens` caps all agents with one shared family ledger.
+
+- `make install-lib` installs `myralib` as `libmyra.a`, `include/myra/` and a CMake package (README, "Library"). Other programs then use `find_package(myra)` and link `myra::myra`. Public headers moved to `include/myra/`, the library to `lib/` and the executable to `cli/`. `lib/` is off the public include path. Only `myra` and `libmyra-term` see the private `util.h`. cJSON is compiled into the archive, with its header beside `myra.h`. A separate `libcjson.a` could shadow a system `include/cJSON.h`. `make install` now installs only the executables. ctest `install.consumer` builds `tests/consumer/` against an installed copy.
+
+- `myra -r host` founds a family whose root is the calling program (docs/dev/recursion.md, "Subcommands"). That program adds members over stdin and starts them itself. `myra-swarm` uses it for its shared budget. A joining member now records its provider and model. `spawn` copies them to its children.
 
 - `-r`/`--recurse`: recursive agents, ported from minima. Through `shell`, an agent runs `myra -r spawn --name NAME -- TASK` to start a headless child, `wait` to print its answer, `agents` to list the family and `shutdown` to stop its descendants. Children inherit the parent's permissions; `spawn` is refused under `ask`. A finished child is announced in a note after the parent's next tool result, so the parent works on instead of polling, and a child's text never reaches the prompt with the user's authority. `--budget-tokens N` is required: each request reserves against a shared ledger, is sent with its grant as `max_tokens`, and fails once spending leaves too little, stopping the requester's descendants. Design: `docs/dev/recursion.md`.
 

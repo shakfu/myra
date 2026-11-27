@@ -1,7 +1,7 @@
 /* mcp.c - a Model Context Protocol client over stdio (https://modelcontextprotocol.io).
    Each server's tools join the model's tools as mcp__<server>__<tool>. JSON-RPC, one
    message per line, on the server's stdin and stdout; its stderr is left as ours. */
-#include "mcp.h"
+#include "myra/mcp.h"
 #include "util.h"
 
 #include <errno.h>

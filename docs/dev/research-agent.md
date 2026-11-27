@@ -61,10 +61,10 @@ The coding agent then `read`s `notes/curl-timeout.md`. A human should read it fi
 | Option | Cost | Risk |
 |-|-|-|
 | A. `--research` flag in `myra`: selects the tool set and system prompt | Reuses the loop, providers, streaming, `sink` and tests. Adds a tool-set switch to `myra_init` and `myra_run_tool`. Same again in `agent.py` | The coding tools stay in the binary. A dispatch bug could reach them |
-| B. Separate binary on `myralib` | Tool table and dispatch move out of `myra.c` into callers. Larger refactor | Coding tools absent from the binary |
+| B. Separate binary on `myralib` | Built: a binary registers `search` and `fetch` with `myra_add_tool` and never calls `myra_add_coding_tools` | Dispatch reaches only registered tools. The coding tools' code is still linked, since `tools.c` also holds `shell`'s job cleanup and the atomic write that `state.c` uses |
 | C. No client tools: OpenRouter web search (`:online` model suffix) | No code. `openrouter` only. Search happens on the server; no `fetch` rules to maintain | Excludes `local`. Pages still reach the context; the split still matters |
 
-Suggested order: try C by hand to learn whether research answers are good enough. Build A only if `local` support or control over `fetch` is needed. Choose B only if A's dispatch-bug risk turns out to matter in practice.
+Since the tool registry (2026-11-27), B costs about what A does and keeps the coding tools out of the research agent's `tools` array and dispatch by construction. Suggested order: try C by hand; if research answers are good enough without `local`, stop there; else build B.
 
 ## Open questions
 

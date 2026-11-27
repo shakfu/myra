@@ -27,11 +27,13 @@ else()
 endif()
 
 find_package(CURL REQUIRED)
+find_package(Threads REQUIRED)
 
-# Vendored; built without our warning flags.
-add_library(cjson STATIC vendor/cjson/cJSON.c)
-target_include_directories(cjson PUBLIC vendor/cjson)
-target_link_libraries(cjson PRIVATE m)
+include(GNUInstallDirs)
+
+# Vendored; built without our warning flags. Its objects go into libmyra, so an
+# installed libmyra is one archive.
+add_library(cjson OBJECT vendor/cjson/cJSON.c)
 target_compile_options(cjson PRIVATE -Wno-deprecated-declarations) # sprintf, in upstream code
 
 add_library(linenoise STATIC
@@ -53,18 +55,56 @@ if(MYRA_WERROR)
   list(APPEND WARNINGS -Werror) # our targets only: vendored code keeps its warnings
 endif()
 
-add_library(myralib STATIC src/myra.c src/mcp.c)
-target_include_directories(myralib PUBLIC src)
-target_compile_definitions(myralib PUBLIC _DEFAULT_SOURCE _DARWIN_C_SOURCE
-                           MYRA_VERSION="${PROJECT_VERSION}")
+# The library: public headers in include/myra/, sources and private util.h in lib/.
+# In-tree targets also get the feature macros; an installed consumer does not. A target
+# that uses util.h adds lib/ itself, so myra-swarm and tests see only the public headers.
+add_library(myralib STATIC lib/agent.c lib/api.c lib/loop.c lib/state.c lib/text.c lib/tools.c
+                    lib/mcp.c $<TARGET_OBJECTS:cjson>)
+set_target_properties(myralib PROPERTIES OUTPUT_NAME myra EXPORT_NAME myra)
+target_include_directories(myralib PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+                                          $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/vendor/cjson>
+                                          $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_definitions(myralib PUBLIC $<BUILD_INTERFACE:_DEFAULT_SOURCE>
+                           $<BUILD_INTERFACE:_DARWIN_C_SOURCE>
+                           $<BUILD_INTERFACE:MYRA_VERSION="${PROJECT_VERSION}">)
+target_include_directories(myralib PRIVATE lib)
 target_compile_options(myralib PRIVATE ${WARNINGS})
-target_link_libraries(myralib PUBLIC cjson CURL::libcurl)
+target_link_libraries(myralib PUBLIC CURL::libcurl Threads::Threads PRIVATE m)
 
-add_executable(myra src/main.c src/acp.c src/family.c)
+# myra on a terminal: replies, notes and permission questions, through myralib's hooks.
+add_library(myraterm STATIC term/term.c)
+set_target_properties(myraterm PROPERTIES OUTPUT_NAME myra-term EXPORT_NAME term)
+target_include_directories(myraterm PRIVATE lib) # util.h
+target_compile_options(myraterm PRIVATE ${WARNINGS})
+target_link_libraries(myraterm PUBLIC myralib)
+
+# The agent executable.
+add_executable(myra cli/main.c cli/acp.c cli/family.c)
+target_include_directories(myra PRIVATE lib) # util.h
 target_compile_options(myra PRIVATE ${WARNINGS})
-target_link_libraries(myra PRIVATE myralib linenoise)
+target_link_libraries(myra PRIVATE myraterm linenoise)
 
-install(TARGETS myra RUNTIME DESTINATION bin)
+install(TARGETS myra RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT bin)
+
+# The libraries for other programs: find_package(myra), then link myra::myra, and
+# myra::term for a terminal front end.
+include(CMakePackageConfigHelpers)
+set(MYRA_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/myra)
+install(TARGETS myralib myraterm EXPORT myraTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT dev)
+install(FILES include/myra/myra.h include/myra/mcp.h include/myra/term.h vendor/cjson/cJSON.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/myra COMPONENT dev)
+install(FILES vendor/cjson/LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} RENAME cJSON-LICENSE
+        COMPONENT dev)
+install(EXPORT myraTargets NAMESPACE myra:: DESTINATION ${MYRA_CMAKE_DIR} COMPONENT dev)
+file(WRITE ${CMAKE_BINARY_DIR}/myraConfig.cmake
+     "include(CMakeFindDependencyMacro)\nfind_dependency(CURL)\nfind_dependency(Threads)\n"
+     "include(\"\${CMAKE_CURRENT_LIST_DIR}/myraTargets.cmake\")\n")
+# 0.x: a minor release may break the API.
+write_basic_package_version_file(${CMAKE_BINARY_DIR}/myraConfigVersion.cmake
+                                 COMPATIBILITY SameMinorVersion)
+install(FILES ${CMAKE_BINARY_DIR}/myraConfig.cmake ${CMAKE_BINARY_DIR}/myraConfigVersion.cmake
+        DESTINATION ${MYRA_CMAKE_DIR} COMPONENT dev)
 
 enable_testing()
 
@@ -74,7 +114,7 @@ endif()
 
 add_executable(unit tests/unit.c)
 target_compile_options(unit PRIVATE ${WARNINGS})
-target_link_libraries(unit PRIVATE myralib)
+target_link_libraries(unit PRIVATE myraterm)
 # One ctest entry per TEST(name) in unit.c; reconfigure when it changes.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS tests/unit.c)
 file(STRINGS tests/unit.c UNIT_LINES REGEX "^TEST\\([a-z_0-9]+\\)")
@@ -82,6 +122,12 @@ foreach(line ${UNIT_LINES})
   string(REGEX REPLACE "^TEST\\(([a-z_0-9]+)\\).*" "\\1" name "${line}")
   add_test(NAME unit.${name} COMMAND unit ${name})
 endforeach()
+
+# Install the dev component to a scratch prefix and build tests/consumer against it.
+add_test(NAME install.consumer
+         COMMAND ${CMAKE_COMMAND} -DBUILD=${CMAKE_BINARY_DIR} -DSRC=${CMAKE_SOURCE_DIR}
+                 -DGENERATOR=${CMAKE_GENERATOR} -DCC=${CMAKE_C_COMPILER}
+                 -DSANITIZE=${MYRA_SANITIZE} -P ${CMAKE_SOURCE_DIR}/tests/consumer.cmake)
 
 find_program(UV uv)
 if(UV)
@@ -105,3 +151,6 @@ if(UV)
 else()
   message(WARNING "uv not found: end-to-end tests (tests/test_agent.py) are not registered")
 endif()
+
+# myra-swarm: parallel agents on one libmyra; uses UV from above for its tests.
+add_subdirectory(swarm)

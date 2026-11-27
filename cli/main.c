@@ -1,8 +1,9 @@
 /* main.c - the agent CLI: options, provider choice, headless mode and the REPL. */
-#include "myra.h"
+#include "myra/myra.h"
 #include "acp.h"
 #include "family.h"
-#include "mcp.h"
+#include "myra/mcp.h"
+#include "myra/term.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -133,6 +134,8 @@ static void json_result(const myra_agent *a, int from, const myra_provider *p, c
 }
 
 static void discard(void *ud, const char *s) { (void)ud, (void)s; }
+
+static myra_term term; /* stdout, stderr and /dev/tty */
 
 static void on_sigint(int sig) {
     (void)sig;
@@ -323,14 +326,14 @@ static void repl(myra_agent *a, const char *first) {
         }
         if (!strcmp(line, "/raw")) {
             const char *text = myra_last_reply(a);
-            char *shown = text && myra_escape_out ? myra_escape(NULL, text, 0) : NULL;
+            char *shown = text && term.escape_out ? myra_escape(NULL, text, 0) : NULL;
             if (text) printf("%s\n", shown ? shown : text), fflush(stdout);
             else myra_note(MYRA_DIM, "no reply yet\n");
             free(shown);
             continue;
         }
         if ((arg = myra_command(line, "/models"))) {
-            myra_list_models(a, arg);
+            myra_term_list_models(&term, a, arg);
             continue;
         }
         if ((arg = myra_command(line, "/model"))) {
@@ -351,6 +354,7 @@ static void repl(myra_agent *a, const char *first) {
 }
 
 int main(int argc, char **argv) {
+    myra_term_notes(&term); /* plain until the flags below are known */
     if (myra_family_is_command(argc, argv)) return myra_family_command(argc - 2, argv + 2);
     const char *prompt = NULL, *pname = NULL, *model = NULL;
     static const char *const modes[] = {[MYRA_AUTO] = "auto", [MYRA_ASK] = "ask",
@@ -459,10 +463,11 @@ int main(int argc, char **argv) {
         myra_note(MYRA_ERROR, "error: --resume needs -p\n");
         return 2;
     }
-    myra_color = color && isatty(STDERR_FILENO);
-    myra_markdown = !raw && isatty(STDOUT_FILENO);
-    myra_escape_out = isatty(STDOUT_FILENO);
-    myra_escape_err = isatty(STDERR_FILENO);
+    term.color = color && isatty(STDERR_FILENO);
+    term.markdown = !raw && isatty(STDOUT_FILENO);
+    term.escape_out = isatty(STDOUT_FILENO);
+    term.escape_err = isatty(STDERR_FILENO);
+    term.verbose = verbose;
     if (prompt && myra_provider_named(prompt)) { /* -p and -P differ only by case */
         myra_note(MYRA_ERROR, "error: -p takes a prompt; did you mean -P %s?\n", prompt);
         return 2;
@@ -517,6 +522,7 @@ int main(int argc, char **argv) {
         cJSON_Delete(saved);
         return 1;
     }
+    myra_add_coding_tools(&a);
     if (!model) a.save_model = 0; /* the session's model is not a choice to remember */
     if (saved) myra_session_resume(&a, saved, resume);
     cJSON_Delete(saved);
@@ -526,7 +532,8 @@ int main(int argc, char **argv) {
     int from = cJSON_GetArraySize(a.messages);
     a.verbose = verbose;
     a.context_window = window;
-    if (json) a.io.text = discard; /* stdout carries only the result line */
+    myra_term_attach(&term, &a);
+    if (json) a.io.text = discard, a.io.text_end = NULL; /* stdout carries only the result line */
     a.save_provider = pname != NULL;
     int child = recurse ? myra_family_join(&a, modes[perms], prompt != NULL, budget, budget_cost) : 0;
     if (child < 0) {

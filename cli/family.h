@@ -3,11 +3,11 @@
 #ifndef MYRA_FAMILY_H
 #define MYRA_FAMILY_H
 
-#include "myra.h"
+#include "myra/myra.h"
 
 /* Whether argv[1] is -r and argv[2] names a subcommand. */
 int myra_family_is_command(int argc, char **argv);
-/* myra -r spawn|wait|agents|shutdown ...: argv[0] is the subcommand. The exit status. */
+/* myra -r spawn|wait|agents|shutdown|host ...: argv[0] is the subcommand. The exit status. */
 int myra_family_command(int argc, char **argv);
 
 /* Found a family, or join as the child MYRA_ID names; sets a's family hooks. perms is

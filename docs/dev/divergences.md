@@ -1,6 +1,6 @@
 # C vs Python: behavioural differences
 
-`scripts/agent.py` follows `src/myra.c` and `src/main.c`, and the e2e suite (`tests/test_agent.py`) runs against both. The suite does not exercise the differences below. A change that adds a difference, or removes one, updates this file.
+`scripts/agent.py` follows `lib/`, `term/` and `cli/main.c`, and the e2e suite (`tests/test_agent.py`) runs against both. The suite does not exercise the differences below. A change that adds a difference, or removes one, updates this file.
 
 Checked against commit `b0a3adb`.
 

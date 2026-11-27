@@ -1,6 +1,5 @@
 /* myra-ui: a CUI desktop front end for myralib. Options mirror myra's; words after
-   them are sent as the first message. Threads: the UI thread runs the frame
-   (view.c); one worker at a time runs a turn or a model fetch (worker.c). */
+   them are sent as the first message. The window is libmyra-ui (app.h). */
 #include "app.h"
 
 #include <errno.h>
@@ -64,28 +63,12 @@ int main(int argc, char **argv) {
                               : "myra-ui: no provider: set OPENROUTER_API_KEY, or pass -P local\n", pname);
         return pname ? 2 : 1;
     }
-    if (myra_init(&s.agent, p, model, s.permissions) < 0) return 1;
+    if (myra_init(&s.agent, p, model, s.permissions) < 0) { /* no note hook yet: say why */
+        fprintf(stderr, "%s\n", myra_last_error); /* "error: ..." */
+        return 1;
+    }
+    myra_add_coding_tools(&s.agent);
     s.agent.save_provider = pname != NULL;
 
-    tr_init(&s.tr);
-    cui_log_init(&s.log, s.log_lines, sizeof s.log_lines / sizeof *s.log_lines, s.log_text, sizeof s.log_text);
-    s.started_at = tr_now();
-    s.show_files = s.show_log = true;
-    s.model_index = -1;
-    char *theme = myra_load_state("ui.theme"), *layout = myra_load_state("ui.layout");
-    s.dark = theme && !strcmp(theme, "dark");
-    if (layout) snprintf(s.layout, sizeof s.layout, "%s", layout);
-    free(theme), free(layout);
-    worker_install(&s);
-    if (s.draft[0]) s.act = ACT_SEND, view_act(&s);
-
-    int rc = cui_app_run(&(cui_app_desc){.title = "myra", .width = 1280, .height = 820,
-                                         .theme = s.dark ? CUI_THEME_DARK : CUI_THEME_LIGHT},
-                         view_frame, &s);
-    worker_shutdown(&s);
-    myra_note_hook = NULL;
-    myra_free_model_ids(s.models);
-    myra_free(&s.agent);
-    tr_free(&s.tr);
-    return rc;
+    return ui_run(&s);
 }

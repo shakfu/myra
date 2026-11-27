@@ -93,8 +93,9 @@ class Mock:
                                           "t": time.monotonic(),
                                           "headers": {k.lower(): v for k, v in self.headers.items()},
                                           "body": body})
-                    i = next((i for i, r in enumerate(mock.replies) if r[1].get("_for") == who),
-                             next(i for i, r in enumerate(mock.replies) if "_for" not in r[1]))
+                    i = next((i for i, r in enumerate(mock.replies) if r[1].get("_for") == who), None)
+                    if i is None:  # not a default argument: that would be evaluated first
+                        i = next(i for i, r in enumerate(mock.replies) if "_for" not in r[1])
                     status, reply, *delay = mock.replies.pop(i)  # optional third item: seconds
                 time.sleep(delay[0] if delay else 0)
                 reply = dict(reply)
@@ -3009,6 +3010,86 @@ def test_budget_cost_limit(mock, tmp_path):
     p = api.run(tmp_path, *FAMILY, "--budget-cost", "0.01", "-m", "test/model", "-p", "go")
     assert p.returncode == 1 and "the family's cost budget of $0.01 is spent" in p.stderr
     assert len(mock.requests) == 1  # the model list; no chat request
+
+
+class Host:
+    """A `myra -r host` process: the root of a family whose members a program starts."""
+
+    def __init__(self, api, cwd, *args):
+        self.p = subprocess.Popen([str(AGENT), "-r", "host", *args], cwd=cwd, env=api.env(cwd),
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.fid = self.p.stdout.readline().strip()
+
+    def send(self, line):
+        self.p.stdin.write(line + "\n")
+        self.p.stdin.flush()
+        return self.p.stdout.readline().strip()
+
+    def registry(self, cwd):
+        return json.loads((cwd / f".state/myra/family/{self.fid}/registry.json").read_text())
+
+    def close(self):
+        self.p.stdin.close()
+        return self.p.wait(timeout=10)
+
+
+def test_family_host_member_joins_and_spends_the_ledger(mock, tmp_path):
+    api = Api(mock, "local")
+    host = Host(api, tmp_path, "--budget-tokens", "1000000", "--permissions", "read-only")
+    assert re.fullmatch(r"\d+-\d+", host.fid), host.p.stderr.read()
+    mid = host.send("add part-1")
+    assert mid == f"{host.fid}-1" and host.send("add part-2") == f"{host.fid}-2"
+    api.reply("done", for_="part-1")
+    p = api.run(tmp_path, "-r", "--json", "-p", "go", env={"MYRA_FAMILY": host.fid, "MYRA_ID": mid})
+    assert p.returncode == 0, p.stderr
+    assert json.loads(p.stdout)["text"] == "done"
+    assert 'You are agent "part-1"' in mock.requests[0]["body"]["messages"][0]["content"]
+    root, one, two = host.registry(tmp_path)["members"]
+    assert root["pid"] == host.p.pid and one["parent"] == two["parent"] == host.fid
+    assert one["pid"] > 0 and one["provider"] == "local"  # recorded by its join
+    assert two["pid"] == 0 and two["provider"] == ""
+    ledger = (tmp_path / f".state/myra/family/{host.fid}/ledger.jsonl").read_text().splitlines()
+    assert [sorted(k for k in ("hold", "settles") if k in json.loads(x)) for x in ledger] == [["hold"], ["settles"]]
+    assert host.close() == 0
+    assert not family_dirs(tmp_path)  # EOF on its stdin ends the family
+
+
+def test_family_host_budget_is_shared(mock, tmp_path):
+    api = Api(mock, "local")
+    host = Host(api, tmp_path, "--budget-tokens", "5000")  # too little for one request's floor
+    mid = host.send("add part-1")
+    p = api.run(tmp_path, "-r", "--json", "-p", "go", env={"MYRA_FAMILY": host.fid, "MYRA_ID": mid})
+    assert p.returncode == 1
+    assert "the family's token budget of 5000 is spent" in json.loads(p.stdout)["error"]
+    assert not mock.requests
+    assert host.close() == 0
+
+
+def test_family_host_checks_its_input(mock, tmp_path):
+    api = Api(mock, "local")
+    tokens = "host needs --budget-tokens N, a whole number, 0 < N <= 1e15"
+    for args, why in [((), tokens),
+                      (("--budget-tokens", "12abc"), tokens),
+                      (("--budget-tokens", "1.5"), tokens),
+                      (("--budget-tokens", "2e15"), tokens),
+                      (("--budget-tokens", "inf"), tokens),
+                      (("--budget-tokens", "1e400"), tokens),
+                      (("--budget-tokens", "9", "--budget-cost", "inf"), "host: --budget-cost takes dollars, 0 to 1e15"),
+                      (("--budget-tokens", "9", "--permissions", "some"), "host: unknown --permissions mode"),
+                      (("--budget-tokens", "9", "--budget-cost", "-1"), "host: --budget-cost takes dollars, 0 to 1e15")]:
+        p = subprocess.run([str(AGENT), "-r", "host", *args], cwd=tmp_path, env=api.env(tmp_path),
+                           capture_output=True, text=True, timeout=10, check=False)
+        assert p.returncode == 2 and p.stderr == f"error: {why}\n", (args, p.stderr)
+    host = Host(api, tmp_path, "--budget-tokens", "9")
+    assert host.send("add") == "error: host takes one command: add NAME"
+    assert host.send("add no spaces") == "error: a name is 1 to 32 of A-Z, a-z, 0-9, '-' and '_'"
+    assert host.send("add " + "x" * 33).startswith("error: a name is")
+    assert host.send("add " + "x" * 300).startswith("error: a name is")  # one reply per line
+    assert host.send("add ok") == f"{host.fid}-1"  # still serving
+    host.p.send_signal(signal.SIGINT)  # ignored: its life is its stdin
+    assert host.send("add ok2") == f"{host.fid}-2"
+    assert host.close() == 0 and not family_dirs(tmp_path)
 
 
 def test_family_keep_leaves_the_files(mock, tmp_path):

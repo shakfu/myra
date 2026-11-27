@@ -1,8 +1,10 @@
 /* worker.c - the agent thread. myra_ask and myra_model_ids block, so they run here;
    the myra_io hooks write what happens into the transcript. */
 #include "app.h"
-#include "util.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 
 #define DIFF_MAX (1 << 20) /* files above this get no diff: the view would be slow */
@@ -13,9 +15,14 @@ static app *the_app; /* for myra_note_hook, which takes no user data */
 static char *small_file(const char *path) {
     struct stat st;
     if (stat(path, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size > DIFF_MAX) return NULL;
-    buf b = {0};
-    if (slurp(path, &b) < 0) { free(b.p); return NULL; }
-    return b.p;
+    FILE *f = fopen(path, "rb");
+    char *p = f ? malloc((size_t)st.st_size + 1) : NULL;
+    size_t n = p ? fread(p, 1, (size_t)st.st_size, f) : 0; /* a file that grew: its start */
+    int failed = f && ferror(f);
+    if (f) fclose(f);
+    if (!p || failed) { free(p); return NULL; }
+    p[n] = 0;
+    return p;
 }
 
 /* s with its only occurrence of old replaced by new, as edit will do; NULL if old
@@ -23,11 +30,13 @@ static char *small_file(const char *path) {
 static char *replaced(const char *s, const char *old, const char *new) {
     const char *at = *old ? strstr(s, old) : NULL;
     if (!at || strstr(at + 1, old)) return NULL;
-    buf b = {0};
-    buf_add(&b, s, (size_t)(at - s));
-    buf_add(&b, new, strlen(new));
-    buf_add(&b, at + strlen(old), strlen(at + strlen(old)));
-    return b.p;
+    size_t head = (size_t)(at - s), o = strlen(old), m = strlen(new), tail = strlen(at + o);
+    char *r = malloc(head + m + tail + 1);
+    if (!r) return NULL;
+    memcpy(r, s, head);
+    memcpy(r + head, new, m);
+    memcpy(r + head + m, at + o, tail + 1);
+    return r;
 }
 
 static void on_text(void *ud, const char *s) { tr_text(ud, s); }
@@ -43,8 +52,8 @@ static void on_tool(void *ud, const char *name, const char *detail, const cJSON 
         const char *content = cJSON_GetStringValue(cJSON_GetObjectItem(input, "content"));
         if (content && strlen(content) <= DIFF_MAX) {
             before = small_file(path); /* NULL: a new file */
-            after = xstrdup(content);
-            if (!before) before = xstrdup("");
+            after = strdup(content);
+            if (!before) before = strdup("");
         }
     } else if (!strcmp(name, "edit") && path) {
         const char *old = cJSON_GetStringValue(cJSON_GetObjectItem(input, "old_string"));
@@ -53,8 +62,12 @@ static void on_tool(void *ud, const char *name, const char *detail, const cJSON 
         if (file && (after = replaced(file, old, new))) before = file;
         else if (old && new) { /* show the fragments: edit will report why it failed */
             free(file);
-            before = xstrdup(old), after = xstrdup(new);
+            before = strdup(old), after = strdup(new);
         }
+    }
+    if (!before || !after) { /* out of memory: no diff rather than a wrong one */
+        free(before), free(after);
+        before = after = NULL;
     }
     tr_tool(ud, name, detail, json, before, after, pending);
     free(json), free(before), free(after);

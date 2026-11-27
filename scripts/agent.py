@@ -111,7 +111,7 @@ class Style(StrEnum):
 
 escape_out = escape_err = False  # set when stdout, stderr is a terminal; see escape()
 
-# C0, DEL and C1 in caret notation, as myra_escape in src/myra.c.
+# C0, DEL and C1 in caret notation, as myra_escape in term/term.c.
 CARET = ({c: "^" + chr(c + 64) for c in range(32)} | {127: "^?"}
          | {c: "M-^" + chr(c - 64) for c in range(128, 160)})
 CARET_LINES = {c: v for c, v in CARET.items() if c not in (9, 10)}  # keeps \t and \n
@@ -176,7 +176,7 @@ def md_word(c: str) -> bool:  # ASCII only, as in myra
 
 class Markdown:
     """Streaming markdown renderer: headings, bold, italic, inline code, fenced code,
-    bullets, quotes and rules. Mirrors myra_md in src/myra.c."""
+    bullets, quotes and rules. Mirrors myra_md in term/term.c."""
 
     def __init__(self):
         self.line = ""  # the start of a line, held until its block kind is known
@@ -1115,7 +1115,7 @@ def mcp_load(path: str) -> list | None:
 
 class McpServer:
     """A Model Context Protocol server over stdio (https://modelcontextprotocol.io).
-    Mirrors src/mcp.c. JSON-RPC, one message per line; its stderr is left as ours."""
+    Mirrors lib/mcp.c. JSON-RPC, one message per line; its stderr is left as ours."""
 
     def __init__(self, name: str, proc: subprocess.Popen):
         self.name, self.proc = name, proc
@@ -2027,7 +2027,7 @@ def prompt_text(blocks: Any) -> str:
 
 class AcpServer:
     """Serves the Agent Client Protocol on stdin and stdout: JSON-RPC, one message per line
-    (https://agentclientprotocol.com). Mirrors src/acp.c. stdout carries only protocol
+    (https://agentclientprotocol.com). Mirrors cli/acp.c. stdout carries only protocol
     messages; notes go to stderr.
 
     Python has no curl progress callback for myra_poll, so a reader thread takes stdin. It
@@ -2307,7 +2307,7 @@ class AcpServer:
 
 # ---- recursive agents: -r (docs/dev/recursion.md) ----
 
-FAMILY_COMMANDS = ("spawn", "wait", "agents", "shutdown")
+FAMILY_COMMANDS = ("spawn", "wait", "agents", "shutdown", "host")
 WAIT_DEFAULT = 100  # seconds; under shell's default timeout of 120
 GRACE_DEFAULT = 5
 RESERVE = 0.95  # of the budget: the rest absorbs estimation error
@@ -2639,6 +2639,28 @@ def prune_families() -> None:
                 remove_family(d)
 
 
+def found(fid: str, budget: float, budget_cost: float, provider: str, model: str,
+          perms: str) -> Path | None:
+    """Create family fid, with root member fid as this process; None with an error note."""
+    prune_families()
+    d = family_dir(fid, make=True)
+    try:
+        if not d:
+            raise OSError("no state directory")
+        d.mkdir(mode=0o700)
+    except OSError as e:
+        note(f"error: -r: cannot create the family directory: {e.strerror or e}\n", Style.ERROR)
+        return None
+    r = {"budget_tokens": budget, "budget_cost": budget_cost or None, "members": [{
+        "id": fid, "name": "root", "parent": None, "pid": os.getpid(), "provider": provider,
+        "model": model, "permissions": perms, "started_at": int(time.time()), "ended_at": None}]}
+    with locked(d) as ok:
+        if not ok or not save_registry(d, r):
+            note("error: -r: cannot write the family registry\n", Style.ERROR)
+            return None
+    return d
+
+
 def family_join(agent: Agent, perms: str, headless: bool, budget: float = 0,
                 budget_cost: float = 0) -> int:
     """Found a family, or join as the child MYRA_ID names: 1 for a child, 0 for the root,
@@ -2667,6 +2689,9 @@ def family_join(agent: Agent, perms: str, headless: bool, budget: float = 0,
                 p = member(r, m.get("parent")) if m else None
                 if m and p:
                     m["pid"] = os.getpid()
+                    # What it runs: a member that host added has no provider or model yet,
+                    # and spawn copies them to this member's children.
+                    m["provider"], m["model"] = agent.prov.name, agent.model
                     save_registry(d, r)
         if not m or not p:
             note(f"error: -r: no member {mid} in family {fid}\n", Style.ERROR)
@@ -2687,23 +2712,9 @@ def family_join(agent: Agent, perms: str, headless: bool, budget: float = 0,
         if budget <= 0:
             note("error: -r needs --budget-tokens N, the most the family may spend\n", Style.ERROR)
             return -1
-        prune_families()
         fid = new_id()
-        d = family_dir(fid, make=True)
-        try:
-            if not d:
-                raise OSError("no state directory")
-            d.mkdir(mode=0o700)
-        except OSError as e:
-            note(f"error: -r: cannot create the family directory: {e.strerror or e}\n", Style.ERROR)
+        if not (d := found(fid, budget, budget_cost, agent.prov.name, agent.model, perms)):
             return -1
-        r = {"budget_tokens": budget, "budget_cost": budget_cost or None, "members": [{"id": fid, "name": "root", "parent": None, "pid": os.getpid(),
-                          "provider": agent.prov.name, "model": agent.model, "permissions": perms,
-                          "started_at": int(time.time()), "ended_at": None}]}
-        with locked(d) as ok:
-            if not ok or not save_registry(d, r):
-                note("error: -r: cannot write the family registry\n", Style.ERROR)
-                return -1
         me = Membership(d, fid, fid, budget=budget, budget_cost=budget_cost)
     os.environ["MYRA_FAMILY"], os.environ["MYRA_SELF"] = me.fid, me.self
     agent.family_prompt = family_prompt(name, parent_name)
@@ -2959,10 +2970,70 @@ def stop_members(d: Path, of: str, grace: int) -> int:
     return len(pids)
 
 
+def family_host(argv: list[str]) -> int:
+    """myra -r host: found a family whose root is this process, for a program that starts
+    its members itself (myra-swarm). Prints the family id, then answers each "add NAME"
+    line on stdin with the new member's id, or a line starting "error: ". A member joins by
+    running myra -r -p with MYRA_FAMILY and MYRA_ID set. EOF on stdin ends the family."""
+    global me
+    opts = {"--budget-tokens": "0", "--budget-cost": "0", "--permissions": "auto", "-P": "", "-m": ""}
+    i = 1
+    while i < len(argv):
+        if argv[i] in opts and i + 1 < len(argv):
+            opts[argv[i]], i = argv[i + 1], i + 2
+        else:
+            note("usage: myra -r host --budget-tokens N [--budget-cost USD] "
+                 "[--permissions MODE] [-P PROVIDER] [-m MODEL]\n", Style.ERROR)
+            return 2
+
+    def number(v: str) -> float:  # the whole of v, else NaN, which every check refuses
+        try:
+            return float(v)
+        except ValueError:
+            return math.nan
+    budget, budget_cost = number(opts["--budget-tokens"]), number(opts["--budget-cost"])
+    perms = opts["--permissions"]
+    known = perms in ("auto", "ask", "all", "read-only")
+    tokens_ok = 0 < budget <= 1e15 and budget == int(budget)  # main's limits for -r
+    cost_ok = 0 <= budget_cost <= 1e15
+    if not tokens_ok or not cost_ok or not known:
+        note("error: host needs --budget-tokens N, a whole number, 0 < N <= 1e15\n" if not tokens_ok
+             else "error: host: unknown --permissions mode\n" if not known
+             else "error: host: --budget-cost takes dollars, 0 to 1e15\n", Style.ERROR)
+        return 2
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # it lives as long as its stdin; Ctrl-C is for the members
+    fid = new_id()
+    if not (d := found(fid, budget, budget_cost, opts["-P"], opts["-m"], perms)):
+        return 1
+    me = Membership(d, fid, fid, budget=budget, budget_cost=budget_cost)
+    print(fid, flush=True)
+    added = 0
+    for line in sys.stdin:
+        line = line.rstrip("\r\n")
+        name = line[4:] if line.startswith("add ") else None
+        if name is None or not valid_name(name):
+            print("error: " + ("a name is 1 to 32 of A-Z, a-z, 0-9, '-' and '_'" if name is not None
+                               else "host takes one command: add NAME"), flush=True)
+            continue
+        added += 1
+        mid = f"{fid}-{added}"  # the family id and a count: unique, though every add has this pid
+        with locked(d) as ok:
+            r = load_registry(d) if ok else None
+            if r is not None:
+                r["members"].append({"id": mid, "name": name, "parent": fid, "pid": 0,
+                                     "provider": opts["-P"], "model": opts["-m"],
+                                     "permissions": perms, "started_at": int(time.time()),
+                                     "ended_at": None})
+            saved = r is not None and save_registry(d, r)
+        print(mid if saved else "error: cannot write the family registry", flush=True)
+    family_leave("")  # the root's leave: marks it ended and removes the family
+    return 0
+
+
 def family_command(argv: list[str]) -> int:
-    """myra -r spawn|wait|agents|shutdown ...: argv[0] is the subcommand. The exit status."""
+    """myra -r spawn|wait|agents|shutdown|host ...: argv[0] is the subcommand. The exit status."""
     return {"spawn": family_spawn, "wait": family_wait, "agents": family_agents,
-            "shutdown": family_shutdown}[argv[0]](argv)
+            "shutdown": family_shutdown, "host": family_host}[argv[0]](argv)
 
 
 # ---- the CLI ----

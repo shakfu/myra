@@ -4,7 +4,7 @@ myra is deliberately small: four tools, two OpenAI-compatible providers, one str
 
 They are grouped by the axis they change, and each entry is meant to be orthogonal to the others: implementing any one does not require or duplicate the next. Within a group the items still stand alone unless noted.
 
-Each item names the axis, the user-visible win, and roughly where it lands in the current code (`src/myra.c` = providers/tools/loop, `src/main.c` = CLI/REPL).
+Each item names the axis, the user-visible win, and roughly where it lands in the current code (`lib/` = providers, tools and the loop, `cli/main.c` = CLI/REPL).
 
 ---
 
@@ -100,7 +100,7 @@ Axis: **input**. Piped input already works; add `--`-separated prompts or a `--s
 ## 6. Extensibility and integration
 
 ### 6.1 MCP client
-Status: done. `src/mcp.c`; servers come from `--mcp-config FILE` and, under `--acp`, from the editor.
+Status: done. `lib/mcp.c`; servers come from `--mcp-config FILE` and, under `--acp`, from the editor.
 
 Axis: **extensibility**. Speak the Model Context Protocol over stdio to configured servers, exposing their tools to the loop as extra entries in the existing `tools` array. This is the single highest-leverage feature for adopting myra alongside other tools, and it is additive: the four built-ins keep working, the tool loop is unchanged in shape. Config lives in a small JSON file under the state dir.
 
